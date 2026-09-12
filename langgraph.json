@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "fluidbank": "./src/fluidbank_orchestrator/graph.py:graph"
+  },
+  "env": ".env"
+}

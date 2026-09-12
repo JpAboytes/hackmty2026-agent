@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from dotenv import load_dotenv
 
-from graph import graph
-from personas import PERSONA_USER_IDS
+from fluidbank_orchestrator.graph import graph
+from fluidbank_orchestrator.personas import PERSONA_USER_IDS
 
 
 async def main() -> None:
@@ -18,7 +19,7 @@ async def main() -> None:
             "user_id": PERSONA_USER_IDS["ana"],
         }
     )
-    print(result["a2ui_response"].model_dump_json(indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

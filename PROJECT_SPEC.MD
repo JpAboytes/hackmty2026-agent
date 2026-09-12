@@ -67,16 +67,19 @@ The system consists of independently maintained repositories and deployable comp
 ### 5.2 Agent Orchestrator
 
 - LangGraph implemented in the backend language selected for the orchestration repository.
-- Interprets user intent, obtains the minimum required data, selects a template, and produces an A2UI payload.
+- Interprets user intent and obtains the minimum required data by calling the MCP server's tools.
+- Drafts conversational text grounded in that data and extracts structured parameters (e.g. a requested number of months) the MCP server needs to build the right surface.
+- Never constructs, edits, or validates A2UI content. The MCP server is the only component that produces A2UI; the orchestrator relays whatever it returns to the mobile client untouched.
 - Must not directly mutate client state or generate executable client code.
-- Must enforce confirmation boundaries for actions that could affect financial decisions or user data.
+- Must enforce confirmation boundaries for actions that could affect financial decisions or user data: user-triggered actions are dispatched deterministically to the MCP server's action tool, never decided or rewritten by the LLM.
 
 ### 5.3 MCP Tool Server
 
-- FastMCP in Python.
+- FastMCP in Python. Runnable locally over stdio and deployable remotely (e.g. Horizon) over Streamable HTTP.
 - Provides narrowly scoped, typed tools for retrieving demo financial data and computing derived scores.
+- Owns the full A2UI protocol implementation: templates, resources (served via `resources/read`), `updateDataModel`, validation, `_meta.ui` metadata, user-triggered actions, and A2UI error responses. A2UI content is returned as an `EmbeddedResource` (MIME type `application/a2ui+json`) alongside any plain text or structured content in the same tool result.
 - Tools must validate inputs, return structured errors, and expose only the data required by the current request.
-- The MCP server is the only component that directly accesses Supabase data for the initial architecture.
+- The MCP server is the only component that directly accesses Supabase data and the only component that constructs or validates A2UI content.
 
 ### 5.4 Supabase
 
@@ -97,13 +100,13 @@ It consumes the versioned shared contract package. It must not import source fil
 
 ### 6.2 Agent Orchestrator Repository
 
-Owns LangGraph state, intent routing, prompt and policy logic, template selection, payload generation, and orchestrator tests.
+Owns LangGraph state, intent routing, prompt and policy logic, the MCP client integration, and orchestrator tests. It does not own template selection or A2UI payload generation - that belongs to the MCP repository.
 
-It consumes the versioned shared contract definition and communicates with the MCP server through its public tool interface.
+It consumes the versioned shared contract definition only to type the A2UI envelope it relays; it must never construct or edit A2UI content. It communicates with the MCP server through its public tool interface, whether a local stdio process or its deployed HTTP endpoint, and forwards MCP-produced A2UI content to the mobile client unmodified.
 
 ### 6.3 MCP and Data Repository
 
-Owns the FastMCP server, tool definitions, Supabase migrations, seed data, score computation, and data/tool tests.
+Owns the FastMCP server, tool definitions, the full A2UI protocol implementation (templates, resources, `updateDataModel`, actions, validation, error responses), Supabase migrations, seed data, score computation, and data/tool tests.
 
 It must not contain mobile UI code or assume a local checkout of the mobile repository.
 
@@ -144,60 +147,45 @@ Template selection must be deterministic for the same normalized request, user c
 
 ## 8. A2UI Contract
 
-Every response from the orchestrator to the mobile client must validate against the versioned A2UI schema before it is rendered.
+The system implements Google's A2UI protocol as-is: a hard requirement, not a bespoke JSON format inspired by it. An earlier draft of this document specified a flat, single-shot payload (`version` / `template_id` / `surface.components[]`); that draft is superseded and must not be implemented. The MCP repository (`hackmty2026-mcp`) is the sole source of truth for the wire format, under `src/supabase_mcp/a2ui/`.
 
-Example payload:
+### 8.1 Ownership
+
+- **MCP server**: builds and validates every A2UI artifact - templates, resources, surfaces, the component catalog, `updateDataModel` patches, actions, and A2UI error responses. This is the only component allowed to construct or edit A2UI content.
+- **Agent orchestrator**: calls the MCP server's tools and relays whatever A2UI content they return to the mobile client, byte-for-byte. The LLM never sees, generates, or modifies A2UI JSON - only the accompanying plain text and structured data.
+- **Mobile client**: implements the A2UI renderer, the component catalog, per-surface state, data bindings, template/catalog caching, and dispatches user actions.
+
+### 8.2 Transport shape
+
+A2UI content travels inside an MCP tool result as an `EmbeddedResource` with MIME type `application/a2ui+json`, alongside the tool's ordinary text and structured content:
+
+```text
+ToolResult
+├── TextContent            → may reach the LLM
+├── structuredContent      → may reach the LLM if the flow needs it
+├── EmbeddedResource (A2UI, application/a2ui+json)  → relayed to Mobile untouched
+└── _meta.ui                                        → template/surface metadata
+```
+
+Templates are also published directly through MCP's `resources/read`. Component catalogs are negotiated per session via `_meta.a2ui.clientCapabilities` / `supportedCatalogIds`.
+
+### 8.3 Envelope forwarded by the agent
+
+The orchestrator's HTTP response to the mobile client separates conversational content from A2UI content so the LLM's output path and the A2UI path never mix:
 
 ```json
 {
-  "version": "a2ui/v1",
-  "template_id": "projection",
-  "applied_tags": ["high-contrast", "large-targets"],
-  "meta": {
-    "narrative": "Your current budget supports a six-month purchase without affecting your rent.",
-    "accessibility": {
-      "font_scale": "lg",
-      "contrast": "high",
-      "hit_target": "large"
-    }
-  },
-  "surface": {
-    "layout": "vertical_stack",
-    "components": [
+  "message": "Encontré 5 resultados.",
+  "data": { "count": 5 },
+  "a2ui": {
+    "resourceUri": "a2ui://database/overview",
+    "messages": [
       {
-        "id": "alert-header",
-        "type": "Banner",
-        "tags": ["high-contrast"],
-        "props": {
-          "variant": "info",
-          "title": "Purchase installment simulation"
-        }
-      },
-      {
-        "id": "installment-term",
-        "type": "InteractiveSlider",
-        "tags": ["large-targets"],
-        "props": {
-          "label": "Number of months",
-          "min": 3,
-          "max": 18,
-          "step": 3,
-          "default_value": 6
-        }
-      },
-      {
-        "id": "confirm-simulation",
-        "type": "Button",
-        "tags": ["large-targets"],
-        "props": {
-          "label": "Confirm simulation",
-          "action": {
-            "type": "A2UI_DISPATCH",
-            "intent": "CONFIRM_SIMULATION",
-            "payload": {
-              "months": 6
-            }
-          }
+        "version": "v0.9.1",
+        "updateDataModel": {
+          "surfaceId": "database-overview",
+          "path": "/",
+          "value": {}
         }
       }
     ]
@@ -205,13 +193,23 @@ Example payload:
 }
 ```
 
-Contract requirements:
+`a2ui` is `null` whenever the MCP server has nothing to render for that turn (e.g. a plain conversational reply). The orchestrator must never populate or alter this field's contents beyond copying it from the MCP response.
 
-- Every component has a stable, unique `id` within the surface.
-- `type`, layout values, tags, accessibility values, and action intents are enumerated by the shared contract.
-- Unknown component types or invalid props must produce a visible, recoverable error state; they must never be rendered dynamically.
+### 8.4 Actions
+
+User-triggered actions (button presses, confirmations) call the MCP server's action tool deterministically from the mobile/agent layer. They must not be routed through the LLM to decide whether or how to call it. The MCP server validates the action, applies the resulting `updateDataModel`, and the agent relays the update back to Mobile the same way as the original surface.
+
+### 8.5 Accessibility boundary
+
+Personal accessibility preferences (font scale, high contrast, dark mode, reduced motion, screen reader state, large touch targets) are a Mobile/renderer concern and are not sent to the MCP server. The MCP server emits semantic components (e.g. `variant: "h1"`, not `fontSize: 28`) and lets the renderer map them to accessible native widgets. The MCP server only needs to know about an accessibility preference when it changes *what content or structure* to send, not merely its style - for example `prefersDataTable`, `requiresTextAlternative`, or `avoidTimeLimitedInteractions` passed via request `_meta`, never inside the LLM prompt.
+
+### 8.6 General requirements
+
+- Every component has a stable, unique id within its surface.
+- Component types, catalog entries, and action names are enumerated by the MCP server's catalog/template implementation, not invented by the LLM.
+- Unknown component types or invalid props must produce a visible, recoverable error state on the client; they must never be rendered dynamically.
 - The client must treat payload content as data, not executable code.
-- Actions must be validated again by the receiving backend before any state-changing operation.
-- Contract changes require a version update, migration notes, and fixture coverage.
+- Actions must be validated again by the MCP server before any state-changing operation.
+- Contract changes require a version update, migration notes, and fixture coverage, tracked in `hackmty2026-mcp`.
 
 

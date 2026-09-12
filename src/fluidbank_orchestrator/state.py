@@ -1,10 +1,12 @@
-"""State contract for the FluidBank LangGraph workflow."""
+"""State contract for the FluidBank LangGraph workflow.
+
+No A2UI type lives here: template/surface generation is owned by the MCP
+server's A2UI implementation, not the agent.
+"""
 
 from __future__ import annotations
 
 from typing import TypedDict
-
-from schemas.a2ui import A2UIPayload, TemplateId
 
 
 class UserProfile(TypedDict):
@@ -26,7 +28,5 @@ class GraphState(TypedDict, total=False):
     user_query: str
     user_id: str
     user_profile: UserProfile
-    selected_template: TemplateId
-    narrative: str
+    message: str
     months: int
-    a2ui_response: A2UIPayload

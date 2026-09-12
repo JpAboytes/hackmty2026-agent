@@ -1,0 +1,59 @@
+# FluidBank Orchestrator
+
+LangGraph agent for the accessibility-first banking demo. It fetches real financial and accessibility context through the read-only `hackmty2026-mcp` server, drafts a grounded conversational reply with Gemini, and relays whatever A2UI content that server returns to the mobile client - it never constructs or edits A2UI itself. See `PROJECT_SPEC.MD` for the full architecture and contract.
+
+## Layout
+
+```text
+src/fluidbank_orchestrator/
+  graph.py         LangGraph workflow: fetch_context -> intent
+  state.py         Graph state (TypedDict)
+  mcp_client.py     MCP client: deployed Horizon endpoint, local stdio fallback
+  personas.py       Fixed demo persona ids (seeded by hackmty2026-mcp)
+  api.py            FastAPI entrypoint
+scripts/
+  run_local.py      Run the graph once from the CLI, without an HTTP server
+langgraph.json      LangGraph CLI / Studio manifest
+```
+
+## Setup
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -e ".[dev]"
+cp .env.example .env   # fill in GEMINI_API_KEY, MCP_SERVER_URL, HORIZON_API_KEY
+```
+
+## Run
+
+HTTP API:
+
+```bash
+./.venv/bin/uvicorn fluidbank_orchestrator.api:app --reload
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "Tengo dinero para el fin de semana?", "persona": "ana"}'
+```
+
+One-off local run (no HTTP server):
+
+```bash
+./.venv/bin/python scripts/run_local.py
+```
+
+LangGraph dev server / Studio (install the CLI separately - it's not a project
+dependency, since its resolver is heavy):
+
+```bash
+./.venv/bin/pip install "langgraph-cli[inmem]"
+./.venv/bin/langgraph dev
+```
+
+## Validate changes
+
+```bash
+./.venv/bin/ruff check .
+```
