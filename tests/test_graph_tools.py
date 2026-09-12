@@ -45,6 +45,36 @@ class FakeModel(ToolAwareModel):
         return ModelTurn(message=self.message)
 
 
+class SelectUsersModel(ToolAwareModel):
+    async def generate(
+        self,
+        *,
+        query: str,
+        profile: UserProfile,
+        tools: Sequence[MCPToolDefinition],
+        observations: Sequence[Mapping[str, Any]],
+    ) -> ModelTurn:
+        del query, profile, tools
+        if observations:
+            return ModelTurn(message="Usuario cargado.")
+        return ModelTurn(
+            message="",
+            tool_calls=(
+                {
+                    "name": "select_rows",
+                    "arguments": {
+                        "schema": "public",
+                        "table": "users",
+                        "filters": [
+                            {"column": "email", "operator": "eq", "value": "wrong@example.com"},
+                            {"column": "active", "operator": "eq", "value": True},
+                        ],
+                    },
+                },
+            ),
+        )
+
+
 def _tools(*, visualization: bool = True) -> list[MCPToolDefinition]:
     names = ["list_allowed_tables", "describe_table"]
     if visualization:
@@ -268,6 +298,60 @@ async def test_non_visual_question_does_not_call_visualization(
     result, calls, _model = await _run(monkeypatch, "¿Cuál es mi saldo disponible?")
     assert calls == []
     assert result["message"] == "Respuesta textual."
+
+
+@pytest.mark.asyncio
+async def test_select_users_is_scoped_to_request_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_profile(_email: str) -> UserProfile:
+        return PROFILE.copy()
+
+    async def load_tools() -> list[MCPToolDefinition]:
+        return [
+            MCPToolDefinition(
+                name="select_rows",
+                description="Select rows.",
+                input_schema={"type": "object"},
+            )
+        ]
+
+    async def execute(name: str, arguments: Mapping[str, Any] | None) -> MCPToolExecution:
+        resolved = dict(arguments or {})
+        calls.append((name, resolved))
+        return MCPToolExecution(
+            result=CallToolResult(
+                content=[TextContent(text="One user loaded.")],
+                structured_content={"ok": True, "rows": [{"id": "user-id"}]},
+                meta=None,
+                data=None,
+            ),
+            a2ui=None,
+        )
+
+    monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
+    result = await build_graph(
+        model=SelectUsersModel(),
+        tool_loader=load_tools,
+        tool_executor=execute,
+    ).ainvoke({"user_query": "Carga mi usuario", "user_email": EMAIL})
+
+    assert result["message"] == "Usuario cargado."
+    assert calls == [
+        (
+            "select_rows",
+            {
+                "schema": "public",
+                "table": "users",
+                "filters": [
+                    {"column": "active", "operator": "eq", "value": True},
+                    {"column": "email", "operator": "eq", "value": EMAIL},
+                ],
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

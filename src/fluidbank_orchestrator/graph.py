@@ -150,6 +150,25 @@ ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
 ToolExecutor = Callable[[str, Mapping[str, Any] | None], Awaitable[MCPToolExecution]]
 
 
+def _scope_tool_arguments(
+    name: str, arguments: Mapping[str, Any], user_email: str
+) -> dict[str, Any]:
+    """Bind model-driven user lookups to the authenticated request email."""
+    scoped = deepcopy(dict(arguments))
+    if name != "select_rows" or scoped.get("schema") != "public" or scoped.get("table") != "users":
+        return scoped
+
+    raw_filters = scoped.get("filters")
+    filters = list(raw_filters) if isinstance(raw_filters, list) else []
+    scoped["filters"] = [
+        item
+        for item in filters
+        if not (isinstance(item, Mapping) and item.get("column") == "email")
+    ]
+    scoped["filters"].append({"column": "email", "operator": "eq", "value": user_email})
+    return scoped
+
+
 def _normalized(value: str) -> str:
     return "".join(
         character
@@ -459,8 +478,9 @@ def build_graph(
                     }
                 )
                 continue
+            scoped_arguments = _scope_tool_arguments(name, arguments, state["user_email"])
             try:
-                execution = await tool_executor(name, arguments)
+                execution = await tool_executor(name, scoped_arguments)
                 structured = execution.result.structured_content
                 observations.append(
                     {
