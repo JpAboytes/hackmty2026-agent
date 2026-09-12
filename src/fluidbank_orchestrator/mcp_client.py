@@ -281,14 +281,24 @@ def _float_value(row: Mapping[str, object], key: str) -> float:
     return parsed
 
 
+# Accessible defaults for an account that has not chosen presentation settings
+# yet. A new user simply has no row, which is not an error.
+_DEFAULT_PREFERENCES: dict[str, str] = {
+    "literacy_level": "medium",
+    "font_scale": "lg",
+    "contrast": "high",
+    "hit_target": "large",
+}
+
+
 async def fetch_user_context(current_user_id: str) -> UserProfile:
-    """Fetch one configured demo user's context through mandatory MCP scope."""
+    """Fetch one signed-in user's context through mandatory MCP scope."""
     try:
         config = load_mcp_config()
         async with create_mcp_client(config) as client:
             user_rows = await _select(client, config.url, "users", current_user_id)
             if not user_rows:
-                raise UserContextError("no seeded user found for the supplied user id")
+                raise UserContextError("no user found for the supplied user id")
             prefs_rows = await _select(
                 client, config.url, "accessibility_preferences", current_user_id
             )
@@ -301,10 +311,9 @@ async def fetch_user_context(current_user_id: str) -> UserProfile:
     except Exception:  # noqa: BLE001 - expose a stable error without transport secrets
         raise UserContextError("could not reach the remote MCP server") from None
 
-    if not prefs_rows:
-        raise UserContextError("no accessibility preferences seeded for the selected user")
-
-    prefs = prefs_rows[0]
+    # An account with no stored preferences reads with the accessible defaults
+    # rather than losing its real balances to the generic fallback profile.
+    prefs = prefs_rows[0] if prefs_rows else _DEFAULT_PREFERENCES
     available_balance = sum(_float_value(row, "available_balance") for row in account_rows)
     recurring_expenses = sum(
         _float_value(row, "amount")
@@ -313,10 +322,11 @@ async def fetch_user_context(current_user_id: str) -> UserProfile:
     )
 
     return {
-        "literacy_level": _string_value(prefs, "literacy_level"),
-        "font_scale": _string_value(prefs, "font_scale"),
-        "contrast": _string_value(prefs, "contrast"),
-        "hit_target": _string_value(prefs, "hit_target"),
+        "literacy_level": _string_value(prefs, "literacy_level")
+        or _DEFAULT_PREFERENCES["literacy_level"],
+        "font_scale": _string_value(prefs, "font_scale") or _DEFAULT_PREFERENCES["font_scale"],
+        "contrast": _string_value(prefs, "contrast") or _DEFAULT_PREFERENCES["contrast"],
+        "hit_target": _string_value(prefs, "hit_target") or _DEFAULT_PREFERENCES["hit_target"],
         "available_balance": available_balance,
         "recurring_expenses": recurring_expenses,
         "overdraft_risk": _overdraft_risk(available_balance, recurring_expenses),

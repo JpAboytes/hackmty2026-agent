@@ -169,3 +169,38 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
 def test_float_value_rejects_non_finite_values(value: str) -> None:
     with pytest.raises(UserContextError, match="invalid"):
         mcp_client._float_value({"amount": value}, "amount")
+
+
+@pytest.mark.asyncio
+async def test_a_new_user_without_preferences_keeps_its_own_balances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh account has no preferences row, which must not discard its data."""
+    config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
+    user_id = "c72428ad-ebaf-4709-b832-2c0f5094d685"
+
+    async def fake_select(
+        client: _FakeClient,
+        server_identity: str,
+        table: str,
+        current_user_id: str,
+    ) -> list[dict[str, object]]:
+        del client, server_identity, current_user_id
+        rows: dict[str, list[dict[str, object]]] = {
+            "users": [{"id": user_id}],
+            "accessibility_preferences": [],
+            "accounts": [{"available_balance": "42.00"}],
+            "subscriptions": [],
+        }
+        return rows[table]
+
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: config)
+    monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
+    monkeypatch.setattr(mcp_client, "_select", fake_select)
+
+    profile = await fetch_user_context(user_id)
+
+    assert profile["available_balance"] == 42.00
+    assert profile["recurring_expenses"] == 0.0
+    assert profile["literacy_level"] == "medium"
+    assert profile["hit_target"] == "large"
