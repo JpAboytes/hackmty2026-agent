@@ -11,10 +11,12 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
 from fastmcp import Client
 from fastmcp.client.client import CallToolResult
@@ -34,6 +36,10 @@ class MCPConfigurationError(ValueError):
 
 class UserContextError(RuntimeError):
     """Raised when the MCP server is unreachable or a user has no seeded data."""
+
+
+class TrustedUserScopeError(UserContextError):
+    """A scoped MCP operation has no valid server-authenticated UUID."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +145,85 @@ MODEL_TOOL_NAMES = frozenset(
     }
 )
 
+SCOPED_TOOL_NAMES = frozenset(
+    {
+        "select_rows",
+        "visualize_allowed_data",
+        "a2ui_action",
+    }
+)
+
+_OWNERSHIP_FILTER_COLUMNS = frozenset(
+    {
+        "user_id",
+        "customer_id",
+        "account_id",
+        "from_account_id",
+        "to_account_id",
+        "owner_id",
+        "persona_id",
+    }
+)
+
+
+def require_current_user_id(value: object) -> UUID:
+    """Return only a UUID established by the authentication boundary."""
+    if not isinstance(value, UUID):
+        raise TrustedUserScopeError("a valid authenticated user id is required")
+    return value
+
+
+def _business_filters(value: object, *, users_table: bool = False) -> list[object]:
+    filters = list(value) if isinstance(value, list) else []
+    ownership_columns = _OWNERSHIP_FILTER_COLUMNS | ({"id"} if users_table else set())
+    return [
+        item
+        for item in filters
+        if not (isinstance(item, Mapping) and item.get("column") in ownership_columns)
+    ]
+
+
+def enforce_trusted_user_scope(
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+    current_user_id: UUID | None,
+) -> dict[str, Any] | None:
+    """Detach tool arguments and overwrite every server-owned identity field.
+
+    Scoped tools fail closed unless the caller supplies the UUID produced by the
+    authentication boundary. Unscoped tools retain their original schema shape.
+    """
+    if tool_name not in SCOPED_TOOL_NAMES:
+        return deepcopy(dict(arguments)) if arguments is not None else None
+
+    canonical_user_id = str(require_current_user_id(current_user_id))
+    scoped = deepcopy(dict(arguments)) if arguments is not None else {}
+    canonical_scope = {"user_id": canonical_user_id}
+
+    if tool_name == "select_rows":
+        scoped["scope"] = canonical_scope
+        scoped["filters"] = _business_filters(
+            scoped.get("filters"),
+            users_table=scoped.get("schema") == "public" and scoped.get("table") == "users",
+        )
+    elif tool_name == "visualize_allowed_data":
+        raw_request = scoped.get("request")
+        request = deepcopy(dict(raw_request)) if isinstance(raw_request, Mapping) else {}
+        request["scope"] = canonical_scope
+        source = request.get("source")
+        request["filters"] = _business_filters(
+            request.get("filters"),
+            users_table=(
+                isinstance(source, Mapping)
+                and source.get("schema") == "public"
+                and source.get("table") == "users"
+            ),
+        )
+        scoped["request"] = request
+    else:
+        scoped["trustedScope"] = canonical_scope
+    return scoped
+
 
 async def list_remote_tools() -> list[MCPToolDefinition]:
     """Load the real read-only tool collection from the configured endpoint."""
@@ -181,13 +266,15 @@ async def call_mcp_tool(
     name: str,
     arguments: Mapping[str, Any] | None = None,
     *,
+    current_user_id: UUID | None = None,
     bridge: A2UIBridge = DEFAULT_A2UI_BRIDGE,
 ) -> MCPToolExecution:
     """Call any MCP tool and process optional A2UI metadata through one bridge."""
+    trusted_arguments = enforce_trusted_user_scope(name, arguments, current_user_id)
     logger.info("MCP tool selected name=%s", name)
     result = await client.call_tool(
         name,
-        dict(arguments) if arguments is not None else None,
+        trusted_arguments,
         raise_on_error=False,
     )
     logger.info("MCP tool completed name=%s is_error=%s", name, result.is_error)
@@ -206,9 +293,12 @@ async def execute_remote_tool(
     name: str,
     arguments: Mapping[str, Any] | None = None,
     *,
+    current_user_id: UUID | None = None,
     bridge: A2UIBridge = DEFAULT_A2UI_BRIDGE,
 ) -> MCPToolExecution:
     """Execute a tool over the configured remote/local MCP connection."""
+    if name in SCOPED_TOOL_NAMES:
+        require_current_user_id(current_user_id)
     config = load_mcp_config()
     try:
         async with create_mcp_client(config) as client:
@@ -217,6 +307,7 @@ async def execute_remote_tool(
                 config.url,
                 name,
                 arguments,
+                current_user_id=current_user_id,
                 bridge=bridge,
             )
     except MCPConfigurationError:
@@ -229,7 +320,7 @@ async def _select(
     client: Client[Any],
     server_identity: str,
     table: str,
-    current_user_id: str,
+    current_user_id: UUID,
 ) -> list[dict[str, object]]:
     execution = await call_mcp_tool(
         client,
@@ -238,8 +329,8 @@ async def _select(
         {
             "schema": "public",
             "table": table,
-            "scope": {"user_id": current_user_id},
         },
+        current_user_id=current_user_id,
     )
     rows = getattr(execution.result.data, "rows", None)
     if not isinstance(rows, list):
@@ -306,8 +397,9 @@ _DEFAULT_PREFERENCES: dict[str, str] = {
 }
 
 
-async def fetch_user_context(current_user_id: str) -> UserProfile:
+async def fetch_user_context(current_user_id: UUID) -> UserProfile:
     """Fetch one signed-in user's context through mandatory MCP scope."""
+    current_user_id = require_current_user_id(current_user_id)
     try:
         config = load_mcp_config()
         async with create_mcp_client(config) as client:

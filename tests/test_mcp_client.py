@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
+from fastmcp.client.client import CallToolResult
+from mcp.types import TextContent
 
 from fluidbank_orchestrator import mcp_client
 from fluidbank_orchestrator.mcp_client import (
     MODEL_TOOL_NAMES,
     MCPConfig,
     MCPConfigurationError,
+    TrustedUserScopeError,
     UserContextError,
+    call_mcp_tool,
     create_mcp_client,
     fetch_user_context,
     load_mcp_config,
@@ -117,20 +122,20 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
-    user_id = "11111111-1111-1111-1111-111111111111"
-    calls: list[tuple[str, str]] = []
+    user_id = UUID("11111111-1111-1111-1111-111111111111")
+    calls: list[tuple[str, UUID]] = []
 
     async def fake_select(
         client: _FakeClient,
         server_identity: str,
         table: str,
-        current_user_id: str,
+        current_user_id: UUID,
     ) -> list[dict[str, object]]:
         del client
         assert server_identity == _URL
         calls.append((table, current_user_id))
         rows: dict[str, list[dict[str, object]]] = {
-            "users": [{"id": user_id}],
+            "users": [{"id": str(user_id)}],
             "accessibility_preferences": [
                 {
                     "literacy_level": "standard",
@@ -184,17 +189,17 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
 ) -> None:
     """A fresh account has no preferences row, which must not discard its data."""
     config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
-    user_id = "c72428ad-ebaf-4709-b832-2c0f5094d685"
+    user_id = UUID("c72428ad-ebaf-4709-b832-2c0f5094d685")
 
     async def fake_select(
         client: _FakeClient,
         server_identity: str,
         table: str,
-        current_user_id: str,
+        current_user_id: UUID,
     ) -> list[dict[str, object]]:
         del client, server_identity, current_user_id
         rows: dict[str, list[dict[str, object]]] = {
-            "users": [{"id": user_id}],
+            "users": [{"id": str(user_id)}],
             "accessibility_preferences": [],
             "accounts": [
                 {
@@ -227,3 +232,92 @@ def test_owned_money_excludes_credit_and_never_mixes_currencies() -> None:
         {"account_type": "checking", "currency": "USD", "available_balance": 20},
     ]
     assert mcp_client._owned_balances(rows) == {"MXN": 150.0, "USD": 20.0}
+
+
+class _RecordingClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object] | None]] = []
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, object] | None,
+        *,
+        raise_on_error: bool = True,
+    ) -> CallToolResult:
+        assert raise_on_error is False
+        self.calls.append((name, arguments))
+        return CallToolResult(
+            content=[TextContent(text="ok")],
+            structured_content={"ok": True},
+            meta=None,
+            data=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "model_arguments", "scope_path"),
+    [
+        (
+            "select_rows",
+            {
+                "schema": "public",
+                "table": "transactions",
+                "scope": {"user_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
+            },
+            ("scope",),
+        ),
+        (
+            "visualize_allowed_data",
+            {"request": {"scope": {"user_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}}},
+            ("request", "scope"),
+        ),
+        (
+            "a2ui_action",
+            {
+                "name": "refresh",
+                "trustedScope": {"user_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
+            },
+            ("trustedScope",),
+        ),
+    ],
+)
+async def test_mcp_boundary_overwrites_untrusted_user_scope(
+    tool_name: str,
+    model_arguments: dict[str, object],
+    scope_path: tuple[str, ...],
+) -> None:
+    current_user_id = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    client = _RecordingClient()
+
+    await call_mcp_tool(  # type: ignore[arg-type]
+        client,
+        _URL,
+        tool_name,
+        model_arguments,
+        current_user_id=current_user_id,
+    )
+
+    received = client.calls[0][1]
+    assert received is not None
+    value: object = received
+    for key in scope_path:
+        assert isinstance(value, dict)
+        value = value[key]
+    assert value == {"user_id": str(current_user_id)}
+
+
+@pytest.mark.asyncio
+async def test_scoped_mcp_call_without_identity_fails_closed_before_calling_client() -> None:
+    client = _RecordingClient()
+
+    with pytest.raises(TrustedUserScopeError):
+        await call_mcp_tool(  # type: ignore[arg-type]
+            client,
+            _URL,
+            "select_rows",
+            {"schema": "public", "table": "transactions"},
+        )
+
+    assert client.calls == []

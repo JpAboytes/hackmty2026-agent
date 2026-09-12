@@ -6,12 +6,11 @@ import logging
 import unicodedata
 from copy import deepcopy
 from typing import Annotated, Any
-from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from mcp.types import TextContent
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .auth import AuthenticationError, verify_supabase_access_token
 from .graph import graph
@@ -20,6 +19,7 @@ from .mcp_client import (
     MCPToolExecution,
     UserContextError,
     execute_remote_tool,
+    require_current_user_id,
 )
 from .schemas.a2ui import A2UIBundle
 from .schemas.a2ui_action import (
@@ -50,15 +50,12 @@ def health() -> dict[str, str]:
 
 
 class ChatRequest(BaseModel):
-    """A chat turn for one signed-in application user.
+    """A chat turn whose security identity comes only from the bearer token."""
 
-    ``user_id`` is a temporary compatibility field. The endpoint accepts it
-    only when it equals the subject resolved from the Supabase bearer token.
-    """
+    model_config = ConfigDict(extra="forbid")
 
     query: Annotated[str, Field(min_length=1, max_length=20_000)] | None = None
     action: A2UIActionRequest | None = None
-    user_id: UUID
 
     @model_validator(mode="after")
     def exactly_one_input(self) -> ChatRequest:
@@ -121,11 +118,9 @@ async def chat(
 ) -> ChatResponse:
     """Route structured actions directly, then domain intents, then ordinary chat."""
     try:
-        current_user_id = await verify_supabase_access_token(authorization)
-    except AuthenticationError as exc:
+        current_user_id = require_current_user_id(await verify_supabase_access_token(authorization))
+    except (AuthenticationError, UserContextError) as exc:
         raise HTTPException(status_code=401, detail="Authentication required") from exc
-    if str(request.user_id) != current_user_id:
-        raise HTTPException(status_code=403, detail="Authenticated user does not match user_id")
 
     action: dict[str, Any] | None = None
     query = request.query
@@ -145,20 +140,18 @@ async def chat(
         )
 
     if action is not None:
-        scoped_action = {
-            **action,
-            "trustedScope": {"user_id": current_user_id},
-        }
         try:
-            action_execution = await execute_remote_tool("a2ui_action", scoped_action)
+            action_execution = await execute_remote_tool(
+                "a2ui_action",
+                action,
+                current_user_id=current_user_id,
+            )
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()
         if action["name"] == "request_financial_view":
             structured = action_execution.result.structured_content
             request_data = structured.get("request") if isinstance(structured, dict) else None
-            trusted_scope = (
-                structured.get("trustedScope") if isinstance(structured, dict) else None
-            )
+            trusted_scope = structured.get("trustedScope") if isinstance(structured, dict) else None
             intent = (
                 normalize_action_intent(request_data.get("intent"))
                 if isinstance(request_data, dict)
@@ -168,7 +161,7 @@ async def chat(
                 not isinstance(structured, dict)
                 or structured.get("ok") is not True
                 or not isinstance(trusted_scope, dict)
-                or trusted_scope.get("user_id") != current_user_id
+                or trusted_scope.get("user_id") != str(current_user_id)
                 or intent is None
             ):
                 return ChatResponse(
@@ -190,7 +183,11 @@ async def chat(
     if _requests_database_overview(query):
         try:
             return _response_from_tool(
-                await execute_remote_tool("database_overview", {"limit": 50})
+                await execute_remote_tool(
+                    "database_overview",
+                    {"limit": 50},
+                    current_user_id=current_user_id,
+                )
             )
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()

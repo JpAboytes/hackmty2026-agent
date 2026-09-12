@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, TypedDict
+from uuid import UUID
 
 
 class UserProfile(TypedDict):
@@ -23,7 +24,7 @@ class GraphState(TypedDict, total=False):
     """Data passed between graph nodes."""
 
     user_query: str
-    current_user_id: str
+    current_user_id: UUID
     requested_intent: str
     action_requested: bool
     financial_request_intent: str

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fastmcp.client.client import CallToolResult
@@ -13,15 +14,20 @@ import fluidbank_orchestrator.graph as graph_module
 from fluidbank_orchestrator.graph import (
     ModelTurn,
     ToolAwareModel,
-    _scope_tool_arguments,
+    _model_tool_schema,
     build_graph,
 )
-from fluidbank_orchestrator.mcp_client import MCPToolDefinition, MCPToolExecution
+from fluidbank_orchestrator.mcp_client import (
+    MCPToolDefinition,
+    MCPToolExecution,
+    TrustedUserScopeError,
+    enforce_trusted_user_scope,
+)
 from fluidbank_orchestrator.services.financial_presentation import build_financial_presentation
 from fluidbank_orchestrator.state import UserProfile
 
-USER_A = "68dc4d66-07b8-5893-95f1-07f06989a552"
-USER_B = "c1a3797d-b335-5a9d-98a1-402311f82c7a"
+USER_A = UUID("68dc4d66-07b8-5893-95f1-07f06989a552")
+USER_B = UUID("c1a3797d-b335-5a9d-98a1-402311f82c7a")
 PROFILE: UserProfile = {
     "literacy_level": "medium",
     "font_scale": "lg",
@@ -76,11 +82,16 @@ async def _run_graph(
 ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def fake_profile(_current_user_id: str) -> UserProfile:
+    async def fake_profile(_current_user_id: UUID) -> UserProfile:
         return PROFILE.copy()
 
-    async def execute(name: str, arguments: Mapping[str, Any] | None) -> MCPToolExecution:
-        resolved = dict(arguments or {})
+    async def execute(
+        name: str,
+        arguments: Mapping[str, Any] | None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        resolved = enforce_trusted_user_scope(name, arguments, current_user_id) or {}
         calls.append((name, resolved))
         return _execution(rows)
 
@@ -118,7 +129,7 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
     result, calls = await _run_graph(monkeypatch, "¿Cuánto dinero tengo?", rows)
 
     assert [name for name, _ in calls] == ["select_rows"]
-    assert calls[0][1]["scope"] == {"user_id": USER_A}
+    assert calls[0][1]["scope"] == {"user_id": str(USER_A)}
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
     assert presentation.data["owned_balance"] == 150
@@ -200,14 +211,12 @@ async def test_semantic_activity_request_does_not_require_chart_keyword(
     ]
     result, calls = await _run_graph(monkeypatch, "¿Qué días gasto más?", rows)
     assert [name for name, _ in calls] == ["select_rows"]
-    assert calls[0][1]["order_by"] == [
-        {"column": "occurred_at", "direction": "desc"}
-    ]
+    assert calls[0][1]["order_by"] == [{"column": "occurred_at", "direction": "desc"}]
     assert result["financial_presentation"].intent == "spending-analysis"
 
 
 def test_scope_overwrites_model_ownership_and_keeps_business_filters() -> None:
-    scoped = _scope_tool_arguments(
+    scoped = enforce_trusted_user_scope(
         "select_rows",
         {
             "schema": "public",
@@ -220,15 +229,98 @@ def test_scope_overwrites_model_ownership_and_keeps_business_filters() -> None:
         },
         USER_A,
     )
-    assert scoped["scope"] == {"user_id": USER_A}
+    assert scoped is not None
+    assert scoped["scope"] == {"user_id": str(USER_A)}
     assert scoped["filters"] == [{"column": "category", "operator": "eq", "value": "groceries"}]
+
+
+def test_visualization_scope_is_overwritten_without_mutating_model_arguments() -> None:
+    model_arguments = {
+        "request": {
+            "source": {"schema": "public", "table": "transactions"},
+            "scope": {"user_id": str(USER_B)},
+            "filters": [
+                {"column": "user_id", "operator": "eq", "value": str(USER_B)},
+                {"column": "category", "operator": "eq", "value": "groceries"},
+            ],
+        }
+    }
+
+    scoped = enforce_trusted_user_scope("visualize_allowed_data", model_arguments, USER_A)
+
+    assert scoped is not None
+    assert scoped["request"]["scope"] == {"user_id": str(USER_A)}
+    assert scoped["request"]["filters"] == [
+        {"column": "category", "operator": "eq", "value": "groceries"}
+    ]
+    assert model_arguments["request"]["scope"] == {"user_id": str(USER_B)}
+
+
+def test_model_facing_schemas_hide_trusted_scope_fields() -> None:
+    tool = MCPToolDefinition(
+        name="visualize_allowed_data",
+        description="Visualize rows.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "request": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "object",
+                            "properties": {"user_id": {"type": "string"}},
+                        },
+                        "visualization": {"type": "string"},
+                    },
+                    "required": ["scope", "visualization"],
+                }
+            },
+        },
+    )
+
+    model_schema = _model_tool_schema(tool)
+    request_schema = model_schema["properties"]["request"]
+
+    assert "scope" not in request_schema["properties"]
+    assert request_schema["required"] == ["visualization"]
+    assert "scope" in tool.input_schema["properties"]["request"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_missing_graph_identity_fails_before_loading_or_executing_tools() -> None:
+    loaded = False
+    executed = False
+
+    async def load_tools() -> list[MCPToolDefinition]:
+        nonlocal loaded
+        loaded = True
+        return await _select_tool()
+
+    async def execute(
+        _name: str,
+        _arguments: Mapping[str, Any] | None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        del current_user_id
+        nonlocal executed
+        executed = True
+        return _execution([])
+
+    with pytest.raises(TrustedUserScopeError):
+        await build_graph(model=FakeModel(), tool_loader=load_tools, tool_executor=execute).ainvoke(
+            {"user_query": "Muéstrame mis movimientos"}
+        )
+
+    assert loaded is False
+    assert executed is False
 
 
 @pytest.mark.asyncio
 async def test_plain_conversation_can_finish_without_chat_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_profile(_current_user_id: str) -> UserProfile:
+    async def fake_profile(_current_user_id: UUID) -> UserProfile:
         return PROFILE.copy()
 
     monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
@@ -243,7 +335,7 @@ async def test_plain_conversation_can_finish_without_chat_message(
 async def test_unresolvable_user_never_receives_placeholder_money(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def unavailable(_current_user_id: str) -> UserProfile:
+    async def unavailable(_current_user_id: UUID) -> UserProfile:
         raise graph_module.UserContextError("missing")
 
     monkeypatch.setattr(graph_module, "fetch_user_context", unavailable)

@@ -64,7 +64,7 @@ def _bearer_token(authorization: str | None) -> str:
     return token
 
 
-def _authenticated_subject(payload: Any) -> str:
+def _authenticated_subject(payload: Any) -> UUID:
     if not isinstance(payload, Mapping):
         raise AuthenticationError("The Supabase user response is invalid")
     raw_id = payload.get("id")
@@ -78,10 +78,10 @@ def _authenticated_subject(payload: Any) -> str:
         raise AuthenticationError("Anonymous accounts cannot use the banking agent")
     if not payload.get("email_confirmed_at") and not payload.get("confirmed_at"):
         raise AuthenticationError("The Supabase account is not confirmed")
-    return str(subject)
+    return subject
 
 
-async def verify_supabase_access_token(authorization: str | None) -> str:
+async def verify_supabase_access_token(authorization: str | None) -> UUID:
     """Resolve the trusted UUID through Supabase Auth's authenticated user endpoint."""
     token = _bearer_token(authorization)
     config = load_supabase_auth_config()

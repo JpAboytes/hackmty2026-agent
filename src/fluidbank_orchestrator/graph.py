@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
+from uuid import UUID
 
 from google import genai
 from google.genai import types
@@ -24,6 +25,7 @@ from .mcp_client import (
     execute_remote_tool,
     fetch_user_context,
     list_remote_tools,
+    require_current_user_id,
 )
 from .schemas.banking_view import FinancialIntent
 from .services.financial_presentation import (
@@ -141,7 +143,7 @@ class GeminiToolAwareModel:
             types.FunctionDeclaration(
                 name=tool.name,
                 description=tool.description,
-                parameters_json_schema=_gemini_safe_schema(deepcopy(tool.input_schema)),
+                parameters_json_schema=_model_tool_schema(tool),
             )
             for tool in tools
         ]
@@ -187,60 +189,42 @@ class GeminiToolAwareModel:
 
 
 ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
-ToolExecutor = Callable[[str, Mapping[str, Any] | None], Awaitable[MCPToolExecution]]
 
 
-_OWNERSHIP_FILTER_COLUMNS = frozenset(
-    {
-        "user_id",
-        "customer_id",
-        "account_id",
-        "from_account_id",
-        "to_account_id",
-        "owner_id",
-        "persona_id",
-    }
-)
+class ToolExecutor(Protocol):
+    async def __call__(
+        self,
+        name: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution: ...
 
 
-def _business_filters(value: object, *, users_table: bool = False) -> list[object]:
-    filters = list(value) if isinstance(value, list) else []
-    ownership_columns = _OWNERSHIP_FILTER_COLUMNS | ({"id"} if users_table else set())
-    return [
-        item
-        for item in filters
-        if not (isinstance(item, Mapping) and item.get("column") in ownership_columns)
-    ]
+def _strip_model_identity_fields(node: Any) -> Any:
+    """Remove trusted identity properties from a detached model-facing schema."""
+    if isinstance(node, dict):
+        stripped = {key: _strip_model_identity_fields(value) for key, value in node.items()}
+        properties = stripped.get("properties")
+        if isinstance(properties, dict):
+            properties.pop("scope", None)
+            properties.pop("trustedScope", None)
+        required = stripped.get("required")
+        if isinstance(required, list):
+            stripped["required"] = [
+                value for value in required if value not in {"scope", "trustedScope"}
+            ]
+        return stripped
+    if isinstance(node, list):
+        return [_strip_model_identity_fields(value) for value in node]
+    return node
 
 
-def _scope_tool_arguments(
-    name: str, arguments: Mapping[str, Any], current_user_id: str
-) -> dict[str, Any]:
-    """Overwrite model-controlled ownership inputs with canonical graph state."""
-    scoped = deepcopy(dict(arguments))
-    canonical_scope = {"user_id": current_user_id}
-    if name == "select_rows":
-        scoped["scope"] = canonical_scope
-        scoped["filters"] = _business_filters(
-            scoped.get("filters"),
-            users_table=scoped.get("schema") == "public" and scoped.get("table") == "users",
-        )
-        return scoped
-    if name == "visualize_allowed_data":
-        raw_request = scoped.get("request")
-        request = deepcopy(dict(raw_request)) if isinstance(raw_request, Mapping) else {}
-        request["scope"] = canonical_scope
-        source = request.get("source")
-        request["filters"] = _business_filters(
-            request.get("filters"),
-            users_table=(
-                isinstance(source, Mapping)
-                and source.get("schema") == "public"
-                and source.get("table") == "users"
-            ),
-        )
-        scoped["request"] = request
-    return scoped
+def _model_tool_schema(tool: MCPToolDefinition) -> dict[str, Any]:
+    schema = _gemini_safe_schema(deepcopy(tool.input_schema))
+    if tool.name in {"select_rows", "visualize_allowed_data"}:
+        schema = _strip_model_identity_fields(schema)
+    return cast("dict[str, Any]", schema)
 
 
 def _tool_definitions(state: GraphState) -> list[MCPToolDefinition]:
@@ -335,6 +319,9 @@ def build_graph(
     """Build an injectable graph with an explicit model -> tools -> model loop."""
     resolved_model = model or GeminiToolAwareModel()
 
+    async def validate_identity_node(state: GraphState) -> GraphState:
+        return {"current_user_id": require_current_user_id(state.get("current_user_id"))}
+
     async def load_tools_node(_state: GraphState) -> GraphState:
         try:
             tools = await tool_loader()
@@ -344,7 +331,8 @@ def build_graph(
 
     async def fetch_context_node(state: GraphState) -> GraphState:
         try:
-            profile = await fetch_user_context(state["current_user_id"])
+            current_user_id = require_current_user_id(state.get("current_user_id"))
+            profile = await fetch_user_context(current_user_id)
         except (MCPConfigurationError, UserContextError):
             # Missing context must never become invented financial data.
             return {"user_profile": _FALLBACK_PROFILE.copy(), "context_available": False}
@@ -430,9 +418,12 @@ def build_graph(
                     }
                 )
                 continue
-            scoped_arguments = _scope_tool_arguments(name, arguments, state["current_user_id"])
             try:
-                execution = await tool_executor(name, scoped_arguments)
+                execution = await tool_executor(
+                    name,
+                    arguments,
+                    current_user_id=require_current_user_id(state.get("current_user_id")),
+                )
                 structured = execution.result.structured_content
                 observations.append(
                     {
@@ -489,13 +480,15 @@ def build_graph(
         return END
 
     workflow = StateGraph(GraphState)
+    workflow.add_node("validate_identity", cast("Any", validate_identity_node))
     workflow.add_node("load_tools", cast("Any", load_tools_node))
     workflow.add_node("fetch_context", cast("Any", fetch_context_node))
     workflow.add_node("agent", cast("Any", agent_node))
     workflow.add_node("tools", cast("Any", tools_node))
     workflow.add_node("select_presentation", cast("Any", select_presentation_node))
     workflow.add_node("build_presentation", cast("Any", build_presentation_node))
-    workflow.add_edge(START, "load_tools")
+    workflow.add_edge(START, "validate_identity")
+    workflow.add_edge("validate_identity", "load_tools")
     workflow.add_edge("load_tools", "fetch_context")
     workflow.add_edge("fetch_context", "agent")
     workflow.add_conditional_edges(
