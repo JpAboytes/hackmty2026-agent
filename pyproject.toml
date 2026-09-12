@@ -27,6 +27,10 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/fluidbank_orchestrator"]
 
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -8,7 +8,7 @@ LangGraph agent for the accessibility-first banking demo. It fetches real financ
 src/fluidbank_orchestrator/
   graph.py         LangGraph workflow: fetch_context -> intent
   state.py         Graph state (TypedDict)
-  mcp_client.py     MCP client: deployed Horizon endpoint, local stdio fallback
+  mcp_client.py     Remote MCP client: validated config, Horizon bearer auth
   personas.py       Fixed demo persona ids (seeded by hackmty2026-mcp)
   api.py            FastAPI entrypoint
 scripts/
