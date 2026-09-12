@@ -69,7 +69,7 @@ The system consists of independently maintained repositories and deployable comp
 - LangGraph implemented in the backend language selected for the orchestration repository.
 - Interprets user intent and obtains the minimum required data by calling the MCP server's tools.
 - Drafts conversational text grounded in that data and extracts structured parameters (e.g. a requested number of months) the MCP server needs to build the right surface.
-- Never constructs, edits, or validates A2UI content. The MCP server is the only component that produces A2UI; the orchestrator relays whatever it returns to the mobile client untouched.
+- Never invents, translates, or asks the LLM to edit A2UI content. The MCP server is the only component that produces A2UI. The orchestrator validates MCP-produced messages, resolves the MCP-selected static resource, and packages the original validated message objects for the mobile transport.
 - Must not directly mutate client state or generate executable client code.
 - Must enforce confirmation boundaries for actions that could affect financial decisions or user data: user-triggered actions are dispatched deterministically to the MCP server's action tool, never decided or rewritten by the LLM.
 
@@ -102,7 +102,7 @@ It consumes the versioned shared contract package. It must not import source fil
 
 Owns LangGraph state, intent routing, prompt and policy logic, the MCP client integration, and orchestrator tests. It does not own template selection or A2UI payload generation - that belongs to the MCP repository.
 
-It consumes the versioned shared contract definition only to type the A2UI envelope it relays; it must never construct or edit A2UI content. It communicates with the MCP server through its public tool interface, whether a local stdio process or its deployed HTTP endpoint, and forwards MCP-produced A2UI content to the mobile client unmodified.
+It consumes the official A2UI schema to validate the envelope it relays; it must never invent, translate, or semantically edit A2UI content. It communicates with the MCP server through its public tool and resource interfaces, whether a local stdio process or its deployed HTTP endpoint. Because Mobile is not an MCP client, the orchestrator combines the MCP-produced static resource messages and embedded dynamic messages into one ordered, self-contained response.
 
 ### 6.3 MCP and Data Repository
 
@@ -147,13 +147,13 @@ Template selection must be deterministic for the same normalized request, user c
 
 ## 8. A2UI Contract
 
-The system implements Google's A2UI protocol as-is: a hard requirement, not a bespoke JSON format inspired by it. An earlier draft of this document specified a flat, single-shot payload (`version` / `template_id` / `surface.components[]`); that draft is superseded and must not be implemented. The MCP repository (`hackmty2026-mcp`) is the sole source of truth for the wire format, under `src/supabase_mcp/a2ui/`.
+The system implements Google's A2UI protocol as-is: a hard requirement, not a bespoke JSON format inspired by it. An earlier draft of this document specified a flat, single-shot payload (`a2ui/v1`, `meta`, `surface`, `Banner`, `MetricCard`, and `InteractiveSlider`); that draft is superseded and must not be implemented. The MCP repository is the source of truth for the produced wire format, under `src/supabase_mcp/a2ui_support/`.
 
 ### 8.1 Ownership
 
 - **MCP server**: builds and validates every A2UI artifact - templates, resources, surfaces, the component catalog, `updateDataModel` patches, actions, and A2UI error responses. This is the only component allowed to construct or edit A2UI content.
-- **Agent orchestrator**: calls the MCP server's tools and relays whatever A2UI content they return to the mobile client, byte-for-byte. The LLM never sees, generates, or modifies A2UI JSON - only the accompanying plain text and structured data.
-- **Mobile client**: implements the A2UI renderer, the component catalog, per-surface state, data bindings, template/catalog caching, and dispatches user actions.
+- **Agent orchestrator**: calls MCP domain tools, reads `_meta.ui`, resolves the selected MCP resource, validates static and dynamic messages, and returns detached copies in source order. The LLM never sees, generates, or modifies A2UI JSON.
+- **Mobile client**: implements the A2UI renderer, the component catalog, per-surface state, data bindings, and dispatches user actions. It is not an MCP client and never dereferences an `a2ui://` URI.
 
 ### 8.2 Transport shape
 
@@ -167,7 +167,7 @@ ToolResult
 └── _meta.ui                                        → template/surface metadata
 ```
 
-Templates are also published directly through MCP's `resources/read`. Component catalogs are negotiated per session via `_meta.a2ui.clientCapabilities` / `supportedCatalogIds`.
+Templates are also published directly through MCP's `resources/read`. A tool selects a complete surface through `_meta.ui.resourceUri`; it does not select an individual component. Components remain declarations inside the selected static surface template.
 
 ### 8.3 Envelope forwarded by the agent
 
@@ -178,8 +178,16 @@ The orchestrator's HTTP response to the mobile client separates conversational c
   "message": "Encontré 5 resultados.",
   "data": { "count": 5 },
   "a2ui": {
-    "resourceUri": "a2ui://database/overview",
+    "resource_uri": "a2ui://database/overview",
     "messages": [
+      {
+        "version": "v0.9.1",
+        "createSurface": {}
+      },
+      {
+        "version": "v0.9.1",
+        "updateComponents": {}
+      },
       {
         "version": "v0.9.1",
         "updateDataModel": {
@@ -193,17 +201,33 @@ The orchestrator's HTTP response to the mobile client separates conversational c
 }
 ```
 
-`a2ui` is `null` whenever the MCP server has nothing to render for that turn (e.g. a plain conversational reply). The orchestrator must never populate or alter this field's contents beyond copying it from the MCP response.
+The abbreviated bodies above represent complete official envelopes. `messages` always contains JSON objects, never encoded JSON strings. For a normal new surface, the order is `createSurface` → `updateComponents` → `updateDataModel`. `a2ui` is `null` whenever the MCP server has nothing to render or the optional presentation cannot be validated; the successful MCP text fallback and structured `data` remain available.
 
-### 8.4 Actions
+### 8.4 Agent bridge and cache
 
-User-triggered actions (button presses, confirmations) call the MCP server's action tool deterministically from the mobile/agent layer. They must not be routed through the LLM to decide whether or how to call it. The MCP server validates the action, applies the resulting `updateDataModel`, and the agent relays the update back to Mobile the same way as the original surface.
+The generic bridge uses public FastMCP result fields. It reads runtime `CallToolResult.meta["ui"]`, requires an `a2ui://` resource URI and `application/a2ui+json`, reads that URI through the connected MCP client's `resources/read`, and extracts only matching `EmbeddedResource` content from the tool result. It validates the template, dynamic updates, surface consistency, exact `v0.9.1` protocol, and complete sequence with the official SDK.
 
-### 8.5 Accessibility boundary
+Validated static templates are cached by MCP server identity plus resource URI in a bounded process-local LRU cache. The cache never stores `updateDataModel` data, returns detached copies, coalesces concurrent reads for the same uncached key, and does not retain failed reads. Static messages are included on every response because Mobile treats each response as a self-contained replacement.
+
+The bridge allowlists exactly the v0.9.1 Basic Catalog and `https://fluidbank.app/a2ui/catalogs/finance/v1`. Basic remains `Text`, `Button`, `Card`, and `Column`; Finance adds the strict `Chart` component. Each template is validated with the catalog declared by `createSurface`, so `Chart` under Basic, unknown Finance components, inline catalogs, and all other catalog IDs fail before forwarding.
+
+The agent carries a checked-in copy of Finance v1 because the bridge validates offline and must not expose MCP credentials or ask Expo to fetch resources. A parity test compares that copy with the MCP source catalog, checks the Expo catalog ID, and shares representative accepted/rejected chart fixtures. The generic bridge still branches on `_meta.ui`, not tool names: it reads and caches `a2ui://finance/data-chart`, validates the static messages, appends only the dynamic `updateDataModel`, and returns JSON objects in static-before-dynamic order. Cache entries never contain banking rows.
+
+The one wire component binds `{kind: "area", accessibleSummary?, props}` or `{kind: "heatmap", accessibleSummary?, props}`. The agent enforces stable unique area series IDs, 240 area points, 500 heatmap cells, finite bounded values, actual calendar dates, unique labels/dates, and forbidden unknown properties. Future catalog components require a versioned SDK-valid schema, matching agent/client validators, a trusted Expo adapter, and cross-repository fixtures; they do not require tool-name special cases in this bridge.
+
+### 8.5 Actions
+
+User-triggered actions (button presses, confirmations) call the MCP server's `a2ui_action` tool deterministically from the mobile/agent layer. During the temporary chat-transport compatibility period, the agent strictly parses Mobile's serialized action JSON, requires exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`, and forwards those values unchanged. Actions never enter the LLM. The MCP action registry enforces action/component allowlists, and any A2UI-enabled result returns through the same generic bridge.
+
+### 8.6 Accessibility boundary
 
 Personal accessibility preferences (font scale, high contrast, dark mode, reduced motion, screen reader state, large touch targets) are a Mobile/renderer concern and are not sent to the MCP server. The MCP server emits semantic components (e.g. `variant: "h1"`, not `fontSize: 28`) and lets the renderer map them to accessible native widgets. The MCP server only needs to know about an accessibility preference when it changes *what content or structure* to send, not merely its style - for example `prefersDataTable`, `requiresTextAlternative`, or `avoidTimeLimitedInteractions` passed via request `_meta`, never inside the LLM prompt.
 
-### 8.6 General requirements
+### 8.7 Current integration proof
+
+`database_overview` is a development/integration proof for the bridge. It selects `a2ui://database/overview`, whose static template declares `Text`, `Button`, `Card`, and `Column`, and embeds its dynamic `updateDataModel`. It demonstrates protocol integration over allowlisted database metadata; it is not a consumer-facing banking surface.
+
+### 8.8 General requirements
 
 - Every component has a stable, unique id within its surface.
 - Component types, catalog entries, and action names are enumerated by the MCP server's catalog/template implementation, not invented by the LLM.

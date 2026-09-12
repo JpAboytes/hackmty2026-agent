@@ -6,9 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
+from fluidbank_orchestrator import mcp_client
 from fluidbank_orchestrator.mcp_client import (
+    MCPConfig,
     MCPConfigurationError,
+    UserContextError,
     create_mcp_client,
+    fetch_user_context,
     load_mcp_config,
 )
 
@@ -93,3 +97,66 @@ def test_horizon_client_uses_expected_remote_url_and_raw_token() -> None:
 def test_invalid_mcp_endpoint_is_rejected(url: str) -> None:
     with pytest.raises(MCPConfigurationError):
         load_mcp_config({"MCP_SERVER_URL": url, "HORIZON_API_KEY": _TOKEN})
+
+
+class _FakeClient:
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_context_resolves_email_to_user_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
+    user_id = "11111111-1111-1111-1111-111111111111"
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_select(
+        client: _FakeClient,
+        server_identity: str,
+        table: str,
+        column: str,
+        value: str,
+    ) -> list[dict[str, object]]:
+        del client
+        assert server_identity == _URL
+        calls.append((table, column, value))
+        rows: dict[str, list[dict[str, object]]] = {
+            "users": [{"id": user_id}],
+            "accessibility_preferences": [
+                {
+                    "literacy_level": "standard",
+                    "font_scale": "1.0",
+                    "contrast": "standard",
+                    "hit_target": "standard",
+                }
+            ],
+            "accounts": [{"available_balance": "1250.50"}],
+            "subscriptions": [{"amount": "19.99", "status": "active"}],
+        }
+        return rows[table]
+
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: config)
+    monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
+    monkeypatch.setattr(mcp_client, "_select", fake_select)
+
+    profile = await fetch_user_context("ana.demo@fluidbank.test")
+
+    assert calls[0] == ("users", "email", "ana.demo@fluidbank.test")
+    assert calls[1:] == [
+        ("accessibility_preferences", "user_id", user_id),
+        ("accounts", "user_id", user_id),
+        ("subscriptions", "user_id", user_id),
+    ]
+    assert profile["available_balance"] == 1250.50
+    assert profile["recurring_expenses"] == 19.99
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e10000"])
+def test_float_value_rejects_non_finite_values(value: str) -> None:
+    with pytest.raises(UserContextError, match="invalid"):
+        mcp_client._float_value({"amount": value}, "amount")
