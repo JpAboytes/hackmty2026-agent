@@ -7,6 +7,7 @@ directly to FastMCP; it is never added to graph state or model-visible data.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Mapping
@@ -42,6 +43,22 @@ class MCPToolExecution:
     result: CallToolResult
     a2ui: A2UIBundle | None
     presentation_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MCPToolDefinition:
+    """Detached, JSON-safe tool definition loaded from the active MCP endpoint."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": dict(self.input_schema),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +128,52 @@ def create_mcp_client(config: MCPConfig | None = None) -> Client[Any]:
 
 DEFAULT_A2UI_BRIDGE = A2UIBridge()
 
+MODEL_TOOL_NAMES = frozenset(
+    {
+        "health_check",
+        "list_allowed_tables",
+        "describe_table",
+        "select_rows",
+        "database_overview",
+        "visualize_allowed_data",
+    }
+)
+
+
+async def list_remote_tools() -> list[MCPToolDefinition]:
+    """Load the real read-only tool collection from the configured endpoint."""
+    config = load_mcp_config()
+    try:
+        async with create_mcp_client(config) as client:
+            listed = await client.list_tools()
+    except MCPConfigurationError:
+        raise
+    except Exception:
+        raise UserContextError("could not load tools from the remote MCP server") from None
+
+    definitions: list[MCPToolDefinition] = []
+    for tool in listed:
+        if tool.name not in MODEL_TOOL_NAMES:
+            continue
+        schema = dict(tool.input_schema)
+        try:
+            json.dumps(schema, allow_nan=False)
+        except (TypeError, ValueError):
+            raise UserContextError("the MCP tool schema was invalid") from None
+        definitions.append(
+            MCPToolDefinition(
+                name=tool.name,
+                description=tool.description or "",
+                input_schema=schema,
+            )
+        )
+    logger.info(
+        "Loaded MCP model tools count=%d visualization_available=%s",
+        len(definitions),
+        any(tool.name == "visualize_allowed_data" for tool in definitions),
+    )
+    return definitions
+
 
 async def call_mcp_tool(
     client: Client[Any],
@@ -121,7 +184,13 @@ async def call_mcp_tool(
     bridge: A2UIBridge = DEFAULT_A2UI_BRIDGE,
 ) -> MCPToolExecution:
     """Call any MCP tool and process optional A2UI metadata through one bridge."""
-    result = await client.call_tool(name, dict(arguments) if arguments is not None else None)
+    logger.info("MCP tool selected name=%s", name)
+    result = await client.call_tool(
+        name,
+        dict(arguments) if arguments is not None else None,
+        raise_on_error=False,
+    )
+    logger.info("MCP tool completed name=%s is_error=%s", name, result.is_error)
     try:
         a2ui = await bridge.build_bundle(client, result, server_identity=server_identity)
     except A2UIBridgeError as exc:

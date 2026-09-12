@@ -15,7 +15,7 @@ Expo
 
 ```text
 src/fluidbank_orchestrator/
-  graph.py         LangGraph workflow: fetch_context -> intent
+  graph.py         LangGraph workflow: runtime tools -> agent -> tools -> agent
   state.py         Graph state (TypedDict)
   mcp_client.py     Generic tool execution, validated config, Horizon bearer auth
   schemas/
@@ -51,7 +51,9 @@ curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
   -d '{"query": "Tengo dinero para el fin de semana?", "email": "ana.demo@fluidbank.test"}'
 ```
 
-A request for a database overview or available database objects deterministically calls the existing MCP `database_overview` domain tool. That tool selects the entire `a2ui://database/overview` surface through `_meta.ui.resourceUri`; no component-selection tool exists. The agent reads the static `createSurface` and `updateComponents` resource through MCP, combines it with the embedded dynamic `updateDataModel`, and returns:
+A request for a database overview or available database objects deterministically calls the existing MCP `database_overview` domain tool. Explicit chart, graph, trend, daily-activity, calendar-heatmap, and series-comparison requests enter the graph's tool loop. The agent loads the active deployment's actual tool schemas, confirms `visualize_allowed_data` is available, discovers exact allowlisted object and column names through `list_allowed_tables` and `describe_table`, and only then calls the visualization tool. Area charts are used for ordered trends/comparisons and heatmaps for date-based intensity. No component-selection tool exists.
+
+The selected domain tool chooses the entire A2UI surface through `_meta.ui.resourceUri`. The agent calls FastMCP with `raise_on_error=False` so sanitized error `CallToolResult` objects are preserved instead of becoming generic transport failures. For successful presentations it retains the raw result, reads the static `createSurface` and `updateComponents` resource through MCP, combines it with the embedded dynamic `updateDataModel`, and returns:
 
 ```json
 {
@@ -72,7 +74,7 @@ The bodies above are abbreviated; actual messages are complete JSON objects rath
 
 Expo's temporary action serialization is parsed as strict JSON and forwarded directly to `a2ui_action` with exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`. It never goes through Gemini. The MCP action registry remains authoritative for allowed action/component pairs, and action results use the same A2UI bridge.
 
-Only the official v0.9.1 Basic Catalog and Expo's current `Text`, `Button`, `Card`, and `Column` subset are accepted. Charts require a future shared custom catalog. `database_overview` is an integration proof over allowlisted database objects, not a consumer banking screen. Future financial tools that follow the same MCP metadata/resource/update contract need no component-specific bridge code.
+Only the official v0.9.1 Basic Catalog and the fixed Finance v1 catalog are accepted. Basic supports Expo's `Text`, `Button`, `Card`, and `Column` subset. Finance adds the strict `Chart` union, which can resolve only to the existing area or heatmap adapters. `database_overview` is an integration proof over allowlisted database objects, not a consumer banking screen. Future financial tools that follow the same MCP metadata/resource/update contract need no component-specific bridge code.
 
 One-off local run (no HTTP server):
 

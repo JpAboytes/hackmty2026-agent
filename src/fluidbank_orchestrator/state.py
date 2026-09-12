@@ -6,7 +6,7 @@ server's A2UI implementation, not the agent.
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 
 class UserProfile(TypedDict):
@@ -30,3 +30,8 @@ class GraphState(TypedDict, total=False):
     user_profile: UserProfile
     message: str
     months: int
+    available_tools: list[dict[str, Any]]
+    tool_calls: list[dict[str, Any]]
+    tool_observations: list[dict[str, Any]]
+    final_tool_execution: object
+    tool_loop_count: int

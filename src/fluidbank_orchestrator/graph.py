@@ -1,21 +1,33 @@
-"""LangGraph workflow for ordinary conversational requests.
-
-The API routes deterministic A2UI domain tools and actions outside this graph.
-This graph preserves the existing context-fetching and Gemini reasoning path;
-it never receives or generates A2UI messages.
-"""
+"""LangGraph model/tool loop for conversational and A2UI requests."""
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import unicodedata
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Protocol, cast
 
 from google import genai
 from google.genai import types
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from .mcp_client import UserContextError, fetch_user_context
+from .mcp_client import (
+    MCPConfigurationError,
+    MCPToolDefinition,
+    MCPToolExecution,
+    UserContextError,
+    execute_remote_tool,
+    fetch_user_context,
+    list_remote_tools,
+)
 from .state import GraphState, UserProfile
+
+logger = logging.getLogger(__name__)
 
 _FALLBACK_PROFILE: UserProfile = {
     "literacy_level": "medium",
@@ -26,6 +38,19 @@ _FALLBACK_PROFILE: UserProfile = {
     "recurring_expenses": 3200.0,
     "available_balance": 1200.0,
 }
+_MAX_TOOL_TURNS = 8
+_NUMERIC_TYPES = (
+    "SMALLINT",
+    "INTEGER",
+    "BIGINT",
+    "DECIMAL",
+    "NUMERIC",
+    "REAL",
+    "DOUBLE",
+    "FLOAT",
+    "MONEY",
+)
+_DATE_TYPES = ("DATE", "TIME", "TIMESTAMP")
 
 
 class _Intent(BaseModel):
@@ -33,80 +58,448 @@ class _Intent(BaseModel):
     months: int | None = None
 
 
-async def fetch_context_node(state: GraphState) -> dict[str, UserProfile]:
-    """Fetch accessibility/financial context through the MCP server.
-
-    Falls back to a static demo profile if Supabase or the MCP server is
-    unreachable, per the local demo mode required by PROJECT_SPEC.MD.
-    """
-    try:
-        profile = await fetch_user_context(state["user_email"])
-    except UserContextError:
-        profile = _FALLBACK_PROFILE.copy()
-    return {"user_profile": profile}
+@dataclass(frozen=True, slots=True)
+class ModelTurn:
+    message: str
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    months: int | None = None
 
 
-def _fallback_intent() -> _Intent:
-    """Deterministic reply used when Gemini is unavailable."""
-    return _Intent(message="No pude generar una respuesta personalizada en este momento.")
+class ToolAwareModel(Protocol):
+    async def generate(
+        self,
+        *,
+        query: str,
+        profile: UserProfile,
+        tools: Sequence[MCPToolDefinition],
+        observations: Sequence[Mapping[str, Any]],
+    ) -> ModelTurn: ...
 
 
-_INTENT_PROMPT = """Eres el asistente conversacional de un agente bancario accesible.
-Responde brevemente (1-2 oraciones, en español) a la consulta del usuario usando
-únicamente los datos de su contexto financiero. Nunca inventes cifras que no
-estén en el contexto, y nunca describas botones, pantallas ni componentes
-visuales: eso lo decide otro sistema.
+_MODEL_PROMPT = """Eres un asistente bancario accesible y conciso. Responde en español.
+Usa exclusivamente los datos proporcionados y las herramientas MCP disponibles.
+Para solicitudes explícitas de gráfica o visualización, usa visualize_allowed_data.
+Nunca inventes esquemas, tablas o columnas: descubre primero con list_allowed_tables y
+describe_table. Usa area para tendencias ordenadas y comparaciones; usa heatmap para
+actividad o intensidad por fecha. No fuerces gráficas para preguntas de valores o texto.
+No generes ni copies JSON A2UI: el puente de la aplicación conserva el resultado MCP.
 
-Si la consulta pide simular una compra a plazos, incluye "months" (entero,
-3 a 18) con el número de meses solicitado; si no aplica, deja "months" como
-null.
-
-Ajusta el vocabulario al nivel de alfabetización financiera del usuario:
-"low" = lenguaje muy simple y directo, "medium" = lenguaje claro, "high" = puede
-incluir más detalle.
-
-Contexto del usuario:
-- Saldo disponible: {available_balance}
-- Gastos recurrentes mensuales: {recurring_expenses}
-- Riesgo de sobregiro (0 a 1): {overdraft_risk}
-- Nivel de alfabetización financiera: {literacy_level}
-
-Consulta del usuario: "{query}"
+Consulta: {query}
+Perfil: {profile}
+Observaciones MCP anteriores: {observations}
 """
 
 
-async def intent_node(state: GraphState) -> dict[str, object]:
-    """Draft a grounded conversational reply and extract structured
-    parameters (e.g. months) with Gemini. Falls back to a plain message if
-    the LLM call fails, per the local demo mode required by PROJECT_SPEC.MD.
-    """
-    profile = state["user_profile"]
-    query = state["user_query"]
-    try:
-        client = genai.Client()
-        response = client.models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
-            contents=_INTENT_PROMPT.format(query=query, **profile),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=_Intent,
+class GeminiToolAwareModel:
+    """Gemini adapter that receives the exact runtime MCP tool schemas."""
+
+    async def generate(
+        self,
+        *,
+        query: str,
+        profile: UserProfile,
+        tools: Sequence[MCPToolDefinition],
+        observations: Sequence[Mapping[str, Any]],
+    ) -> ModelTurn:
+        declarations = [
+            types.FunctionDeclaration(
+                name=tool.name,
+                description=tool.description,
+                parameters_json_schema=deepcopy(tool.input_schema),
+            )
+            for tool in tools
+        ]
+        prompt = _MODEL_PROMPT.format(
+            query=query,
+            profile=json.dumps(profile, ensure_ascii=False, sort_keys=True),
+            observations=json.dumps(list(observations), ensure_ascii=False, sort_keys=True),
+        )
+        try:
+            response = await genai.Client().aio.models.generate_content(
+                model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(function_declarations=declarations)]
+                    if declarations
+                    else None,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    response_mime_type="application/json",
+                    response_schema=_Intent,
+                ),
+            )
+            allowed = {tool.name for tool in tools}
+            calls: list[dict[str, Any]] = []
+            for function_call in response.function_calls or []:
+                if function_call.name not in allowed:
+                    continue
+                arguments = function_call.args
+                if not isinstance(arguments, Mapping):
+                    continue
+                calls.append({"name": function_call.name, "arguments": dict(arguments)})
+            if calls:
+                return ModelTurn(message="", tool_calls=tuple(calls[:2]))
+            parsed = response.parsed
+            intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
+            return ModelTurn(message=intent.message, months=intent.months)
+        except Exception as exc:  # noqa: BLE001 - deterministic policies remain available
+            logger.warning("Gemini model turn failed (%s)", type(exc).__name__)
+        return ModelTurn(message="No pude generar una respuesta personalizada en este momento.")
+
+
+ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
+ToolExecutor = Callable[[str, Mapping[str, Any] | None], Awaitable[MCPToolExecution]]
+
+
+def _normalized(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
+def _visualization_kind(query: str) -> str | None:
+    text = _normalized(query)
+    explicit = (
+        "show me a chart",
+        "chart",
+        "graph",
+        "visualiz",
+        "trend",
+        "over time",
+        "daily activity",
+        "calendar heatmap",
+        "compare these series",
+        "grafica",
+        "tendencia",
+        "a lo largo del tiempo",
+        "actividad diaria",
+        "mapa de calor",
+        "comparar estas series",
+    )
+    if not any(term in text for term in explicit):
+        return None
+    heatmap = (
+        "heatmap",
+        "mapa de calor",
+        "calendar",
+        "calendario",
+        "daily activity",
+        "actividad diaria",
+    )
+    return "heatmap" if any(term in text for term in heatmap) else "area"
+
+
+def _tool_definitions(state: GraphState) -> list[MCPToolDefinition]:
+    definitions: list[MCPToolDefinition] = []
+    for value in state.get("available_tools", []):
+        name = value.get("name")
+        description = value.get("description")
+        schema = value.get("input_schema")
+        if isinstance(name, str) and isinstance(description, str) and isinstance(schema, dict):
+            definitions.append(MCPToolDefinition(name, description, schema))
+    return definitions
+
+
+def _observations(state: GraphState, name: str) -> list[dict[str, Any]]:
+    return [item for item in state.get("tool_observations", []) if item.get("name") == name]
+
+
+def _successful_data(observation: Mapping[str, Any]) -> dict[str, Any] | None:
+    data = observation.get("data")
+    if observation.get("is_error") is True or not isinstance(data, dict) or data.get("ok") is False:
+        return None
+    return data
+
+
+def _table_score(query: str, table: str) -> int:
+    text = _normalized(query)
+    name = _normalized(table)
+    score = sum(2 for part in name.replace("_", " ").split() if part in text)
+    aliases = {
+        "transactions": (
+            "activity",
+            "actividad",
+            "transaction",
+            "transaccion",
+            "spending",
+            "gasto",
+        ),
+        "subscriptions": ("subscription", "suscripcion", "charge", "cargo"),
+        "accounts": ("balance", "saldo", "account", "cuenta"),
+    }
+    score += sum(5 for term in aliases.get(name, ()) if term in text)
+    if name == "transactions" and any(term in text for term in ("activity", "actividad")):
+        score += 5
+    return score
+
+
+def _chart_columns(description: Mapping[str, Any], *, kind: str) -> tuple[str, list[str]] | None:
+    columns = description.get("columns")
+    if not isinstance(columns, list):
+        return None
+    dates: list[str] = []
+    numerics: list[str] = []
+    for column in columns:
+        if not isinstance(column, Mapping):
+            continue
+        name = column.get("name")
+        data_type = column.get("data_type")
+        if not isinstance(name, str) or not isinstance(data_type, str):
+            continue
+        upper = data_type.upper()
+        if (kind == "heatmap" and upper.startswith("DATE")) or (
+            kind == "area" and upper.startswith(_DATE_TYPES)
+        ):
+            dates.append(name)
+        if upper.startswith(_NUMERIC_TYPES):
+            numerics.append(name)
+    if not dates or not numerics:
+        return None
+    return dates[0], numerics[:4]
+
+
+def _required_visualization_turn(state: GraphState, kind: str) -> ModelTurn:
+    tools = {tool.name for tool in _tool_definitions(state)}
+    if "visualize_allowed_data" not in tools:
+        return ModelTurn(
+            message="No puedo crear la visualización porque el MCP activo no ofrece "
+            "visualize_allowed_data."
+        )
+    if "list_allowed_tables" not in tools or "describe_table" not in tools:
+        return ModelTurn(
+            message="No puedo crear la visualización porque el MCP no ofrece descubrimiento "
+            "seguro del esquema."
+        )
+
+    listed = next(
+        (
+            data
+            for observation in reversed(_observations(state, "list_allowed_tables"))
+            if (data := _successful_data(observation)) is not None
+        ),
+        None,
+    )
+    if listed is None:
+        return ModelTurn(
+            message="",
+            tool_calls=({"name": "list_allowed_tables", "arguments": {}},),
+        )
+    objects = listed.get("objects")
+    if not isinstance(objects, list) or not objects:
+        return ModelTurn(
+            message="No hay tablas permitidas disponibles para crear la visualización."
+        )
+
+    described: dict[tuple[str, str], dict[str, Any]] = {}
+    for observation in _observations(state, "describe_table"):
+        data = _successful_data(observation)
+        if data is None:
+            continue
+        schema = data.get("schema")
+        table = data.get("table")
+        if isinstance(schema, str) and isinstance(table, str):
+            described[(schema, table)] = data
+
+    candidates: list[tuple[int, str, str]] = []
+    for item in objects:
+        if not isinstance(item, Mapping):
+            continue
+        schema = item.get("schema")
+        table = item.get("table")
+        if isinstance(schema, str) and isinstance(table, str):
+            candidates.append((_table_score(state["user_query"], table), schema, table))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    for _score, schema, table in candidates:
+        description = described.get((schema, table))
+        if description is None:
+            return ModelTurn(
+                message="",
+                tool_calls=(
+                    {
+                        "name": "describe_table",
+                        "arguments": {"schema": schema, "table": table},
+                    },
+                ),
+            )
+        columns = _chart_columns(description, kind=kind)
+        if columns is None:
+            continue
+        date_column, value_columns = columns
+        if kind == "heatmap":
+            visualization: dict[str, Any] = {
+                "kind": "heatmap",
+                "date_column": date_column,
+                "value_column": value_columns[0],
+                "initial_view": "month",
+            }
+        else:
+            visualization = {
+                "kind": "area",
+                "x_column": date_column,
+                "y_columns": value_columns,
+            }
+        return ModelTurn(
+            message="",
+            tool_calls=(
+                {
+                    "name": "visualize_allowed_data",
+                    "arguments": {
+                        "request": {
+                            "source": {"schema": schema, "table": table},
+                            "order": [{"column": date_column, "direction": "asc"}],
+                            "limit": 100,
+                            "visualization": visualization,
+                        }
+                    },
+                },
             ),
         )
-        parsed = response.parsed
-        intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
-    except Exception:  # noqa: BLE001 - any LLM failure falls back to local demo mode
-        intent = _fallback_intent()
-
-    result: dict[str, object] = {"message": intent.message}
-    if intent.months is not None:
-        result["months"] = intent.months
-    return result
+    return ModelTurn(
+        message="No encontré una tabla permitida con columnas de fecha y valor numérico para "
+        "esa visualización."
+    )
 
 
-workflow = StateGraph(GraphState)
-workflow.add_node("fetch_context", fetch_context_node)
-workflow.add_node("intent", intent_node)
-workflow.add_edge(START, "fetch_context")
-workflow.add_edge("fetch_context", "intent")
-workflow.add_edge("intent", END)
-graph = workflow.compile()
+def _text_from_execution(execution: MCPToolExecution) -> str:
+    for content in execution.result.content:
+        text = getattr(content, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return "La herramienta terminó sin una respuesta de texto."
+
+
+def build_graph(
+    *,
+    model: ToolAwareModel | None = None,
+    tool_loader: ToolLoader = list_remote_tools,
+    tool_executor: ToolExecutor = execute_remote_tool,
+) -> Any:
+    """Build an injectable graph with an explicit model -> tools -> model loop."""
+    resolved_model = model or GeminiToolAwareModel()
+
+    async def load_tools_node(_state: GraphState) -> GraphState:
+        try:
+            tools = await tool_loader()
+            return {"available_tools": [tool.as_dict() for tool in tools]}
+        except (MCPConfigurationError, UserContextError):
+            return {"available_tools": []}
+
+    async def fetch_context_node(state: GraphState) -> GraphState:
+        try:
+            profile = await fetch_user_context(state["user_email"])
+        except (MCPConfigurationError, UserContextError):
+            profile = _FALLBACK_PROFILE.copy()
+        return {"user_profile": profile}
+
+    async def agent_node(state: GraphState) -> GraphState:
+        observations = state.get("tool_observations", [])
+        visualization_kind = _visualization_kind(state["user_query"])
+        latest_visualization = _observations(state, "visualize_allowed_data")
+        if visualization_kind is not None and latest_visualization:
+            return {
+                "message": str(latest_visualization[-1].get("text") or "La visualización terminó."),
+                "tool_calls": [],
+            }
+        if state.get("tool_loop_count", 0) >= _MAX_TOOL_TURNS:
+            return {
+                "message": "No pude completar la visualización dentro del límite seguro de pasos.",
+                "tool_calls": [],
+            }
+
+        candidate = await resolved_model.generate(
+            query=state["user_query"],
+            profile=state["user_profile"],
+            tools=_tool_definitions(state),
+            observations=observations,
+        )
+        if visualization_kind is not None:
+            candidate = _required_visualization_turn(state, visualization_kind)
+        else:
+            candidate = ModelTurn(
+                message=candidate.message,
+                tool_calls=tuple(
+                    call
+                    for call in candidate.tool_calls
+                    if call.get("name") != "visualize_allowed_data"
+                ),
+                months=candidate.months,
+            )
+        result: GraphState = {
+            "message": candidate.message,
+            "tool_calls": [dict(call) for call in candidate.tool_calls],
+        }
+        if candidate.months is not None:
+            result["months"] = candidate.months
+        return result
+
+    async def tools_node(state: GraphState) -> GraphState:
+        available = {tool.name for tool in _tool_definitions(state)}
+        observations = list(state.get("tool_observations", []))
+        update: GraphState = {
+            "tool_calls": [],
+            "tool_loop_count": state.get("tool_loop_count", 0) + 1,
+        }
+        for call in state.get("tool_calls", []):
+            name = call.get("name")
+            arguments = call.get("arguments")
+            if (
+                not isinstance(name, str)
+                or name not in available
+                or not isinstance(arguments, dict)
+            ):
+                observations.append(
+                    {
+                        "name": str(name),
+                        "arguments": {},
+                        "is_error": True,
+                        "data": {},
+                        "text": "La herramienta solicitada no está disponible.",
+                    }
+                )
+                continue
+            try:
+                execution = await tool_executor(name, arguments)
+                structured = execution.result.structured_content
+                observations.append(
+                    {
+                        "name": name,
+                        "arguments": deepcopy(arguments),
+                        "is_error": bool(execution.result.is_error),
+                        "data": deepcopy(structured) if isinstance(structured, dict) else {},
+                        "text": _text_from_execution(execution),
+                    }
+                )
+                if name in {"visualize_allowed_data", "database_overview"}:
+                    update["final_tool_execution"] = execution
+            except (MCPConfigurationError, UserContextError):
+                observations.append(
+                    {
+                        "name": name,
+                        "arguments": deepcopy(arguments),
+                        "is_error": True,
+                        "data": {},
+                        "text": "No pude consultar el servicio de datos en este momento.",
+                    }
+                )
+        update["tool_observations"] = observations
+        return update
+
+    def route_after_agent(state: GraphState) -> str:
+        return "tools" if state.get("tool_calls") else END
+
+    workflow = StateGraph(GraphState)
+    workflow.add_node("load_tools", cast("Any", load_tools_node))
+    workflow.add_node("fetch_context", cast("Any", fetch_context_node))
+    workflow.add_node("agent", cast("Any", agent_node))
+    workflow.add_node("tools", cast("Any", tools_node))
+    workflow.add_edge(START, "load_tools")
+    workflow.add_edge("load_tools", "fetch_context")
+    workflow.add_edge("fetch_context", "agent")
+    workflow.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
+    workflow.add_edge("tools", "agent")
+    return workflow.compile()
+
+
+graph = build_graph()

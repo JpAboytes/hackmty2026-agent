@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -27,6 +28,7 @@ from fluidbank_orchestrator.schemas.a2ui import (
 )
 
 _URI_PART = re.compile(r"^[A-Za-z0-9._~-]+$")
+logger = logging.getLogger(__name__)
 
 
 class A2UIBridgeError(ValueError):
@@ -106,6 +108,7 @@ class A2UIBridge:
         if not isinstance(ui, Mapping):
             raise A2UIBridgeError("invalid_ui_metadata")
         resource_uri = _parse_resource_uri(ui.get("resourceUri"))
+        logger.info("MCP A2UI resource discovered uri=%s", resource_uri)
         if ui.get("mimeType") != A2UI_MIME_TYPE:
             raise A2UIBridgeError("invalid_ui_mime_type")
         if not server_identity or len(server_identity) > 2_048:
@@ -114,12 +117,15 @@ class A2UIBridge:
         surface_id, template_messages = await self._get_template(
             mcp_client, server_identity, resource_uri
         )
+        logger.info("MCP A2UI resource loaded uri=%s", resource_uri)
         dynamic_messages = self._extract_dynamic_messages(tool_result, surface_id)
         complete = [*template_messages, *dynamic_messages]
         try:
             validate_complete_sequence(complete, surface_id)
         except A2UIValidationError as exc:
             raise A2UIBridgeError("invalid_a2ui_sequence") from exc
+        logger.info("MCP A2UI validated surface=%s", surface_id)
+        logger.info("MCP A2UI ready for client emission surface=%s", surface_id)
         return A2UIBundle(resource_uri=resource_uri, messages=deepcopy(complete))
 
     async def _get_template(

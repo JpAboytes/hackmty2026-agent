@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import unicodedata
 from copy import deepcopy
 from typing import Any
@@ -26,6 +27,7 @@ from .schemas.a2ui_action import A2UIActionPayloadError, parse_legacy_a2ui_actio
 _EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FluidBank Orchestrator", version="0.1.0")
 
@@ -79,7 +81,10 @@ def _response_from_tool(execution: MCPToolExecution) -> ChatResponse:
     )
     structured = execution.result.structured_content
     data = deepcopy(structured) if isinstance(structured, dict) else {}
-    return ChatResponse(message=message, data=data, a2ui=execution.a2ui)
+    response = ChatResponse(message=message, data=data, a2ui=execution.a2ui)
+    if response.a2ui is not None:
+        logger.info("A2UI emitted to client resource_uri=%s", response.a2ui.resource_uri)
+    return response
 
 
 def _unavailable_response() -> ChatResponse:
@@ -117,6 +122,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
             return _unavailable_response()
 
     result = await graph.ainvoke({"user_query": request.query, "user_email": request.email})
+    final_execution = result.get("final_tool_execution")
+    if isinstance(final_execution, MCPToolExecution):
+        return _response_from_tool(final_execution)
     data: dict[str, Any] = dict(result["user_profile"])
     if "months" in result:
         data["months"] = result["months"]

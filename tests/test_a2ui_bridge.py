@@ -117,7 +117,14 @@ class FakeClient:
         text = self.template if isinstance(self.template, str) else json.dumps(self.template)
         return [TextResourceContents(uri=RESOURCE_URI, mime_type=A2UI_MIME_TYPE, text=text)]
 
-    async def call_tool(self, name: str, arguments: dict[str, Any] | None) -> CallToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        raise_on_error: bool = True,
+    ) -> CallToolResult:
+        assert raise_on_error is False
         self.call_count += 1
         return self.result
 
