@@ -92,6 +92,40 @@ Observaciones MCP anteriores: {observations}
 """
 
 
+def _gemini_safe_schema(node: Any) -> Any:
+    """Narrow an MCP JSON Schema to the subset Gemini accepts as a declaration.
+
+    Gemini rejects a union that mixes an array branch with scalar branches,
+    which MCP emits for filter values accepting either one scalar or a list.
+    One such union made every tool-bound turn fail with INVALID_ARGUMENT, so
+    the array branch is dropped and the model offers scalars only. This narrows
+    nothing but the declaration: MCP still validates the real call against its
+    own unmodified schema.
+    """
+    if isinstance(node, dict):
+        narrowed = {key: _gemini_safe_schema(value) for key, value in node.items()}
+        for union in ("anyOf", "oneOf"):
+            branches = narrowed.get(union)
+            if not isinstance(branches, list):
+                continue
+            kept = [
+                branch
+                for branch in branches
+                if not (isinstance(branch, dict) and branch.get("type") == "array")
+            ]
+            scalars = [
+                branch
+                for branch in kept
+                if isinstance(branch, dict) and branch.get("type") not in (None, "null")
+            ]
+            if len(kept) != len(branches) and scalars:
+                narrowed[union] = kept
+        return narrowed
+    if isinstance(node, list):
+        return [_gemini_safe_schema(item) for item in node]
+    return node
+
+
 class GeminiToolAwareModel:
     """Gemini adapter that receives the exact runtime MCP tool schemas."""
 
@@ -107,7 +141,7 @@ class GeminiToolAwareModel:
             types.FunctionDeclaration(
                 name=tool.name,
                 description=tool.description,
-                parameters_json_schema=deepcopy(tool.input_schema),
+                parameters_json_schema=_gemini_safe_schema(deepcopy(tool.input_schema)),
             )
             for tool in tools
         ]

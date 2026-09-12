@@ -520,3 +520,35 @@ def test_visualization_scope_overwrites_model_user_and_keeps_business_filters() 
     assert scoped["request"]["filters"] == [
         {"column": "category", "operator": "eq", "value": "groceries"}
     ]
+
+
+def test_gemini_declarations_drop_array_branches_from_mixed_unions() -> None:
+    """Gemini rejects a union mixing an array branch with scalar branches."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "value": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                    {"items": {"anyOf": [{"type": "string"}]}, "type": "array"},
+                    {"type": "null"},
+                ]
+            }
+        },
+    }
+
+    narrowed = graph_module._gemini_safe_schema(schema)
+
+    assert narrowed["properties"]["value"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "integer"},
+        {"type": "null"},
+    ]
+
+
+def test_gemini_declarations_keep_a_union_that_is_only_arrays() -> None:
+    """Nothing is dropped when no scalar branch could replace the array."""
+    schema = {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
+
+    assert graph_module._gemini_safe_schema(schema) == schema
