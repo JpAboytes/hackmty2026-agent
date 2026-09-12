@@ -111,14 +111,26 @@ def _overdraft_risk(available_balance: float, recurring_expenses: float) -> floa
     return max(0.0, min(1.0, shortfall))
 
 
-async def fetch_user_context(user_id: str) -> dict[str, object]:
-    """Fetch one demo user's context entirely through remote MCP tool calls."""
+async def fetch_user_context(email: str) -> dict[str, object]:
+    """Fetch context for the seeded demo user matching this login email,
+    entirely through remote MCP tool calls.
+
+    The email is the client-supplied identifier: it's what the mobile app's
+    Supabase Auth session already carries, and it's a column that already
+    exists on `public.users` - no new schema or client-side user id needed.
+    """
     try:
         async with create_mcp_client() as client:
+            user_rows = await _select(client, "users", "email", email)
+            if not user_rows:
+                raise UserContextError(f"no seeded user found for email {email}")
+            user_id = user_rows[0]["id"]
             prefs_rows = await _select(client, "accessibility_preferences", "user_id", user_id)
             account_rows = await _select(client, "accounts", "user_id", user_id)
             subscription_rows = await _select(client, "subscriptions", "user_id", user_id)
     except MCPConfigurationError:
+        raise
+    except UserContextError:
         raise
     except Exception:  # noqa: BLE001 - expose a stable error without transport secrets
         raise UserContextError("could not reach the remote MCP server") from None

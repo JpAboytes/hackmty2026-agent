@@ -44,7 +44,7 @@ async def fetch_context_node(state: GraphState) -> dict[str, UserProfile]:
     unreachable, per the local demo mode required by PROJECT_SPEC.MD.
     """
     try:
-        profile = await fetch_user_context(state["user_id"])
+        profile = await fetch_user_context(state["user_email"])
     except UserContextError:
         profile = dict(_FALLBACK_PROFILE)
     return {"user_profile": profile}  # type: ignore[typeddict-item]

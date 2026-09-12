@@ -14,7 +14,13 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from .graph import graph
-from .personas import PERSONA_USER_IDS, Persona
+
+# Structural check only (no deliverability lookup): this is a lookup key
+# against public.users.email, not an address we send mail to. EmailStr's
+# email-validator backend rejects IANA-reserved test domains like the
+# fluidbank.test seed emails as "not deliverable", which would reject every
+# seeded demo user.
+_EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 load_dotenv()
 
@@ -34,7 +40,9 @@ def health() -> dict[str, str]:
 
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1)
-    persona: Persona = "ana"
+    # The client's own login identifier - Supabase Auth session email on
+    # mobile - not a fixed demo persona. Matched against public.users.email.
+    email: str = Field(min_length=3, max_length=254, pattern=_EMAIL_PATTERN)
 
 
 class A2UIEnvelope(BaseModel):
@@ -57,9 +65,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     """Run the graph against real Supabase-backed context and return a
     conversational reply. `a2ui` stays null until the MCP server's A2UI
     tools exist - this endpoint will relay them, never generate them."""
-    result = await graph.ainvoke(
-        {"user_query": request.query, "user_id": PERSONA_USER_IDS[request.persona]}
-    )
+    result = await graph.ainvoke({"user_query": request.query, "user_email": request.email})
     data: dict[str, Any] = dict(result["user_profile"])
     if "months" in result:
         data["months"] = result["months"]

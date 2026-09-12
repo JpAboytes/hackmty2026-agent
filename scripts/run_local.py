@@ -8,7 +8,7 @@ import json
 from dotenv import load_dotenv
 
 from fluidbank_orchestrator.graph import graph
-from fluidbank_orchestrator.personas import PERSONA_USER_IDS
+from fluidbank_orchestrator.personas import PERSONA_EMAILS
 
 
 async def main() -> None:
@@ -16,7 +16,7 @@ async def main() -> None:
     result = await graph.ainvoke(
         {
             "user_query": "Tengo dinero para el fin de semana?",
-            "user_id": PERSONA_USER_IDS["ana"],
+            "user_email": PERSONA_EMAILS["ana"],
         }
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
