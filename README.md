@@ -56,4 +56,35 @@ dependency, since its resolver is heavy):
 
 ```bash
 ./.venv/bin/ruff check .
+./.venv/bin/pytest
+```
+
+## Deploy to Cloud Run
+
+The `Dockerfile` builds a slim, non-root image that runs
+`uvicorn fluidbank_orchestrator.api:app` bound to Cloud Run's `$PORT`. Secrets
+and endpoint config are never baked into the image - pass them at deploy
+time. `GEMINI_API_KEY` and `HORIZON_API_KEY` should live in Secret Manager,
+not as plain `--set-env-vars`.
+
+```bash
+gcloud secrets create gemini-api-key --data-file=- <<< "$GEMINI_API_KEY"
+gcloud secrets create horizon-api-key --data-file=- <<< "$HORIZON_API_KEY"
+
+gcloud run deploy fluidbank-orchestrator \
+  --source . \
+  --region REPLACE_WITH_REGION \
+  --allow-unauthenticated \
+  --set-env-vars MCP_SERVER_URL=https://REPLACE_WITH_MCP_DEPLOYMENT.fastmcp.app/mcp,MCP_AUTH_MODE=horizon \
+  --set-secrets GEMINI_API_KEY=gemini-api-key:latest,HORIZON_API_KEY=horizon-api-key:latest
+```
+
+`--source .` builds from the `Dockerfile` via Cloud Build; `.gcloudignore` and
+`.dockerignore` keep the build context to `pyproject.toml`, `README.md`, and
+`src/`. Verify locally first:
+
+```bash
+docker build -t fluidbank-orchestrator:local .
+docker run --rm -p 8080:8080 --env-file .env fluidbank-orchestrator:local
+curl http://127.0.0.1:8080/healthz
 ```

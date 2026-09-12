@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+.env
+.env.*
+!.env.example
+tests
+scripts
+langgraph.json
+PROJECT_SPEC.MD
+Dockerfile
+.dockerignore
+.gcloudignore
