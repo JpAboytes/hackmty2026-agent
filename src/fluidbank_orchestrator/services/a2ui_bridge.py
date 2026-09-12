@@ -17,6 +17,7 @@ from fastmcp import Client
 from fastmcp.client.client import CallToolResult
 from mcp.types import EmbeddedResource, TextResourceContents
 
+from fluidbank_orchestrator.observability import event, stage
 from fluidbank_orchestrator.schemas.a2ui import (
     A2UI_MIME_TYPE,
     MAX_RESOURCE_BYTES,
@@ -108,24 +109,25 @@ class A2UIBridge:
         if not isinstance(ui, Mapping):
             raise A2UIBridgeError("invalid_ui_metadata")
         resource_uri = _parse_resource_uri(ui.get("resourceUri"))
-        logger.info("MCP A2UI resource discovered uri=%s", resource_uri)
         if ui.get("mimeType") != A2UI_MIME_TYPE:
             raise A2UIBridgeError("invalid_ui_mime_type")
         if not server_identity or len(server_identity) > 2_048:
             raise A2UIBridgeError("invalid_server_identity")
 
-        surface_id, template_messages = await self._get_template(
-            mcp_client, server_identity, resource_uri
-        )
-        logger.info("MCP A2UI resource loaded uri=%s", resource_uri)
-        dynamic_messages = self._extract_dynamic_messages(tool_result, surface_id)
-        complete = [*template_messages, *dynamic_messages]
-        try:
-            validate_complete_sequence(complete, surface_id)
-        except A2UIValidationError as exc:
-            raise A2UIBridgeError("invalid_a2ui_sequence") from exc
-        logger.info("MCP A2UI validated surface=%s", surface_id)
-        logger.info("MCP A2UI ready for client emission surface=%s", surface_id)
+        async with stage("a2ui.template", uri=resource_uri) as step:
+            step.set(cached=(server_identity, resource_uri) in self._cache)
+            surface_id, template_messages = await self._get_template(
+                mcp_client, server_identity, resource_uri
+            )
+            step.set(surface=surface_id, messages=len(template_messages))
+        with stage("a2ui.validate", surface=surface_id) as validation:
+            dynamic_messages = self._extract_dynamic_messages(tool_result, surface_id)
+            complete = [*template_messages, *dynamic_messages]
+            try:
+                validate_complete_sequence(complete, surface_id)
+            except A2UIValidationError as exc:
+                raise A2UIBridgeError("invalid_a2ui_sequence") from exc
+            validation.set(static=len(template_messages), dynamic=len(dynamic_messages))
         return A2UIBundle(resource_uri=resource_uri, messages=deepcopy(complete))
 
     async def _get_template(
@@ -169,8 +171,14 @@ class A2UIBridge:
         self, mcp_client: Client[Any], key: tuple[str, str]
     ) -> tuple[str, tuple[dict[str, Any], ...]]:
         _server_identity, resource_uri = key
+        # A cache miss costs one extra MCP round trip; the hit/miss ratio here
+        # is what makes repeated surfaces cheap.
+        event("a2ui.cache", outcome="miss", uri=resource_uri)
         try:
-            contents = await mcp_client.read_resource(resource_uri)
+            async with stage("a2ui.resource_read", uri=resource_uri):
+                contents = await mcp_client.read_resource(resource_uri)
+        except A2UIBridgeError:
+            raise
         except Exception as exc:
             raise A2UIBridgeError("resource_read_failed") from exc
         if len(contents) != 1:

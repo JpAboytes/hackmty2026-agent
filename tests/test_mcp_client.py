@@ -164,7 +164,7 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
     monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
     monkeypatch.setattr(mcp_client, "_select", fake_select)
 
-    profile = await fetch_user_context(user_id)
+    profile = (await fetch_user_context(user_id)).profile
 
     assert calls == [
         ("users", user_id),
@@ -216,7 +216,7 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
     monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
     monkeypatch.setattr(mcp_client, "_select", fake_select)
 
-    profile = await fetch_user_context(user_id)
+    profile = (await fetch_user_context(user_id)).profile
 
     assert profile["available_balance"] == 42.00
     assert profile["recurring_expenses"] == 0.0

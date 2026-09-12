@@ -36,6 +36,7 @@ class GraphState(TypedDict, total=False):
     available_tools: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
     tool_observations: list[dict[str, Any]]
+    context_observations: list[dict[str, Any]]
     final_tool_execution: object
     financial_presentation: object
     tool_loop_count: int

@@ -27,6 +27,7 @@ from .mcp_client import (
     list_remote_tools,
     require_current_user_id,
 )
+from .observability import event, preview, stage
 from .schemas.banking_view import FinancialIntent
 from .services.financial_presentation import (
     build_financial_presentation,
@@ -152,39 +153,66 @@ class GeminiToolAwareModel:
             profile=json.dumps(profile, ensure_ascii=False, sort_keys=True),
             observations=json.dumps(list(observations), ensure_ascii=False, sort_keys=True),
         )
-        try:
-            response = await genai.Client().aio.models.generate_content(
-                model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(function_declarations=declarations)]
-                    if declarations
-                    else None,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                    response_mime_type="application/json",
-                    response_schema=_Intent,
-                ),
-            )
-            allowed = {tool.name for tool in tools}
-            calls: list[dict[str, Any]] = []
-            for function_call in response.function_calls or []:
-                if function_call.name not in allowed:
-                    continue
-                arguments = function_call.args
-                if not isinstance(arguments, Mapping):
-                    continue
-                calls.append({"name": function_call.name, "arguments": dict(arguments)})
-            if calls:
-                return ModelTurn(message="", tool_calls=tuple(calls[:2]))
-            parsed = response.parsed
-            intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
-            return ModelTurn(
-                message=intent.message,
-                months=intent.months,
-                presentation_intent=intent.presentation_intent,
-            )
-        except Exception as exc:  # noqa: BLE001 - deterministic policies remain available
-            logger.warning("Gemini model turn failed (%s)", type(exc).__name__)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+        # The prompt carries every prior observation verbatim, so its size is the
+        # single number that explains a slow model turn late in a tool loop.
+        async with stage(
+            "model.gemini",
+            model=model_name,
+            declared_tools=len(declarations),
+            observations=len(observations),
+            prompt_chars=len(prompt),
+        ) as step:
+            try:
+                response = await genai.Client().aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(function_declarations=declarations)]
+                        if declarations
+                        else None,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        ),
+                        response_mime_type="application/json",
+                        response_schema=_Intent,
+                    ),
+                )
+                usage = response.usage_metadata
+                if usage is not None:
+                    step.set(
+                        prompt_tokens=usage.prompt_token_count,
+                        output_tokens=usage.candidates_token_count,
+                    )
+                allowed = {tool.name for tool in tools}
+                calls: list[dict[str, Any]] = []
+                for function_call in response.function_calls or []:
+                    if function_call.name not in allowed:
+                        continue
+                    arguments = function_call.args
+                    if not isinstance(arguments, Mapping):
+                        continue
+                    calls.append({"name": function_call.name, "arguments": dict(arguments)})
+                if calls:
+                    step.set(decision="tool_calls", calls=",".join(call["name"] for call in calls))
+                    preview("model.gemini.calls", calls)
+                    return ModelTurn(message="", tool_calls=tuple(calls[:2]))
+                parsed = response.parsed
+                intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
+                step.set(
+                    decision="message",
+                    message_chars=len(intent.message),
+                    presentation_intent=intent.presentation_intent,
+                    months=intent.months,
+                )
+                return ModelTurn(
+                    message=intent.message,
+                    months=intent.months,
+                    presentation_intent=intent.presentation_intent,
+                )
+            except Exception as exc:  # noqa: BLE001 - deterministic policies remain available
+                step.set(decision="failed")
+                logger.warning("Gemini model turn failed (%s)", type(exc).__name__)
         return ModelTurn(message="No pude generar una respuesta personalizada en este momento.")
 
 
@@ -246,12 +274,36 @@ def _text_from_execution(execution: MCPToolExecution) -> str:
     return "La herramienta terminó sin una respuesta de texto."
 
 
+def _retained_observations(state: GraphState) -> list[dict[str, Any]]:
+    """Every verified row set this turn holds, prefetched context included.
+
+    Context rows come first so a later, narrower domain read of the same table
+    wins on the deduplicated identifiers.
+    """
+    return [*state.get("context_observations", []), *state.get("tool_observations", [])]
+
+
+def _context_observations(rows: Mapping[str, list[dict[str, object]]]) -> list[dict[str, Any]]:
+    """Record the profile's scoped reads in the shape a domain read produces."""
+    return [
+        {
+            "name": "select_rows",
+            "arguments": {"schema": "public", "table": table},
+            "is_error": False,
+            "data": {"ok": True, "rows": deepcopy(table_rows)},
+            "text": f"Filas de {table} leídas con el contexto del usuario.",
+        }
+        for table, table_rows in rows.items()
+        if table_rows
+    ]
+
+
 def _has_table_observation(state: GraphState, table: str) -> bool:
     return any(
         observation.get("name") == "select_rows"
         and isinstance(observation.get("arguments"), Mapping)
         and observation["arguments"].get("table") == table
-        for observation in state.get("tool_observations", [])
+        for observation in _retained_observations(state)
     )
 
 
@@ -323,23 +375,49 @@ def build_graph(
         return {"current_user_id": require_current_user_id(state.get("current_user_id"))}
 
     async def load_tools_node(_state: GraphState) -> GraphState:
-        try:
-            tools = await tool_loader()
+        async with stage("node.load_tools") as step:
+            try:
+                tools = await tool_loader()
+            except (MCPConfigurationError, UserContextError) as exc:
+                step.set(outcome="unavailable", reason=type(exc).__name__, tools=0)
+                return {"available_tools": []}
+            step.set(outcome="loaded", tools=len(tools))
             return {"available_tools": [tool.as_dict() for tool in tools]}
-        except (MCPConfigurationError, UserContextError):
-            return {"available_tools": []}
 
     async def fetch_context_node(state: GraphState) -> GraphState:
-        try:
-            current_user_id = require_current_user_id(state.get("current_user_id"))
-            profile = await fetch_user_context(current_user_id)
-        except (MCPConfigurationError, UserContextError):
-            # Missing context must never become invented financial data.
-            return {"user_profile": _FALLBACK_PROFILE.copy(), "context_available": False}
-        return {"user_profile": profile, "context_available": True}
+        async with stage("node.fetch_context") as step:
+            try:
+                current_user_id = require_current_user_id(state.get("current_user_id"))
+                context = await fetch_user_context(current_user_id)
+            except (MCPConfigurationError, UserContextError) as exc:
+                # Missing context must never become invented financial data.
+                step.set(outcome="fallback", reason=type(exc).__name__)
+                return {"user_profile": _FALLBACK_PROFILE.copy(), "context_available": False}
+            retained = _context_observations(context.rows)
+            # Presence, never amounts: a balance is the user's money, not a log line.
+            step.set(
+                outcome="resolved",
+                accounts=len(context.profile["owned_balances"]),
+                has_balance=context.profile["available_balance"] is not None,
+                retained=",".join(sorted(context.rows)) or "none",
+            )
+            return {
+                "user_profile": context.profile,
+                "context_available": True,
+                "context_observations": retained,
+            }
 
     async def agent_node(state: GraphState) -> GraphState:
+        async with stage(
+            "node.agent",
+            turn=state.get("tool_loop_count", 0),
+            observations=len(state.get("tool_observations", [])),
+        ) as step:
+            return await _agent_turn(state, step)
+
+    async def _agent_turn(state: GraphState, step: stage) -> GraphState:
         if state.get("context_available") is False:
+            step.set(decision="no_context")
             return {
                 "message": (
                     "No pude identificar tu cuenta, así que no puedo mostrarte cifras. "
@@ -352,6 +430,14 @@ def build_graph(
         financial_intent = explicit_intent or classify_financial_request(state["user_query"])
         if financial_intent is not None:
             candidate = _financial_data_turn(state, financial_intent)
+            # The deterministic financial path never reaches Gemini; seeing this
+            # decision with no model.gemini stage after it is the fast path.
+            step.set(
+                decision="financial_retrieval" if candidate.tool_calls else "financial_ready",
+                intent=financial_intent,
+                source="action" if explicit_intent is not None else "classifier",
+                calls=",".join(call["name"] for call in candidate.tool_calls) or None,
+            )
             return {
                 "financial_request_intent": financial_intent,
                 "message": candidate.message,
@@ -360,8 +446,10 @@ def build_graph(
 
         final_execution = state.get("final_tool_execution")
         if isinstance(final_execution, MCPToolExecution) and final_execution.a2ui is not None:
+            step.set(decision="tool_presentation")
             return {"message": _text_from_execution(final_execution), "tool_calls": []}
         if state.get("tool_loop_count", 0) >= _MAX_TOOL_TURNS:
+            step.set(decision="loop_limit", limit=_MAX_TOOL_TURNS)
             return {
                 "message": "No pude completar la consulta dentro del límite seguro de pasos.",
                 "tool_calls": [],
@@ -374,17 +462,23 @@ def build_graph(
             observations=observations,
         )
         if candidate.tool_calls:
+            step.set(
+                decision="model_tool_calls",
+                calls=",".join(call["name"] for call in candidate.tool_calls),
+            )
             result: GraphState = {
                 "message": "",
                 "tool_calls": [dict(call) for call in candidate.tool_calls],
             }
         elif candidate.presentation_intent is not None:
+            step.set(decision="model_presentation", intent=candidate.presentation_intent)
             result = {
                 "message": candidate.message,
                 "tool_calls": [],
                 "financial_request_intent": candidate.presentation_intent,
             }
         else:
+            step.set(decision="model_message", message_chars=len(candidate.message.strip()))
             message_text = candidate.message.strip() or (
                 "No tengo una respuesta para mostrar en este momento."
             )
@@ -394,13 +488,18 @@ def build_graph(
         return result
 
     async def tools_node(state: GraphState) -> GraphState:
+        pending = state.get("tool_calls", [])
+        async with stage("node.tools", calls=len(pending)):
+            return await _run_tools(state, pending)
+
+    async def _run_tools(state: GraphState, pending: list[dict[str, Any]]) -> GraphState:
         available = {tool.name for tool in _tool_definitions(state)}
         observations = list(state.get("tool_observations", []))
         update: GraphState = {
             "tool_calls": [],
             "tool_loop_count": state.get("tool_loop_count", 0) + 1,
         }
-        for call in state.get("tool_calls", []):
+        for call in pending:
             name = call.get("name")
             arguments = call.get("arguments")
             if (
@@ -408,6 +507,7 @@ def build_graph(
                 or name not in available
                 or not isinstance(arguments, dict)
             ):
+                event("tool.rejected", name=str(name), reason="unavailable")
                 observations.append(
                     {
                         "name": str(name),
@@ -418,13 +518,26 @@ def build_graph(
                     }
                 )
                 continue
+            preview(f"tool.{name}.arguments", arguments)
             try:
-                execution = await tool_executor(
-                    name,
-                    arguments,
-                    current_user_id=require_current_user_id(state.get("current_user_id")),
-                )
-                structured = execution.result.structured_content
+                async with stage(
+                    "tool.call",
+                    name=name,
+                    table=arguments.get("table"),
+                ) as step:
+                    execution = await tool_executor(
+                        name,
+                        arguments,
+                        current_user_id=require_current_user_id(state.get("current_user_id")),
+                    )
+                    structured = execution.result.structured_content
+                    step.set(
+                        is_error=bool(execution.result.is_error),
+                        rows=len(structured["rows"])
+                        if isinstance(structured, dict) and isinstance(structured.get("rows"), list)
+                        else None,
+                        a2ui=execution.a2ui is not None,
+                    )
                 observations.append(
                     {
                         "name": name,
@@ -436,7 +549,8 @@ def build_graph(
                 )
                 if name in {"visualize_allowed_data", "database_overview"}:
                     update["final_tool_execution"] = execution
-            except (MCPConfigurationError, UserContextError):
+            except (MCPConfigurationError, UserContextError) as exc:
+                event("tool.failed", name=name, reason=type(exc).__name__)
                 observations.append(
                     {
                         "name": name,
@@ -450,34 +564,47 @@ def build_graph(
         return update
 
     async def select_presentation_node(state: GraphState) -> GraphState:
-        requested = normalize_action_intent(state.get("financial_request_intent"))
-        if requested is None:
-            return {"message": "La presentación financiera solicitada no es válida."}
-        selected = select_presentation_intent(
-            requested,
-            state.get("tool_observations", []),
-            query=state["user_query"],
-            action_requested=state.get("action_requested", False),
-        )
-        return {"presentation_intent": selected}
+        async with stage("node.select_presentation") as step:
+            requested = normalize_action_intent(state.get("financial_request_intent"))
+            if requested is None:
+                step.set(outcome="invalid")
+                return {"message": "La presentación financiera solicitada no es válida."}
+            selected = select_presentation_intent(
+                requested,
+                _retained_observations(state),
+                query=state["user_query"],
+                action_requested=state.get("action_requested", False),
+            )
+            step.set(requested=requested, selected=selected)
+            return {"presentation_intent": selected}
 
     async def build_presentation_node(state: GraphState) -> GraphState:
-        intent = normalize_action_intent(state.get("presentation_intent"))
-        if intent is None:
-            return {"message": "La presentación financiera solicitada no es válida."}
-        presentation = build_financial_presentation(
-            intent,
-            state.get("tool_observations", []),
-            state["user_profile"],
-        )
-        return {"message": presentation.message, "financial_presentation": presentation}
+        async with stage("node.build_presentation") as step:
+            intent = normalize_action_intent(state.get("presentation_intent"))
+            if intent is None:
+                step.set(outcome="invalid")
+                return {"message": "La presentación financiera solicitada no es válida."}
+            presentation = build_financial_presentation(
+                intent,
+                _retained_observations(state),
+                state["user_profile"],
+            )
+            step.set(
+                intent=intent,
+                a2ui_messages=len(presentation.a2ui.messages),
+                data_keys=",".join(sorted(presentation.data)) or "none",
+            )
+            return {"message": presentation.message, "financial_presentation": presentation}
 
     def route_after_agent(state: GraphState) -> str:
         if state.get("tool_calls"):
-            return "tools"
-        if normalize_action_intent(state.get("financial_request_intent")) is not None:
-            return "select_presentation"
-        return END
+            destination = "tools"
+        elif normalize_action_intent(state.get("financial_request_intent")) is not None:
+            destination = "select_presentation"
+        else:
+            destination = END
+        event("graph.route", node="agent", next=destination)
+        return destination
 
     workflow = StateGraph(GraphState)
     workflow.add_node("validate_identity", cast("Any", validate_identity_node))

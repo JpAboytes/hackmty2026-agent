@@ -7,10 +7,13 @@ directly to FastMCP; it is never added to graph state or model-visible data.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from math import isfinite
@@ -21,6 +24,7 @@ from uuid import UUID
 from fastmcp import Client
 from fastmcp.client.client import CallToolResult
 
+from .observability import preview, stage
 from .schemas.a2ui import A2UIBundle
 from .services.a2ui_bridge import A2UIBridge, A2UIBridgeError
 from .state import UserProfile
@@ -49,6 +53,18 @@ class MCPToolExecution:
     result: CallToolResult
     a2ui: A2UIBundle | None
     presentation_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class UserContext:
+    """One user's derived profile plus the scoped rows it was built from.
+
+    The rows travel with the profile so a later domain read does not fetch the
+    same scoped table a second time in the same turn.
+    """
+
+    profile: UserProfile
+    rows: dict[str, list[dict[str, object]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +146,46 @@ def create_mcp_client(config: MCPConfig | None = None) -> Client[Any]:
     if resolved.auth_mode == "horizon":
         return Client(resolved.url, auth=resolved._horizon_api_key)
     return Client(resolved.url)
+
+
+_TURN_SESSION: ContextVar[tuple[Client[Any], str] | None] = ContextVar(
+    "fluidbank_mcp_session", default=None
+)
+
+
+@asynccontextmanager
+async def mcp_session() -> AsyncIterator[None]:
+    """Hold one MCP session open for everything inside this block.
+
+    A session handshake against the remote endpoint costs roughly as much as a
+    query, and a turn used to pay it three times: once to list tools, once for
+    user context, and once per tool call. Helpers below join this session when
+    one is active and fall back to opening their own when it is not, so tests
+    and one-off calls keep working unchanged.
+    """
+    config = load_mcp_config()
+    async with AsyncExitStack() as stack:
+        async with stage("mcp.connect", purpose="turn", shared=True):
+            client = await stack.enter_async_context(create_mcp_client(config))
+        token = _TURN_SESSION.set((client, config.url))
+        try:
+            yield
+        finally:
+            _TURN_SESSION.reset(token)
+
+
+@asynccontextmanager
+async def _session(purpose: str) -> AsyncIterator[tuple[Client[Any], str]]:
+    """Yield the turn's shared session, or a private one when none is active."""
+    joined = _TURN_SESSION.get()
+    if joined is not None:
+        yield joined
+        return
+    config = load_mcp_config()
+    async with AsyncExitStack() as stack:
+        async with stage("mcp.connect", purpose=purpose, shared=False):
+            client = await stack.enter_async_context(create_mcp_client(config))
+        yield client, config.url
 
 
 DEFAULT_A2UI_BRIDGE = A2UIBridge()
@@ -227,10 +283,10 @@ def enforce_trusted_user_scope(
 
 async def list_remote_tools() -> list[MCPToolDefinition]:
     """Load the real read-only tool collection from the configured endpoint."""
-    config = load_mcp_config()
     try:
-        async with create_mcp_client(config) as client:
-            listed = await client.list_tools()
+        async with _session("list_tools") as (client, _identity):
+            async with stage("mcp.list_tools"):
+                listed = await client.list_tools()
     except MCPConfigurationError:
         raise
     except Exception:
@@ -271,21 +327,29 @@ async def call_mcp_tool(
 ) -> MCPToolExecution:
     """Call any MCP tool and process optional A2UI metadata through one bridge."""
     trusted_arguments = enforce_trusted_user_scope(name, arguments, current_user_id)
-    logger.info("MCP tool selected name=%s", name)
-    result = await client.call_tool(
-        name,
-        trusted_arguments,
-        raise_on_error=False,
-    )
-    logger.info("MCP tool completed name=%s is_error=%s", name, result.is_error)
-    try:
-        a2ui = await bridge.build_bundle(client, result, server_identity=server_identity)
-    except A2UIBridgeError as exc:
-        logger.warning("MCP A2UI presentation rejected code=%s", exc.code)
-        return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
-    except Exception as exc:  # noqa: BLE001 - retain the safe MCP fallback on bridge defects
-        logger.warning("MCP A2UI presentation failed (%s)", type(exc).__name__)
-        return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+    async with stage("mcp.call", name=name) as step:
+        result = await client.call_tool(
+            name,
+            trusted_arguments,
+            raise_on_error=False,
+        )
+        step.set(is_error=bool(result.is_error), contents=len(result.content))
+    preview(f"mcp.call.{name}.result", result.structured_content)
+    async with stage("mcp.a2ui_bridge", name=name) as step:
+        try:
+            a2ui = await bridge.build_bundle(client, result, server_identity=server_identity)
+        except A2UIBridgeError as exc:
+            step.set(outcome="rejected", code=exc.code)
+            logger.warning("MCP A2UI presentation rejected code=%s", exc.code)
+            return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+        except Exception as exc:  # noqa: BLE001 - retain the safe MCP fallback on bridge defects
+            step.set(outcome="failed", reason=type(exc).__name__)
+            logger.warning("MCP A2UI presentation failed (%s)", type(exc).__name__)
+            return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+        step.set(
+            outcome="bundled" if a2ui is not None else "no_presentation",
+            messages=len(a2ui.messages) if a2ui is not None else None,
+        )
     return MCPToolExecution(result=result, a2ui=a2ui)
 
 
@@ -299,12 +363,11 @@ async def execute_remote_tool(
     """Execute a tool over the configured remote/local MCP connection."""
     if name in SCOPED_TOOL_NAMES:
         require_current_user_id(current_user_id)
-    config = load_mcp_config()
     try:
-        async with create_mcp_client(config) as client:
+        async with _session(name) as (client, identity):
             return await call_mcp_tool(
                 client,
-                config.url,
+                identity,
                 name,
                 arguments,
                 current_user_id=current_user_id,
@@ -314,6 +377,7 @@ async def execute_remote_tool(
         raise
     except Exception:  # noqa: BLE001 - expose no transport or credential details
         raise UserContextError("could not reach the remote MCP server") from None
+    raise UserContextError("the remote MCP session closed without a result")
 
 
 async def _select(
@@ -397,20 +461,24 @@ _DEFAULT_PREFERENCES: dict[str, str] = {
 }
 
 
-async def fetch_user_context(current_user_id: UUID) -> UserProfile:
+async def fetch_user_context(current_user_id: UUID) -> UserContext:
     """Fetch one signed-in user's context through mandatory MCP scope."""
     current_user_id = require_current_user_id(current_user_id)
     try:
-        config = load_mcp_config()
-        async with create_mcp_client(config) as client:
-            user_rows = await _select(client, config.url, "users", current_user_id)
+        async with _session("user_context") as (client, identity):
+            # The four reads are independent, so the profile costs one round
+            # trip instead of four. Membership is still enforced: an id that
+            # belongs to nobody returns no user row and fails below, and MCP
+            # scopes every one of these selects server-side regardless.
+            async with stage("mcp.user_context", selects=4, concurrent=True):
+                user_rows, prefs_rows, account_rows, subscription_rows = await asyncio.gather(
+                    _select(client, identity, "users", current_user_id),
+                    _select(client, identity, "accessibility_preferences", current_user_id),
+                    _select(client, identity, "accounts", current_user_id),
+                    _select(client, identity, "subscriptions", current_user_id),
+                )
             if not user_rows:
                 raise UserContextError("no user found for the supplied user id")
-            prefs_rows = await _select(
-                client, config.url, "accessibility_preferences", current_user_id
-            )
-            account_rows = await _select(client, config.url, "accounts", current_user_id)
-            subscription_rows = await _select(client, config.url, "subscriptions", current_user_id)
     except MCPConfigurationError:
         raise
     except UserContextError:
@@ -429,7 +497,7 @@ async def fetch_user_context(current_user_id: UUID) -> UserProfile:
         if _string_value(row, "status") == "active"
     )
 
-    return {
+    profile: UserProfile = {
         "literacy_level": _string_value(prefs, "literacy_level")
         or _DEFAULT_PREFERENCES["literacy_level"],
         "font_scale": _string_value(prefs, "font_scale") or _DEFAULT_PREFERENCES["font_scale"],
@@ -444,3 +512,10 @@ async def fetch_user_context(current_user_id: UUID) -> UserProfile:
         ),
         "owned_balances": owned_balances,
     }
+    # Only the domain tables a later financial read would ask for again. The
+    # user and preference rows stay out: nothing re-reads them, and they carry
+    # identity fields that have no business travelling through graph state.
+    return UserContext(
+        profile=profile,
+        rows={"accounts": account_rows, "subscriptions": subscription_rows},
+    )

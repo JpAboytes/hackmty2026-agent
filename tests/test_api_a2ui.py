@@ -17,6 +17,7 @@ from fluidbank_orchestrator.api import ChatRequest
 from fluidbank_orchestrator.mcp_client import MCPToolExecution
 
 USER_A = UUID("68dc4d66-07b8-5893-95f1-07f06989a552")
+USER_B = UUID("c1a3797d-b335-5a9d-98a1-402311f82c7a")
 AUTH = "Bearer test-token"
 ACTION = {
     "name": "refresh_database_overview",
@@ -27,13 +28,29 @@ ACTION = {
 }
 
 
-def test_chat_request_requires_one_input_and_rejects_client_user_id() -> None:
+def test_chat_request_requires_exactly_one_input() -> None:
     with pytest.raises(ValidationError):
         ChatRequest.model_validate({"query": "Hola", "action": ACTION})
     with pytest.raises(ValidationError):
-        ChatRequest.model_validate({"query": "Hola", "user_id": str(USER_A)})
+        ChatRequest.model_validate({"query": "Hola", "unknown": "x"})
     assert ChatRequest(query="Hola").query == "Hola"
     assert ChatRequest(action=ACTION).action is not None
+
+
+def test_chat_request_tolerates_but_never_trusts_a_client_user_id() -> None:
+    """The deployed client still sends it; forbidding it 422s every request."""
+    request = ChatRequest.model_validate({"query": "Hola", "user_id": str(USER_A)})
+    assert request.user_id == USER_A
+
+
+@pytest.mark.asyncio
+async def test_a_client_user_id_that_contradicts_the_token_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    with pytest.raises(HTTPException) as refused:
+        await api.chat(ChatRequest(query="Hola", user_id=USER_B), AUTH)
+    assert refused.value.status_code == 403
 
 
 async def _authenticate_as_a(_authorization: str | None) -> UUID:

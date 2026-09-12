@@ -21,6 +21,7 @@ from fluidbank_orchestrator.mcp_client import (
     MCPToolDefinition,
     MCPToolExecution,
     TrustedUserScopeError,
+    UserContext,
     enforce_trusted_user_scope,
 )
 from fluidbank_orchestrator.services.financial_presentation import build_financial_presentation
@@ -79,11 +80,12 @@ async def _run_graph(
     monkeypatch: pytest.MonkeyPatch,
     query: str,
     rows: list[dict[str, Any]],
+    context_rows: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def fake_profile(_current_user_id: UUID) -> UserProfile:
-        return PROFILE.copy()
+    async def fake_profile(_current_user_id: UUID) -> UserContext:
+        return UserContext(profile=PROFILE.copy(), rows=dict(context_rows or {}))
 
     async def execute(
         name: str,
@@ -145,6 +147,58 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
     assert view["totalOwnedBalance"] == 150
     assert all(account["accountType"] != "credit" for account in view["accounts"])
     assert calls[0][0] != "chat_message"
+
+
+@pytest.mark.asyncio
+async def test_context_rows_answer_a_balance_without_a_second_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The profile already read accounts; the turn must not read them again."""
+    accounts = [
+        {
+            "id": "checking",
+            "account_type": "checking",
+            "currency": "MXN",
+            "available_balance": 150,
+        }
+    ]
+    result, calls = await _run_graph(
+        monkeypatch,
+        "¿Cuánto dinero tengo?",
+        [],
+        context_rows={"accounts": accounts},
+    )
+
+    assert calls == []
+    presentation = result["financial_presentation"]
+    assert presentation.intent == "financial-summary"
+    assert presentation.data["owned_balance"] == 150
+
+
+@pytest.mark.asyncio
+async def test_a_table_the_profile_never_read_is_still_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prefetching accounts must not suppress an unrelated domain read."""
+    transactions = [
+        {
+            "id": "t1",
+            "amount": 20,
+            "direction": "debit",
+            "category": "food",
+            "merchant": "Cafe",
+            "occurred_at": "2026-09-01T10:00:00+00:00",
+        }
+    ]
+    _result, calls = await _run_graph(
+        monkeypatch,
+        "Muéstrame mis movimientos",
+        transactions,
+        context_rows={"accounts": [{"id": "checking"}]},
+    )
+
+    assert [name for name, _ in calls] == ["select_rows"]
+    assert calls[0][1]["table"] == "transactions"
 
 
 def test_spending_analysis_retains_and_combines_multiple_tool_results() -> None:
@@ -320,8 +374,8 @@ async def test_missing_graph_identity_fails_before_loading_or_executing_tools() 
 async def test_plain_conversation_can_finish_without_chat_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_profile(_current_user_id: UUID) -> UserProfile:
-        return PROFILE.copy()
+    async def fake_profile(_current_user_id: UUID) -> UserContext:
+        return UserContext(profile=PROFILE.copy(), rows={})
 
     monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
     result = await build_graph(model=FakeModel(), tool_loader=_select_tool).ainvoke(
@@ -335,7 +389,7 @@ async def test_plain_conversation_can_finish_without_chat_message(
 async def test_unresolvable_user_never_receives_placeholder_money(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def unavailable(_current_user_id: UUID) -> UserProfile:
+    async def unavailable(_current_user_id: UUID) -> UserContext:
         raise graph_module.UserContextError("missing")
 
     monkeypatch.setattr(graph_module, "fetch_user_context", unavailable)

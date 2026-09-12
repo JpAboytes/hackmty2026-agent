@@ -27,6 +27,7 @@ Expo
   services/
     a2ui_bridge.py  Resource resolution, validation, bounded static-template cache
     financial_presentation.py  Deterministic selection and trusted BankingView builder
+  observability.py  Turn-scoped stage logging and per-turn timing timeline
   api.py            FastAPI entrypoint
 scripts/
   run_local.py      Run the graph once from the CLI, without an HTTP server
@@ -84,12 +85,51 @@ The request body may contain either `query` or a structured `action` with exactl
 
 The official v0.9.1 Basic Catalog, Finance v1, and Finance v2 are accepted. Basic supports `Text`, `Button`, `Card`, and `Column`; Finance v1 adds strict `Chart`; Finance v2 adds strict `BankingView` for the 13 shared intents. Unknown components, actions, styles, IDs, and properties are rejected. `database_overview` remains an integration proof rather than a consumer banking screen.
 
-One-off local run (no HTTP server):
+One-off local run (no HTTP server). It skips only authentication; every other
+stage runs as it does in production:
 
 ```bash
 export SUPABASE_ACCESS_TOKEN='<supabase-access-token>'
-./.venv/bin/python scripts/run_local.py
+./.venv/bin/python scripts/run_local.py "¿Cuánto dinero tengo?"
 ```
+
+## Reading the agent's behaviour
+
+Every request is one *turn* with a short id, and every step inside it is one
+*stage* that logs its own decision and `duration_ms`. The turn closes with a
+timeline that aggregates the stages, which is where latency work starts:
+
+```text
+17:03:28 INFO [t0001] agent: turn start input=query query_chars=21 user=68dc4d66
+17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=1 status=ok duration_ms=20.6
+17:03:28 INFO [t0001] agent: node.fetch_context outcome=resolved accounts=1 has_balance=true status=ok duration_ms=41.1
+17:03:28 INFO [t0001] agent: node.agent turn=0 observations=0 decision=financial_retrieval intent=financial-summary source=classifier calls=select_rows status=ok duration_ms=0.0
+17:03:28 INFO [t0001] agent: graph.route node=agent next=tools
+17:03:28 INFO [t0001] agent: tool.call name=select_rows table=accounts is_error=false rows=1 a2ui=false status=ok duration_ms=30.3
+17:03:28 INFO [t0001] agent: client.response route=graph message_chars=64 data_keys=currency,owned_balance a2ui=true resource_uri=a2ui://financial/view a2ui_messages=3 a2ui_bytes=2104
+17:03:28 INFO [t0001] agent: turn done status=ok total_ms=104.7 | node.load_tools=21ms node.fetch_context=41ms node.agent=0msx2 tool.call=30ms node.tools=30ms node.build_presentation=6ms
+```
+
+Stage names are stable, so `grep` answers specific questions:
+
+| Question | Filter |
+| --- | --- |
+| Where did the time go? | `turn done` |
+| Did the model run at all, and how big was its prompt? | `model.gemini` |
+| Which MCP tools ran, with which table, returning how many rows? | `tool.call` |
+| How much of the turn was connection setup? | `mcp.connect` |
+| What exactly did the client receive? | `client.response` |
+| Why did it take that branch? | `decision=` / `graph.route` |
+
+`decision=financial_retrieval` with no `model.gemini` line after it is the
+deterministic fast path; `decision=model_tool_calls` means Gemini chose the
+tools and the loop will run again.
+
+`LOG_LEVEL=DEBUG` adds stage starts and library transport logs.
+`LOG_PAYLOADS=1` additionally logs truncated tool arguments, MCP results, and
+the exact response body sent to the client - local debugging only, since those
+carry real balances. Without it no financial value is ever logged: stages
+record names, counts, sizes, durations, and classified outcomes only.
 
 LangGraph dev server / Studio (install the CLI separately - it's not a project
 dependency, since its resolver is heavy):

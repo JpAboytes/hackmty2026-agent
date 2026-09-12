@@ -6,6 +6,7 @@ import logging
 import unicodedata
 from copy import deepcopy
 from typing import Annotated, Any
+from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
@@ -19,8 +20,10 @@ from .mcp_client import (
     MCPToolExecution,
     UserContextError,
     execute_remote_tool,
+    mcp_session,
     require_current_user_id,
 )
+from .observability import configure_logging, end_turn, event, preview, stage, start_turn
 from .schemas.a2ui import A2UIBundle
 from .schemas.a2ui_action import (
     A2UIActionPayloadError,
@@ -33,6 +36,7 @@ from .services.financial_presentation import (
 )
 
 load_dotenv()
+configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FluidBank Orchestrator", version="0.1.0")
@@ -56,6 +60,11 @@ class ChatRequest(BaseModel):
 
     query: Annotated[str, Field(min_length=1, max_length=20_000)] | None = None
     action: A2UIActionRequest | None = None
+    # Compatibility only. The deployed mobile client sends the caller's id, and
+    # forbidding it outright made every request 422. It is never trusted:
+    # identity comes from the bearer token, and a value that disagrees with the
+    # token is refused rather than honoured.
+    user_id: UUID | None = None
 
     @model_validator(mode="after")
     def exactly_one_input(self) -> ChatRequest:
@@ -97,13 +106,32 @@ def _response_from_tool(execution: MCPToolExecution) -> ChatResponse:
     )
     structured = execution.result.structured_content
     data = deepcopy(structured) if isinstance(structured, dict) else {}
-    response = ChatResponse(message=message, data=data, a2ui=execution.a2ui)
-    if response.a2ui is not None:
-        logger.info("A2UI emitted to client resource_uri=%s", response.a2ui.resource_uri)
-    return response
+    return ChatResponse(message=message, data=data, a2ui=execution.a2ui)
+
+
+def _log_client_response(route: str, response: ChatResponse) -> None:
+    """Describe the exact envelope leaving for Expo, without its financial values."""
+    bundle = response.a2ui
+    event(
+        "client.response",
+        route=route,
+        message_chars=len(response.message),
+        data_keys=",".join(sorted(response.data)) or "none",
+        a2ui=bundle is not None,
+        resource_uri=bundle.resource_uri if bundle is not None else None,
+        a2ui_messages=len(bundle.messages) if bundle is not None else None,
+        a2ui_bytes=len(bundle.model_dump_json()) if bundle is not None else None,
+    )
+    preview("client.response", response.model_dump(mode="json"))
+
+
+def _invalid_action_response(reason: str) -> ChatResponse:
+    event("client.response", route="invalid_action", reason=reason, a2ui=False)
+    return ChatResponse(message="La acción de interfaz no es válida.", data={}, a2ui=None)
 
 
 def _unavailable_response() -> ChatResponse:
+    event("client.response", route="unavailable", a2ui=False)
     return ChatResponse(
         message="No pude consultar el servicio de datos en este momento.",
         data={},
@@ -116,11 +144,41 @@ async def chat(
     request: ChatRequest,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> ChatResponse:
-    """Route structured actions directly, then domain intents, then ordinary chat."""
+    """Run one chat turn under a single correlated, timed log stream."""
+    start_turn(
+        input="action" if request.action is not None else "query",
+        query_chars=len(request.query) if request.query is not None else None,
+    )
+    status = "ok"
     try:
-        current_user_id = require_current_user_id(await verify_supabase_access_token(authorization))
-    except (AuthenticationError, UserContextError) as exc:
-        raise HTTPException(status_code=401, detail="Authentication required") from exc
+        return await _handle_chat(request, authorization)
+    except HTTPException as exc:
+        status = f"http_{exc.status_code}"
+        raise
+    except Exception as exc:
+        status = f"error:{type(exc).__name__}"
+        raise
+    finally:
+        end_turn(status=status)
+
+
+async def _handle_chat(
+    request: ChatRequest,
+    authorization: str | None,
+) -> ChatResponse:
+    """Route structured actions directly, then domain intents, then ordinary chat."""
+    async with stage("http.auth") as step:
+        try:
+            current_user_id = require_current_user_id(
+                await verify_supabase_access_token(authorization)
+            )
+        except (AuthenticationError, UserContextError) as exc:
+            raise HTTPException(status_code=401, detail="Authentication required") from exc
+        # Only the first octet: enough to correlate a turn, not to identify anyone.
+        step.set(user=str(current_user_id)[:8], claimed_user=request.user_id is not None)
+    if request.user_id is not None and request.user_id != current_user_id:
+        event("http.identity_mismatch")
+        raise HTTPException(status_code=403, detail="Authenticated user does not match user_id")
 
     action: dict[str, Any] | None = None
     query = request.query
@@ -128,24 +186,34 @@ async def chat(
         try:
             action = request.action.as_payload()
         except A2UIActionPayloadError:
-            return ChatResponse(message="La acción de interfaz no es válida.", data={}, a2ui=None)
+            return _invalid_action_response("structured_payload")
     try:
         if query is not None:
             action = parse_legacy_a2ui_action(query)
     except A2UIActionPayloadError:
-        return ChatResponse(
-            message="La acción de interfaz no es válida.",
-            data={},
-            a2ui=None,
-        )
+        return _invalid_action_response("legacy_payload")
 
+    # One MCP session for the whole turn: the routes below make between one
+    # and six calls, and each used to pay its own handshake.
+    async with mcp_session():
+        return await _route_request(action, query, current_user_id)
+
+
+async def _route_request(
+    action: dict[str, Any] | None,
+    query: str | None,
+    current_user_id: UUID,
+) -> ChatResponse:
+    """Dispatch one authenticated turn over the session already opened for it."""
     if action is not None:
+        event("route.selected", route="action", action=action["name"])
         try:
-            action_execution = await execute_remote_tool(
-                "a2ui_action",
-                action,
-                current_user_id=current_user_id,
-            )
+            async with stage("route.action", action=action["name"]):
+                action_execution = await execute_remote_tool(
+                    "a2ui_action",
+                    action,
+                    current_user_id=current_user_id,
+                )
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()
         if action["name"] == "request_financial_view":
@@ -164,44 +232,53 @@ async def chat(
                 or trusted_scope.get("user_id") != str(current_user_id)
                 or intent is None
             ):
-                return ChatResponse(
-                    message="La acción de interfaz no es válida.", data={}, a2ui=None
+                return _invalid_action_response("untrusted_action_result")
+            event("route.selected", route="action_graph", intent=intent)
+            async with stage("graph.invoke", entry="action", intent=intent):
+                result = await graph.ainvoke(
+                    {
+                        "user_query": f"request_financial_view:{intent}",
+                        "requested_intent": intent,
+                        "action_requested": True,
+                        "current_user_id": current_user_id,
+                    },
+                    config={"configurable": {"thread_id": f"user:{current_user_id}"}},
                 )
-            result = await graph.ainvoke(
-                {
-                    "user_query": f"request_financial_view:{intent}",
-                    "requested_intent": intent,
-                    "action_requested": True,
-                    "current_user_id": current_user_id,
-                },
-                config={"configurable": {"thread_id": f"user:{current_user_id}"}},
-            )
-            return _response_from_graph(result)
-        return _response_from_tool(action_execution)
+            return _logged(_response_from_graph(result), route="action_graph")
+        return _logged(_response_from_tool(action_execution), route="action")
 
     assert query is not None
     if _requests_database_overview(query):
+        event("route.selected", route="database_overview")
         try:
-            return _response_from_tool(
-                await execute_remote_tool(
+            async with stage("route.database_overview"):
+                overview = await execute_remote_tool(
                     "database_overview",
                     {"limit": 50},
                     current_user_id=current_user_id,
                 )
-            )
+            return _logged(_response_from_tool(overview), route="database_overview")
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()
 
-    result = await graph.ainvoke(
-        {"user_query": query, "current_user_id": current_user_id},
-        config={"configurable": {"thread_id": f"user:{current_user_id}"}},
-    )
-    return _response_from_graph(result)
+    event("route.selected", route="graph")
+    async with stage("graph.invoke", entry="query"):
+        result = await graph.ainvoke(
+            {"user_query": query, "current_user_id": current_user_id},
+            config={"configurable": {"thread_id": f"user:{current_user_id}"}},
+        )
+    return _logged(_response_from_graph(result), route="graph")
+
+
+def _logged(response: ChatResponse, *, route: str) -> ChatResponse:
+    _log_client_response(route, response)
+    return response
 
 
 def _response_from_graph(result: dict[str, Any]) -> ChatResponse:
     presentation = result.get("financial_presentation")
     if isinstance(presentation, FinancialPresentation):
+        event("graph.output", source="financial_presentation", intent=presentation.intent)
         return ChatResponse(
             message=presentation.message,
             data=deepcopy(presentation.data),
@@ -209,7 +286,9 @@ def _response_from_graph(result: dict[str, Any]) -> ChatResponse:
         )
     final_execution = result.get("final_tool_execution")
     if isinstance(final_execution, MCPToolExecution):
+        event("graph.output", source="final_tool_execution")
         return _response_from_tool(final_execution)
+    event("graph.output", source="model_message", turns=result.get("tool_loop_count", 0))
     data: dict[str, Any] = dict(result.get("user_profile", {}))
     if "months" in result:
         data["months"] = result["months"]
