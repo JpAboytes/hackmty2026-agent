@@ -25,11 +25,17 @@ USER_A = "68dc4d66-07b8-5893-95f1-07f06989a552"
 USER_B = "c1a3797d-b335-5a9d-98a1-402311f82c7a"
 
 
-def test_chat_request_requires_a_known_demo_user_id() -> None:
+def test_chat_request_requires_a_user_id() -> None:
     with pytest.raises(ValidationError, match="Field required"):
         ChatRequest.model_validate({"query": "Hola"})
-    with pytest.raises(ValidationError, match="unknown demo user_id"):
-        ChatRequest(query="Hola", user_id="11111111-1111-1111-1111-111111111111")
+    with pytest.raises(ValidationError, match="uuid"):
+        ChatRequest.model_validate({"query": "Hola", "user_id": "not-a-uuid"})
+
+
+def test_chat_request_accepts_any_real_user_id() -> None:
+    """Membership belongs to MCP/public.users, not to a second allowlist here."""
+    real_user = "c72428ad-ebaf-4709-b832-2c0f5094d685"
+    assert str(ChatRequest(query="Hola", user_id=real_user).user_id) == real_user
 
 
 def _legacy_action(action: dict[str, Any]) -> str:

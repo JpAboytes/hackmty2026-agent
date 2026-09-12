@@ -83,7 +83,7 @@ class AdversarialSelectModel(ToolAwareModel):
 
 
 def _tools(*, visualization: bool = True) -> list[MCPToolDefinition]:
-    names = ["list_allowed_tables", "describe_table"]
+    names = ["list_allowed_tables", "describe_table", "chat_message"]
     if visualization:
         names.append("visualize_allowed_data")
     return [
@@ -130,6 +130,50 @@ def _execution(
         }
         message = "Table described."
         meta = None
+    elif name == "chat_message":
+        text = arguments["request"]["text"]
+        structured = {"ok": True, "message": text}
+        message = text
+        meta = {
+            "ui": {
+                "resourceUri": "a2ui://chat/message",
+                "mimeType": "application/a2ui+json",
+            }
+        }
+        a2ui = A2UIBundle(
+            resource_uri="a2ui://chat/message",
+            messages=[
+                {
+                    "version": "v0.9.1",
+                    "createSurface": {
+                        "surfaceId": "chat-message",
+                        "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json",
+                    },
+                },
+                {
+                    "version": "v0.9.1",
+                    "updateComponents": {
+                        "surfaceId": "chat-message",
+                        "components": [
+                            {"id": "root", "component": "Card", "child": "message_text"},
+                            {
+                                "id": "message_text",
+                                "component": "Text",
+                                "text": {"path": "/message"},
+                            },
+                        ],
+                    },
+                },
+                {
+                    "version": "v0.9.1",
+                    "updateDataModel": {
+                        "surfaceId": "chat-message",
+                        "path": "/",
+                        "value": {"message": text},
+                    },
+                },
+            ],
+        )
     else:
         request = arguments["request"]
         kind = request["visualization"]["kind"]
@@ -193,7 +237,7 @@ def _execution(
                 },
             ],
         )
-    if name != "visualize_allowed_data":
+    if name in {"list_allowed_tables", "describe_table"}:
         a2ui = None
     return MCPToolExecution(
         result=CallToolResult(
@@ -304,8 +348,12 @@ async def test_non_visual_question_does_not_call_visualization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     result, calls, _model = await _run(monkeypatch, "¿Cuál es mi saldo disponible?")
-    assert calls == []
-    assert result["message"] == "Respuesta textual."
+    assert calls == [("chat_message", {"request": {"text": "Respuesta textual."}})]
+    assert result["message"] == ""
+    execution = result["final_tool_execution"]
+    assert isinstance(execution, MCPToolExecution)
+    assert execution.a2ui is not None
+    assert execution.a2ui.resource_uri == "a2ui://chat/message"
 
 
 @pytest.mark.asyncio
@@ -323,12 +371,68 @@ async def test_select_rows_overwrites_model_ownership_with_current_user(
                 name="select_rows",
                 description="Select rows.",
                 input_schema={"type": "object"},
-            )
+            ),
+            MCPToolDefinition(
+                name="chat_message",
+                description="Present chat message.",
+                input_schema={"type": "object"},
+            ),
         ]
 
     async def execute(name: str, arguments: Mapping[str, Any] | None) -> MCPToolExecution:
         resolved = dict(arguments or {})
         calls.append((name, resolved))
+        if name == "chat_message":
+            text = resolved["request"]["text"]
+            return MCPToolExecution(
+                result=CallToolResult(
+                    content=[TextContent(text=text)],
+                    structured_content={"ok": True, "message": text},
+                    meta={
+                        "ui": {
+                            "resourceUri": "a2ui://chat/message",
+                            "mimeType": "application/a2ui+json",
+                        }
+                    },
+                    data=None,
+                ),
+                a2ui=A2UIBundle(
+                    resource_uri="a2ui://chat/message",
+                    messages=[
+                        {
+                            "version": "v0.9.1",
+                            "createSurface": {
+                                "surfaceId": "chat-message",
+                                "catalogId": (
+                                    "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json"
+                                ),
+                            },
+                        },
+                        {
+                            "version": "v0.9.1",
+                            "updateComponents": {
+                                "surfaceId": "chat-message",
+                                "components": [
+                                    {"id": "root", "component": "Card", "child": "message_text"},
+                                    {
+                                        "id": "message_text",
+                                        "component": "Text",
+                                        "text": {"path": "/message"},
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            "version": "v0.9.1",
+                            "updateDataModel": {
+                                "surfaceId": "chat-message",
+                                "path": "/",
+                                "value": {"message": text},
+                            },
+                        },
+                    ],
+                ),
+            )
         return MCPToolExecution(
             result=CallToolResult(
                 content=[TextContent(text="One user loaded.")],
@@ -351,7 +455,11 @@ async def test_select_rows_overwrites_model_ownership_with_current_user(
         }
     )
 
-    assert result["message"] == "Transacciones cargadas."
+    assert result["message"] == ""
+    execution = result["final_tool_execution"]
+    assert isinstance(execution, MCPToolExecution)
+    assert execution.a2ui is not None
+    assert execution.a2ui.resource_uri == "a2ui://chat/message"
     assert calls == [
         (
             "select_rows",
@@ -363,7 +471,8 @@ async def test_select_rows_overwrites_model_ownership_with_current_user(
                     {"column": "active", "operator": "eq", "value": True},
                 ],
             },
-        )
+        ),
+        ("chat_message", {"request": {"text": "Transacciones cargadas."}}),
     ]
 
 
@@ -374,14 +483,20 @@ async def test_unavailable_or_invalid_chart_data_has_safe_text_fallback(
     missing_tool, calls, _model = await _run(
         monkeypatch, "Visualiza la actividad diaria", visualization=False
     )
-    assert calls == []
-    assert "no ofrece visualize_allowed_data" in missing_tool["message"]
+    assert [name for name, _arguments in calls] == ["chat_message"]
+    assert "no ofrece visualize_allowed_data" in calls[0][1]["request"]["text"]
+    assert missing_tool["message"] == ""
 
     invalid_data, calls, _model = await _run(
         monkeypatch, "Visualiza la actividad diaria", numeric=False
     )
-    assert [name for name, _arguments in calls] == ["list_allowed_tables", "describe_table"]
-    assert "columnas de fecha y valor numérico" in invalid_data["message"]
+    assert [name for name, _arguments in calls] == [
+        "list_allowed_tables",
+        "describe_table",
+        "chat_message",
+    ]
+    assert "columnas de fecha y valor numérico" in calls[-1][1]["request"]["text"]
+    assert invalid_data["message"] == ""
 
 
 def test_visualization_scope_overwrites_model_user_and_keeps_business_filters() -> None:

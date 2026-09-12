@@ -8,6 +8,7 @@ import pytest
 
 from fluidbank_orchestrator import mcp_client
 from fluidbank_orchestrator.mcp_client import (
+    MODEL_TOOL_NAMES,
     MCPConfig,
     MCPConfigurationError,
     UserContextError,
@@ -18,6 +19,15 @@ from fluidbank_orchestrator.mcp_client import (
 
 _URL = "https://example.fastmcp.app/mcp"
 _TOKEN = "fmcp_test_placeholder_not_a_real_key"
+
+
+def test_chat_message_is_a_model_visible_tool() -> None:
+    """Regression: every final answer is wrapped through chat_message
+    (graph._chat_message_call), so the graph's tool loop must be allowed to
+    see and call it - omitting it here silently disables that guarantee
+    without any test failing elsewhere, since list_remote_tools() would just
+    quietly drop the tool from what the model loop sees."""
+    assert "chat_message" in MODEL_TOOL_NAMES
 
 
 def test_horizon_mode_rejects_missing_api_key() -> None:

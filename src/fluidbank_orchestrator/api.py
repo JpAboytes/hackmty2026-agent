@@ -11,7 +11,7 @@ from uuid import UUID
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from mcp.types import TextContent
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from .graph import graph
 from .mcp_client import (
@@ -20,7 +20,6 @@ from .mcp_client import (
     UserContextError,
     execute_remote_tool,
 )
-from .personas import DEMO_USER_IDS
 from .schemas.a2ui import A2UIBundle
 from .schemas.a2ui_action import A2UIActionPayloadError, parse_legacy_a2ui_action
 
@@ -42,15 +41,16 @@ def health() -> dict[str, str]:
 
 
 class ChatRequest(BaseModel):
+    """A chat turn for one signed-in application user.
+
+    The id is the caller's authenticated Supabase user id. Membership is not
+    re-checked here: MCP resolves every scoped query against public.users and
+    fails closed on an id that belongs to nobody, so there is no second
+    allowlist to keep in sync.
+    """
+
     query: str = Field(min_length=1, max_length=20_000)
     user_id: UUID
-
-    @field_validator("user_id")
-    @classmethod
-    def require_configured_demo_user(cls, value: UUID) -> UUID:
-        if str(value) not in DEMO_USER_IDS:
-            raise ValueError("unknown demo user_id")
-        return value
 
 
 class ChatResponse(BaseModel):

@@ -136,6 +136,7 @@ MODEL_TOOL_NAMES = frozenset(
         "select_rows",
         "database_overview",
         "visualize_allowed_data",
+        "chat_message",
     }
 )
 

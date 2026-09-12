@@ -427,6 +427,15 @@ def _text_from_execution(execution: MCPToolExecution) -> str:
     return "La herramienta terminó sin una respuesta de texto."
 
 
+def _chat_message_call(text: str) -> dict[str, Any]:
+    """Build the one tool call every plain final answer must end on.
+
+    The MCP chat_message tool wraps drafted text as a validated A2UI text
+    surface - this is how the agent guarantees it never returns bare text.
+    """
+    return {"name": "chat_message", "arguments": {"request": {"text": text}}}
+
+
 def build_graph(
     *,
     model: ToolAwareModel | None = None,
@@ -459,11 +468,15 @@ def build_graph(
                 "message": str(latest_visualization[-1].get("text") or "La visualización terminó."),
                 "tool_calls": [],
             }
+        if _observations(state, "chat_message"):
+            # The final answer was already wrapped as A2UI by chat_message; stop
+            # here instead of asking the model to draft another turn.
+            return {"tool_calls": []}
         if state.get("tool_loop_count", 0) >= _MAX_TOOL_TURNS:
-            return {
-                "message": "No pude completar la visualización dentro del límite seguro de pasos.",
-                "tool_calls": [],
-            }
+            limit_text = (
+                "No pude completar la visualización dentro del límite seguro de pasos."
+            )
+            return {"message": "", "tool_calls": [_chat_message_call(limit_text)]}
 
         candidate = await resolved_model.generate(
             query=state["user_query"],
@@ -483,10 +496,18 @@ def build_graph(
                 ),
                 months=candidate.months,
             )
-        result: GraphState = {
-            "message": candidate.message,
-            "tool_calls": [dict(call) for call in candidate.tool_calls],
-        }
+        if candidate.tool_calls:
+            result: GraphState = {
+                "message": "",
+                "tool_calls": [dict(call) for call in candidate.tool_calls],
+            }
+        else:
+            # Every final answer must reach the client as A2UI, never as bare
+            # text: wrap it through the MCP chat_message tool instead of ending.
+            message_text = candidate.message.strip() or (
+                "No tengo una respuesta para mostrar en este momento."
+            )
+            result = {"message": "", "tool_calls": [_chat_message_call(message_text)]}
         if candidate.months is not None:
             result["months"] = candidate.months
         return result
@@ -529,7 +550,7 @@ def build_graph(
                         "text": _text_from_execution(execution),
                     }
                 )
-                if name in {"visualize_allowed_data", "database_overview"}:
+                if name in {"visualize_allowed_data", "database_overview", "chat_message"}:
                     update["final_tool_execution"] = execution
             except (MCPConfigurationError, UserContextError):
                 observations.append(

@@ -185,11 +185,11 @@ def test_cross_repository_catalog_id_schema_and_fixture_parity() -> None:
     monorepo = Path(__file__).resolve().parents[2]
     agent_catalog = json.loads(
         (
-            monorepo / "hackmty2026-agent/src/fluidbank_orchestrator/a2ui_catalogs/finance_v1.json"
+            monorepo / "hackmty2026/src/fluidbank_orchestrator/a2ui_catalogs/finance_v1.json"
         ).read_text(encoding="utf-8")
     )
     mcp_catalog = json.loads(
-        (monorepo / "mcp/src/supabase_mcp/a2ui_support/catalogs/finance_v1.json").read_text(
+        (monorepo / "hackmty2026-mcp/src/supabase_mcp/a2ui_support/catalogs/finance_v1.json").read_text(
             encoding="utf-8"
         )
     )
