@@ -86,5 +86,5 @@ gcloud run deploy fluidbank-orchestrator \
 ```bash
 docker build -t fluidbank-orchestrator:local .
 docker run --rm -p 8080:8080 --env-file .env fluidbank-orchestrator:local
-curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/health
 ```

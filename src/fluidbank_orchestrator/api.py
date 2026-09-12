@@ -21,9 +21,14 @@ load_dotenv()
 app = FastAPI(title="FluidBank Orchestrator", version="0.1.0")
 
 
-@app.get("/healthz")
-def healthz() -> dict[str, str]:
-    """Liveness/readiness check for the Cloud Run container."""
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Liveness/readiness check for the Cloud Run container.
+
+    Deliberately not named /healthz: that exact path is intercepted at
+    Google's infrastructure level on some Cloud Run configurations and never
+    reaches the container.
+    """
     return {"status": "ok"}
 
 
