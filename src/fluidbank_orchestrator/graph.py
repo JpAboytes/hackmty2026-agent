@@ -1,12 +1,8 @@
-"""LangGraph workflow that fetches real Supabase-backed context through the
-read-only MCP server and drafts a conversational reply with Gemini.
+"""LangGraph workflow for ordinary conversational requests.
 
-A2UI is deliberately out of scope here. Per architecture decision, templates,
-surfaces, validation, and actions are owned by hackmty2026-mcp's own A2UI
-implementation (in progress); the agent only calls MCP and relays whatever
-A2UI payload it returns, untouched by the LLM. This graph produces the
-conversational message and any structured parameters (e.g. `months`) needed
-for that future MCP call - it never builds or edits A2UI itself.
+The API routes deterministic A2UI domain tools and actions outside this graph.
+This graph preserves the existing context-fetching and Gemini reasoning path;
+it never receives or generates A2UI messages.
 """
 
 from __future__ import annotations
@@ -46,8 +42,8 @@ async def fetch_context_node(state: GraphState) -> dict[str, UserProfile]:
     try:
         profile = await fetch_user_context(state["user_id"])
     except UserContextError:
-        profile = dict(_FALLBACK_PROFILE)
-    return {"user_profile": profile}  # type: ignore[typeddict-item]
+        profile = _FALLBACK_PROFILE.copy()
+    return {"user_profile": profile}
 
 
 def _fallback_intent() -> _Intent:
@@ -96,9 +92,8 @@ async def intent_node(state: GraphState) -> dict[str, object]:
                 response_schema=_Intent,
             ),
         )
-        intent = response.parsed
-        if intent is None:
-            raise ValueError("Gemini returned no parsed intent")
+        parsed = response.parsed
+        intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
     except Exception:  # noqa: BLE001 - any LLM failure falls back to local demo mode
         intent = _fallback_intent()
 

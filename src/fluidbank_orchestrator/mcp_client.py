@@ -7,13 +7,21 @@ directly to FastMCP; it is never added to graph state or model-visible data.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from fastmcp import Client
+from fastmcp.client.client import CallToolResult
+
+from .schemas.a2ui import A2UIBundle
+from .services.a2ui_bridge import A2UIBridge, A2UIBridgeError
+from .state import UserProfile
+
+logger = logging.getLogger(__name__)
 
 MCPAuthMode = Literal["horizon", "none"]
 
@@ -24,6 +32,15 @@ class MCPConfigurationError(ValueError):
 
 class UserContextError(RuntimeError):
     """Raised when the MCP server is unreachable or a user has no seeded data."""
+
+
+@dataclass(frozen=True, slots=True)
+class MCPToolExecution:
+    """One MCP result plus its optional, independently validated presentation."""
+
+    result: CallToolResult
+    a2ui: A2UIBundle | None
+    presentation_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +97,7 @@ def load_mcp_config(environment: Mapping[str, str] | None = None) -> MCPConfig:
     return MCPConfig(url=url, auth_mode="horizon", _horizon_api_key=token)
 
 
-def create_mcp_client(config: MCPConfig | None = None) -> Client:
+def create_mcp_client(config: MCPConfig | None = None) -> Client[Any]:
     """Create the configured FastMCP client.
 
     FastMCP accepts the raw Horizon token and adds the HTTP ``Bearer`` prefix.
@@ -91,8 +108,63 @@ def create_mcp_client(config: MCPConfig | None = None) -> Client:
     return Client(resolved.url)
 
 
-async def _select(client: Client, table: str, column: str, value: str) -> list[dict[str, object]]:
-    result = await client.call_tool(
+DEFAULT_A2UI_BRIDGE = A2UIBridge()
+
+
+async def call_mcp_tool(
+    client: Client[Any],
+    server_identity: str,
+    name: str,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    bridge: A2UIBridge = DEFAULT_A2UI_BRIDGE,
+) -> MCPToolExecution:
+    """Call any MCP tool and process optional A2UI metadata through one bridge."""
+    result = await client.call_tool(name, dict(arguments) if arguments is not None else None)
+    try:
+        a2ui = await bridge.build_bundle(client, result, server_identity=server_identity)
+    except A2UIBridgeError as exc:
+        logger.warning("MCP A2UI presentation rejected code=%s", exc.code)
+        return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+    except Exception as exc:  # noqa: BLE001 - retain the safe MCP fallback on bridge defects
+        logger.warning("MCP A2UI presentation failed (%s)", type(exc).__name__)
+        return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+    return MCPToolExecution(result=result, a2ui=a2ui)
+
+
+async def execute_remote_tool(
+    name: str,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    bridge: A2UIBridge = DEFAULT_A2UI_BRIDGE,
+) -> MCPToolExecution:
+    """Execute a tool over the configured remote/local MCP connection."""
+    config = load_mcp_config()
+    try:
+        async with create_mcp_client(config) as client:
+            return await call_mcp_tool(
+                client,
+                config.url,
+                name,
+                arguments,
+                bridge=bridge,
+            )
+    except MCPConfigurationError:
+        raise
+    except Exception:  # noqa: BLE001 - expose no transport or credential details
+        raise UserContextError("could not reach the remote MCP server") from None
+
+
+async def _select(
+    client: Client[Any],
+    server_identity: str,
+    table: str,
+    column: str,
+    value: str,
+) -> list[dict[str, object]]:
+    execution = await call_mcp_tool(
+        client,
+        server_identity,
         "select_rows",
         {
             "schema": "public",
@@ -100,7 +172,15 @@ async def _select(client: Client, table: str, column: str, value: str) -> list[d
             "filters": [{"column": column, "operator": "eq", "value": value}],
         },
     )
-    return result.data.rows
+    rows = getattr(execution.result.data, "rows", None)
+    if not isinstance(rows, list):
+        raise UserContextError("the MCP selection result was invalid")
+    validated: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict) or any(not isinstance(key, str) for key in row):
+            raise UserContextError("the MCP selection result was invalid")
+        validated.append(cast("dict[str, object]", dict(row)))
+    return validated
 
 
 def _overdraft_risk(available_balance: float, recurring_expenses: float) -> float:
@@ -111,13 +191,35 @@ def _overdraft_risk(available_balance: float, recurring_expenses: float) -> floa
     return max(0.0, min(1.0, shortfall))
 
 
-async def fetch_user_context(user_id: str) -> dict[str, object]:
+def _string_value(row: Mapping[str, object], key: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str):
+        raise UserContextError("the MCP user context was invalid")
+    return value
+
+
+def _float_value(row: Mapping[str, object], key: str) -> float:
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        raise UserContextError("the MCP user context was invalid")
+    try:
+        return float(value)
+    except ValueError:
+        raise UserContextError("the MCP user context was invalid") from None
+
+
+async def fetch_user_context(user_id: str) -> UserProfile:
     """Fetch one demo user's context entirely through remote MCP tool calls."""
     try:
-        async with create_mcp_client() as client:
-            prefs_rows = await _select(client, "accessibility_preferences", "user_id", user_id)
-            account_rows = await _select(client, "accounts", "user_id", user_id)
-            subscription_rows = await _select(client, "subscriptions", "user_id", user_id)
+        config = load_mcp_config()
+        async with create_mcp_client(config) as client:
+            prefs_rows = await _select(
+                client, config.url, "accessibility_preferences", "user_id", user_id
+            )
+            account_rows = await _select(client, config.url, "accounts", "user_id", user_id)
+            subscription_rows = await _select(
+                client, config.url, "subscriptions", "user_id", user_id
+            )
     except MCPConfigurationError:
         raise
     except Exception:  # noqa: BLE001 - expose a stable error without transport secrets
@@ -127,16 +229,18 @@ async def fetch_user_context(user_id: str) -> dict[str, object]:
         raise UserContextError(f"no accessibility preferences seeded for user {user_id}")
 
     prefs = prefs_rows[0]
-    available_balance = sum(float(row["available_balance"]) for row in account_rows)
+    available_balance = sum(_float_value(row, "available_balance") for row in account_rows)
     recurring_expenses = sum(
-        float(row["amount"]) for row in subscription_rows if row["status"] == "active"
+        _float_value(row, "amount")
+        for row in subscription_rows
+        if _string_value(row, "status") == "active"
     )
 
     return {
-        "literacy_level": prefs["literacy_level"],
-        "font_scale": prefs["font_scale"],
-        "contrast": prefs["contrast"],
-        "hit_target": prefs["hit_target"],
+        "literacy_level": _string_value(prefs, "literacy_level"),
+        "font_scale": _string_value(prefs, "font_scale"),
+        "contrast": _string_value(prefs, "contrast"),
+        "hit_target": _string_value(prefs, "hit_target"),
         "available_balance": available_balance,
         "recurring_expenses": recurring_expenses,
         "overdraft_risk": _overdraft_risk(available_balance, recurring_expenses),

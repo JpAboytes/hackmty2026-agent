@@ -1,6 +1,15 @@
-# FluidBank Orchestrator
+# Agent Orchestrator
 
-LangGraph agent for the accessibility-first banking demo. It fetches real financial and accessibility context through the read-only `hackmty2026-mcp` server, drafts a grounded conversational reply with Gemini, and relays whatever A2UI content that server returns to the mobile client - it never constructs or edits A2UI itself. See `PROJECT_SPEC.MD` for the full architecture and contract.
+LangGraph agent for the accessibility-first banking demo. It fetches financial and accessibility context through the read-only FastMCP server, drafts ordinary conversational replies with Gemini, and bridges MCP-produced A2UI v0.9.1 surfaces to Expo. It never invents components or lets the LLM inspect or modify A2UI messages. See `PROJECT_SPEC.MD` for the full architecture and contract.
+
+```text
+Expo
+  → POST /api/v1/agent/chat
+  → agent selects an MCP domain tool
+  → MCP result metadata selects an A2UI resource
+  → agent reads/caches the static resource and validates the embedded updateDataModel
+  → Expo receives one self-contained ordered v0.9.1 message sequence
+```
 
 ## Layout
 
@@ -8,7 +17,12 @@ LangGraph agent for the accessibility-first banking demo. It fetches real financ
 src/fluidbank_orchestrator/
   graph.py         LangGraph workflow: fetch_context -> intent
   state.py         Graph state (TypedDict)
-  mcp_client.py     Remote MCP client: validated config, Horizon bearer auth
+  mcp_client.py     Generic tool execution, validated config, Horizon bearer auth
+  schemas/
+    a2ui.py         Strict official-envelope and supported-catalog models
+    a2ui_action.py  Strict parser for the temporary action-over-chat transport
+  services/
+    a2ui_bridge.py  Resource resolution, validation, bounded static-template cache
   personas.py       Fixed demo persona ids (seeded by hackmty2026-mcp)
   api.py            FastAPI entrypoint
 scripts/
@@ -19,8 +33,7 @@ langgraph.json      LangGraph CLI / Studio manifest
 ## Setup
 
 ```bash
-python3 -m venv .venv
-./.venv/bin/pip install -e ".[dev]"
+uv sync --locked --extra dev
 cp .env.example .env   # fill in GEMINI_API_KEY, MCP_SERVER_URL, HORIZON_API_KEY
 ```
 
@@ -37,6 +50,29 @@ curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
   -H 'Content-Type: application/json' \
   -d '{"query": "Tengo dinero para el fin de semana?", "persona": "ana"}'
 ```
+
+A request for a database overview or available database objects deterministically calls the existing MCP `database_overview` domain tool. That tool selects the entire `a2ui://database/overview` surface through `_meta.ui.resourceUri`; no component-selection tool exists. The agent reads the static `createSurface` and `updateComponents` resource through MCP, combines it with the embedded dynamic `updateDataModel`, and returns:
+
+```json
+{
+  "message": "Database overview loaded.",
+  "data": {},
+  "a2ui": {
+    "resource_uri": "a2ui://database/overview",
+    "messages": [
+      { "version": "v0.9.1", "createSurface": {} },
+      { "version": "v0.9.1", "updateComponents": {} },
+      { "version": "v0.9.1", "updateDataModel": {} }
+    ]
+  }
+}
+```
+
+The bodies above are abbreviated; actual messages are complete JSON objects rather than strings. Static templates are cached by MCP server identity plus resource URI, but included in every response. The cache is bounded, stores no dynamic or financial data, returns detached copies, coalesces concurrent reads, and retains only successfully validated templates.
+
+Expo's temporary action serialization is parsed as strict JSON and forwarded directly to `a2ui_action` with exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`. It never goes through Gemini. The MCP action registry remains authoritative for allowed action/component pairs, and action results use the same A2UI bridge.
+
+Only the official v0.9.1 Basic Catalog and Expo's current `Text`, `Button`, `Card`, and `Column` subset are accepted. Charts require a future shared custom catalog. `database_overview` is an integration proof over allowlisted database objects, not a consumer banking screen. Future financial tools that follow the same MCP metadata/resource/update contract need no component-specific bridge code.
 
 One-off local run (no HTTP server):
 
@@ -55,8 +91,10 @@ dependency, since its resolver is heavy):
 ## Validate changes
 
 ```bash
-./.venv/bin/ruff check .
-./.venv/bin/pytest
+uv run pytest
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy
 ```
 
 ## Deploy to Cloud Run
