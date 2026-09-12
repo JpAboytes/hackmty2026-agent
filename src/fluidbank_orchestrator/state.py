@@ -26,7 +26,7 @@ class GraphState(TypedDict, total=False):
     """Data passed between graph nodes."""
 
     user_query: str
-    user_email: str
+    current_user_id: str
     user_profile: UserProfile
     message: str
     months: int

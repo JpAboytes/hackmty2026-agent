@@ -229,8 +229,7 @@ async def _select(
     client: Client[Any],
     server_identity: str,
     table: str,
-    column: str,
-    value: str,
+    current_user_id: str,
 ) -> list[dict[str, object]]:
     execution = await call_mcp_tool(
         client,
@@ -239,7 +238,7 @@ async def _select(
         {
             "schema": "public",
             "table": table,
-            "filters": [{"column": column, "operator": "eq", "value": value}],
+            "scope": {"user_id": current_user_id},
         },
     )
     rows = getattr(execution.result.data, "rows", None)
@@ -281,22 +280,19 @@ def _float_value(row: Mapping[str, object], key: str) -> float:
     return parsed
 
 
-async def fetch_user_context(email: str) -> UserProfile:
-    """Resolve a login email and fetch that user's context through MCP."""
+async def fetch_user_context(current_user_id: str) -> UserProfile:
+    """Fetch one configured demo user's context through mandatory MCP scope."""
     try:
         config = load_mcp_config()
         async with create_mcp_client(config) as client:
-            user_rows = await _select(client, config.url, "users", "email", email)
+            user_rows = await _select(client, config.url, "users", current_user_id)
             if not user_rows:
-                raise UserContextError("no seeded user found for the supplied email")
-            user_id = _string_value(user_rows[0], "id")
+                raise UserContextError("no seeded user found for the supplied user id")
             prefs_rows = await _select(
-                client, config.url, "accessibility_preferences", "user_id", user_id
+                client, config.url, "accessibility_preferences", current_user_id
             )
-            account_rows = await _select(client, config.url, "accounts", "user_id", user_id)
-            subscription_rows = await _select(
-                client, config.url, "subscriptions", "user_id", user_id
-            )
+            account_rows = await _select(client, config.url, "accounts", current_user_id)
+            subscription_rows = await _select(client, config.url, "subscriptions", current_user_id)
     except MCPConfigurationError:
         raise
     except UserContextError:
@@ -305,7 +301,7 @@ async def fetch_user_context(email: str) -> UserProfile:
         raise UserContextError("could not reach the remote MCP server") from None
 
     if not prefs_rows:
-        raise UserContextError(f"no accessibility preferences seeded for user {user_id}")
+        raise UserContextError("no accessibility preferences seeded for the selected user")
 
     prefs = prefs_rows[0]
     available_balance = sum(_float_value(row, "available_balance") for row in account_rows)

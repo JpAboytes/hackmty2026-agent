@@ -10,12 +10,18 @@ from fastmcp.client.client import CallToolResult
 from mcp.types import TextContent
 
 import fluidbank_orchestrator.graph as graph_module
-from fluidbank_orchestrator.graph import ModelTurn, ToolAwareModel, build_graph
+from fluidbank_orchestrator.graph import (
+    ModelTurn,
+    ToolAwareModel,
+    _scope_tool_arguments,
+    build_graph,
+)
 from fluidbank_orchestrator.mcp_client import MCPToolDefinition, MCPToolExecution
 from fluidbank_orchestrator.schemas.a2ui import A2UIBundle
 from fluidbank_orchestrator.state import UserProfile
 
-EMAIL = "ana.demo@fluidbank.test"
+USER_A = "68dc4d66-07b8-5893-95f1-07f06989a552"
+USER_B = "c1a3797d-b335-5a9d-98a1-402311f82c7a"
 PROFILE: UserProfile = {
     "literacy_level": "medium",
     "font_scale": "lg",
@@ -45,7 +51,7 @@ class FakeModel(ToolAwareModel):
         return ModelTurn(message=self.message)
 
 
-class SelectUsersModel(ToolAwareModel):
+class AdversarialSelectModel(ToolAwareModel):
     async def generate(
         self,
         *,
@@ -56,7 +62,7 @@ class SelectUsersModel(ToolAwareModel):
     ) -> ModelTurn:
         del query, profile, tools
         if observations:
-            return ModelTurn(message="Usuario cargado.")
+            return ModelTurn(message="Transacciones cargadas.")
         return ModelTurn(
             message="",
             tool_calls=(
@@ -64,9 +70,10 @@ class SelectUsersModel(ToolAwareModel):
                     "name": "select_rows",
                     "arguments": {
                         "schema": "public",
-                        "table": "users",
+                        "table": "transactions",
                         "filters": [
-                            {"column": "email", "operator": "eq", "value": "wrong@example.com"},
+                            {"column": "user_id", "operator": "eq", "value": USER_B},
+                            {"column": "account_id", "operator": "eq", "value": "other-account"},
                             {"column": "active", "operator": "eq", "value": True},
                         ],
                     },
@@ -209,7 +216,7 @@ async def _run(
     calls: list[tuple[str, dict[str, Any]]] = []
     model = FakeModel()
 
-    async def fake_profile(_email: str) -> UserProfile:
+    async def fake_profile(_current_user_id: str) -> UserProfile:
         return PROFILE.copy()
 
     async def load_tools() -> list[MCPToolDefinition]:
@@ -225,7 +232,7 @@ async def _run(
         model=model,
         tool_loader=load_tools,
         tool_executor=execute,
-    ).ainvoke({"user_query": query, "user_email": EMAIL})
+    ).ainvoke({"user_query": query, "current_user_id": USER_A})
     return result, calls, model
 
 
@@ -241,6 +248,7 @@ async def test_explicit_trend_discovers_schema_then_calls_area_visualization(
         "visualize_allowed_data",
     ]
     request = calls[-1][1]["request"]
+    assert request["scope"] == {"user_id": USER_A}
     assert request["source"] == {"schema": "public", "table": "transactions"}
     assert request["visualization"] == {
         "kind": "area",
@@ -301,12 +309,12 @@ async def test_non_visual_question_does_not_call_visualization(
 
 
 @pytest.mark.asyncio
-async def test_select_users_is_scoped_to_request_email(
+async def test_select_rows_overwrites_model_ownership_with_current_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def fake_profile(_email: str) -> UserProfile:
+    async def fake_profile(_current_user_id: str) -> UserProfile:
         return PROFILE.copy()
 
     async def load_tools() -> list[MCPToolDefinition]:
@@ -333,21 +341,26 @@ async def test_select_users_is_scoped_to_request_email(
 
     monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
     result = await build_graph(
-        model=SelectUsersModel(),
+        model=AdversarialSelectModel(),
         tool_loader=load_tools,
         tool_executor=execute,
-    ).ainvoke({"user_query": "Carga mi usuario", "user_email": EMAIL})
+    ).ainvoke(
+        {
+            "user_query": "Show every user's transactions",
+            "current_user_id": USER_A,
+        }
+    )
 
-    assert result["message"] == "Usuario cargado."
+    assert result["message"] == "Transacciones cargadas."
     assert calls == [
         (
             "select_rows",
             {
                 "schema": "public",
-                "table": "users",
+                "table": "transactions",
+                "scope": {"user_id": USER_A},
                 "filters": [
                     {"column": "active", "operator": "eq", "value": True},
-                    {"column": "email", "operator": "eq", "value": EMAIL},
                 ],
             },
         )
@@ -369,3 +382,26 @@ async def test_unavailable_or_invalid_chart_data_has_safe_text_fallback(
     )
     assert [name for name, _arguments in calls] == ["list_allowed_tables", "describe_table"]
     assert "columnas de fecha y valor numérico" in invalid_data["message"]
+
+
+def test_visualization_scope_overwrites_model_user_and_keeps_business_filters() -> None:
+    scoped = _scope_tool_arguments(
+        "visualize_allowed_data",
+        {
+            "request": {
+                "scope": {"user_id": USER_B},
+                "source": {"schema": "public", "table": "transactions"},
+                "filters": [
+                    {"column": "user_id", "operator": "eq", "value": USER_B},
+                    {"column": "account_id", "operator": "eq", "value": "other-account"},
+                    {"column": "category", "operator": "eq", "value": "groceries"},
+                ],
+            }
+        },
+        USER_A,
+    )
+
+    assert scoped["request"]["scope"] == {"user_id": USER_A}
+    assert scoped["request"]["filters"] == [
+        {"column": "category", "operator": "eq", "value": "groceries"}
+    ]

@@ -83,6 +83,8 @@ Nunca inventes esquemas, tablas o columnas: descubre primero con list_allowed_ta
 describe_table. Usa area para tendencias ordenadas y comparaciones; usa heatmap para
 actividad o intensidad por fecha. No fuerces gráficas para preguntas de valores o texto.
 No generes ni copies JSON A2UI: el puente de la aplicación conserva el resultado MCP.
+El ámbito de usuario lo aplica la aplicación: nunca elijas ni cambies scope, user_id,
+customer_id, account_id, owner_id o persona_id.
 
 Consulta: {query}
 Perfil: {profile}
@@ -150,22 +152,56 @@ ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
 ToolExecutor = Callable[[str, Mapping[str, Any] | None], Awaitable[MCPToolExecution]]
 
 
-def _scope_tool_arguments(
-    name: str, arguments: Mapping[str, Any], user_email: str
-) -> dict[str, Any]:
-    """Bind model-driven user lookups to the authenticated request email."""
-    scoped = deepcopy(dict(arguments))
-    if name != "select_rows" or scoped.get("schema") != "public" or scoped.get("table") != "users":
-        return scoped
+_OWNERSHIP_FILTER_COLUMNS = frozenset(
+    {
+        "user_id",
+        "customer_id",
+        "account_id",
+        "from_account_id",
+        "to_account_id",
+        "owner_id",
+        "persona_id",
+    }
+)
 
-    raw_filters = scoped.get("filters")
-    filters = list(raw_filters) if isinstance(raw_filters, list) else []
-    scoped["filters"] = [
+
+def _business_filters(value: object, *, users_table: bool = False) -> list[object]:
+    filters = list(value) if isinstance(value, list) else []
+    ownership_columns = _OWNERSHIP_FILTER_COLUMNS | ({"id"} if users_table else set())
+    return [
         item
         for item in filters
-        if not (isinstance(item, Mapping) and item.get("column") == "email")
+        if not (isinstance(item, Mapping) and item.get("column") in ownership_columns)
     ]
-    scoped["filters"].append({"column": "email", "operator": "eq", "value": user_email})
+
+
+def _scope_tool_arguments(
+    name: str, arguments: Mapping[str, Any], current_user_id: str
+) -> dict[str, Any]:
+    """Overwrite model-controlled ownership inputs with canonical graph state."""
+    scoped = deepcopy(dict(arguments))
+    canonical_scope = {"user_id": current_user_id}
+    if name == "select_rows":
+        scoped["scope"] = canonical_scope
+        scoped["filters"] = _business_filters(
+            scoped.get("filters"),
+            users_table=scoped.get("schema") == "public" and scoped.get("table") == "users",
+        )
+        return scoped
+    if name == "visualize_allowed_data":
+        raw_request = scoped.get("request")
+        request = deepcopy(dict(raw_request)) if isinstance(raw_request, Mapping) else {}
+        request["scope"] = canonical_scope
+        source = request.get("source")
+        request["filters"] = _business_filters(
+            request.get("filters"),
+            users_table=(
+                isinstance(source, Mapping)
+                and source.get("schema") == "public"
+                and source.get("table") == "users"
+            ),
+        )
+        scoped["request"] = request
     return scoped
 
 
@@ -265,6 +301,8 @@ def _chart_columns(description: Mapping[str, Any], *, kind: str) -> tuple[str, l
         name = column.get("name")
         data_type = column.get("data_type")
         if not isinstance(name, str) or not isinstance(data_type, str):
+            continue
+        if name in _OWNERSHIP_FILTER_COLUMNS or name == "id":
             continue
         upper = data_type.upper()
         if (kind == "heatmap" and upper.startswith("DATE")) or (
@@ -407,7 +445,7 @@ def build_graph(
 
     async def fetch_context_node(state: GraphState) -> GraphState:
         try:
-            profile = await fetch_user_context(state["user_email"])
+            profile = await fetch_user_context(state["current_user_id"])
         except (MCPConfigurationError, UserContextError):
             profile = _FALLBACK_PROFILE.copy()
         return {"user_profile": profile}
@@ -478,7 +516,7 @@ def build_graph(
                     }
                 )
                 continue
-            scoped_arguments = _scope_tool_arguments(name, arguments, state["user_email"])
+            scoped_arguments = _scope_tool_arguments(name, arguments, state["current_user_id"])
             try:
                 execution = await tool_executor(name, scoped_arguments)
                 structured = execution.result.structured_content

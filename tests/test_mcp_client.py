@@ -108,23 +108,22 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_context_resolves_email_to_user_id(
+async def test_fetch_user_context_scopes_every_selection_to_user_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
     user_id = "11111111-1111-1111-1111-111111111111"
-    calls: list[tuple[str, str, str]] = []
+    calls: list[tuple[str, str]] = []
 
     async def fake_select(
         client: _FakeClient,
         server_identity: str,
         table: str,
-        column: str,
-        value: str,
+        current_user_id: str,
     ) -> list[dict[str, object]]:
         del client
         assert server_identity == _URL
-        calls.append((table, column, value))
+        calls.append((table, current_user_id))
         rows: dict[str, list[dict[str, object]]] = {
             "users": [{"id": user_id}],
             "accessibility_preferences": [
@@ -144,13 +143,13 @@ async def test_fetch_user_context_resolves_email_to_user_id(
     monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
     monkeypatch.setattr(mcp_client, "_select", fake_select)
 
-    profile = await fetch_user_context("ana.demo@fluidbank.test")
+    profile = await fetch_user_context(user_id)
 
-    assert calls[0] == ("users", "email", "ana.demo@fluidbank.test")
-    assert calls[1:] == [
-        ("accessibility_preferences", "user_id", user_id),
-        ("accounts", "user_id", user_id),
-        ("subscriptions", "user_id", user_id),
+    assert calls == [
+        ("users", user_id),
+        ("accessibility_preferences", user_id),
+        ("accounts", user_id),
+        ("subscriptions", user_id),
     ]
     assert profile["available_balance"] == 1250.50
     assert profile["recurring_expenses"] == 19.99

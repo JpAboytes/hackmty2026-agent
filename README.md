@@ -23,7 +23,7 @@ src/fluidbank_orchestrator/
     a2ui_action.py  Strict parser for the temporary action-over-chat transport
   services/
     a2ui_bridge.py  Resource resolution, validation, bounded static-template cache
-  personas.py       Fixed demo emails used only by the local-run helper
+  personas.py       Canonical UUIDs and emails for the fixed seeded demo users
   api.py            FastAPI entrypoint
 scripts/
   run_local.py      Run the graph once from the CLI, without an HTTP server
@@ -48,8 +48,10 @@ HTTP API:
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
   -H 'Content-Type: application/json' \
-  -d '{"query": "Tengo dinero para el fin de semana?", "email": "ana.demo@fluidbank.test"}'
+  -d '{"query": "Tengo dinero para el fin de semana?", "user_id": "68dc4d66-07b8-5893-95f1-07f06989a552"}'
 ```
+
+The API accepts only the three configured seeded demo-user UUIDs. It stores the selected UUID as `current_user_id`, namespaces the LangGraph thread as `demo-user:<uuid>`, and injects/overwrites `scope.user_id` immediately before `select_rows` and `visualize_allowed_data` calls. Model-provided ownership filters are discarded; business filters remain and the MCP combines them with the canonical scope using `AND`. The UUID stays in application state and is never inferred from conversation text.
 
 A request for a database overview or available database objects deterministically calls the existing MCP `database_overview` domain tool. Explicit chart, graph, trend, daily-activity, calendar-heatmap, and series-comparison requests enter the graph's tool loop. The agent loads the active deployment's actual tool schemas, confirms `visualize_allowed_data` is available, discovers exact allowlisted object and column names through `list_allowed_tables` and `describe_table`, and only then calls the visualization tool. Area charts are used for ordered trends/comparisons and heatmaps for date-based intensity. No component-selection tool exists.
 
@@ -70,7 +72,9 @@ The selected domain tool chooses the entire A2UI surface through `_meta.ui.resou
 }
 ```
 
-The bodies above are abbreviated; actual messages are complete JSON objects rather than strings. Static templates are cached by MCP server identity plus resource URI, but included in every response. The cache is bounded, stores no dynamic or financial data, returns detached copies, coalesces concurrent reads, and retains only successfully validated templates.
+The bodies above are abbreviated; actual messages are complete JSON objects rather than strings. Static templates are cached by MCP server identity plus resource URI, but included in every response. The cache is bounded, stores no dynamic or financial data, returns detached copies, coalesces concurrent reads, and retains only successfully validated templates. Query results, `updateDataModel` messages, chart rows, and graph state are not globally cached.
+
+This is hackathon-MVP application-level filtering, not a production authorization boundary. It does not add RLS, Supabase Auth verification, or JWT verification.
 
 Expo's temporary action serialization is parsed as strict JSON and forwarded directly to `a2ui_action` with exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`. It never goes through Gemini. The MCP action registry remains authoritative for allowed action/component pairs, and action results use the same A2UI bridge.
 

@@ -6,11 +6,12 @@ import logging
 import unicodedata
 from copy import deepcopy
 from typing import Any
+from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from mcp.types import TextContent
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .graph import graph
 from .mcp_client import (
@@ -19,12 +20,9 @@ from .mcp_client import (
     UserContextError,
     execute_remote_tool,
 )
+from .personas import DEMO_USER_IDS
 from .schemas.a2ui import A2UIBundle
 from .schemas.a2ui_action import A2UIActionPayloadError, parse_legacy_a2ui_action
-
-# Structural check only: this is a public.users.email lookup key, not an
-# address used for delivery. EmailStr rejects the seeded fluidbank.test users.
-_EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -45,7 +43,14 @@ def health() -> dict[str, str]:
 
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
-    email: str = Field(min_length=3, max_length=254, pattern=_EMAIL_PATTERN)
+    user_id: UUID
+
+    @field_validator("user_id")
+    @classmethod
+    def require_configured_demo_user(cls, value: UUID) -> UUID:
+        if str(value) not in DEMO_USER_IDS:
+            raise ValueError("unknown demo user_id")
+        return value
 
 
 class ChatResponse(BaseModel):
@@ -121,7 +126,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()
 
-    result = await graph.ainvoke({"user_query": request.query, "user_email": request.email})
+    current_user_id = str(request.user_id)
+    result = await graph.ainvoke(
+        {"user_query": request.query, "current_user_id": current_user_id},
+        config={"configurable": {"thread_id": f"demo-user:{current_user_id}"}},
+    )
     final_execution = result.get("final_tool_execution")
     if isinstance(final_execution, MCPToolExecution):
         return _response_from_tool(final_execution)
