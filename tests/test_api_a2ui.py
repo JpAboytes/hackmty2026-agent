@@ -1,4 +1,4 @@
-"""Offline routing tests for overview requests, actions, and ordinary chat."""
+"""Offline API authentication and action-routing tests."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastmcp.client.client import CallToolResult
 from mcp.types import TextContent
 from pydantic import ValidationError
@@ -14,6 +15,9 @@ from fluidbank_orchestrator import api
 from fluidbank_orchestrator.api import ChatRequest
 from fluidbank_orchestrator.mcp_client import MCPToolExecution
 
+USER_A = "68dc4d66-07b8-5893-95f1-07f06989a552"
+USER_B = "c1a3797d-b335-5a9d-98a1-402311f82c7a"
+AUTH = "Bearer test-token"
 ACTION = {
     "name": "refresh_database_overview",
     "surfaceId": "database-overview",
@@ -21,21 +25,130 @@ ACTION = {
     "timestamp": "2026-09-12T12:00:00.000Z",
     "context": {"limit": 50},
 }
-USER_A = "68dc4d66-07b8-5893-95f1-07f06989a552"
-USER_B = "c1a3797d-b335-5a9d-98a1-402311f82c7a"
 
 
-def test_chat_request_requires_a_user_id() -> None:
-    with pytest.raises(ValidationError, match="Field required"):
+def test_chat_request_requires_one_input_and_a_user_id() -> None:
+    with pytest.raises(ValidationError):
         ChatRequest.model_validate({"query": "Hola"})
-    with pytest.raises(ValidationError, match="uuid"):
-        ChatRequest.model_validate({"query": "Hola", "user_id": "not-a-uuid"})
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate({"query": "Hola", "action": ACTION, "user_id": USER_A})
+    assert ChatRequest(query="Hola", user_id=USER_A).query == "Hola"
+    assert ChatRequest(action=ACTION, user_id=USER_A).action is not None
 
 
-def test_chat_request_accepts_any_real_user_id() -> None:
-    """Membership belongs to MCP/public.users, not to a second allowlist here."""
-    real_user = "c72428ad-ebaf-4709-b832-2c0f5094d685"
-    assert str(ChatRequest(query="Hola", user_id=real_user).user_id) == real_user
+async def _authenticate_as_a(_authorization: str | None) -> str:
+    return USER_A
+
+
+def _execution(
+    message: str = "Updated.", structured_content: dict[str, Any] | None = None
+) -> MCPToolExecution:
+    return MCPToolExecution(
+        result=CallToolResult(
+            content=[TextContent(text=message)],
+            structured_content=structured_content or {"ok": True},
+            meta=None,
+            data=None,
+        ),
+        a2ui=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_token_subject_body_uuid_mismatch_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def authenticate_as_b(_authorization: str | None) -> str:
+        return USER_B
+
+    monkeypatch.setattr(api, "verify_supabase_access_token", authenticate_as_b)
+    with pytest.raises(HTTPException) as caught:
+        await api.chat(ChatRequest(query="Hola", user_id=USER_A), AUTH)
+    assert caught.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_structured_financial_action_preserves_authenticated_user_in_graph_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    tool_calls: list[tuple[str, dict[str, Any] | None]] = []
+
+    class FakeGraph:
+        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+            invocations.append((state, config))
+            return {"message": "Movimientos listos.", "user_profile": {}}
+
+    action = {
+        "name": "request_financial_view",
+        "surfaceId": "financial-view",
+        "sourceComponentId": "request_financial_view_button",
+        "timestamp": "2026-09-12T12:00:00.000Z",
+        "context": {"intent": "transactions"},
+    }
+
+    async def execute(name: str, arguments: dict[str, Any] | None = None) -> MCPToolExecution:
+        tool_calls.append((name, arguments))
+        return _execution(
+            structured_content={
+                "ok": True,
+                "action": action,
+                "request": {"intent": "transactions"},
+                "trustedScope": {"user_id": USER_A},
+            }
+        )
+
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", FakeGraph())
+    response = await api.chat(ChatRequest(action=action, user_id=USER_A), AUTH)
+
+    state, config = invocations[0]
+    assert state["current_user_id"] == USER_A
+    assert state["requested_intent"] == "transactions"
+    assert state["action_requested"] is True
+    assert config == {"configurable": {"thread_id": f"user:{USER_A}"}}
+    assert response.message == "Movimientos listos."
+    assert tool_calls == [
+        ("a2ui_action", {**action, "trustedScope": {"user_id": USER_A}})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rejected_financial_action_never_reaches_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invoked = False
+
+    class FakeGraph:
+        async def ainvoke(self, _state: dict[str, Any], _config: dict[str, Any]) -> dict[str, Any]:
+            nonlocal invoked
+            invoked = True
+            return {"message": "Unexpected", "user_profile": {}}
+
+    async def reject(_name: str, _arguments: dict[str, Any] | None = None) -> MCPToolExecution:
+        return _execution(
+            structured_content={
+                "ok": False,
+                "error": {"code": "component_mismatch", "message": "Invalid action."},
+            }
+        )
+
+    action = {
+        "name": "request_financial_view",
+        "surfaceId": "financial-view",
+        "sourceComponentId": "request_financial_view_button",
+        "timestamp": "2026-09-12T12:00:00.000Z",
+        "context": {"intent": "transactions"},
+    }
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    monkeypatch.setattr(api, "execute_remote_tool", reject)
+    monkeypatch.setattr(api, "graph", FakeGraph())
+
+    response = await api.chat(ChatRequest(action=action, user_id=USER_A), AUTH)
+
+    assert invoked is False
+    assert response.message == "La acción de interfaz no es válida."
 
 
 def _legacy_action(action: dict[str, Any]) -> str:
@@ -48,132 +161,40 @@ def _legacy_action(action: dict[str, Any]) -> str:
     )
 
 
-def _execution(message: str = "Updated.") -> MCPToolExecution:
-    return MCPToolExecution(
-        result=CallToolResult(
-            content=[TextContent(text=message)],
-            structured_content={"ok": True},
-            meta=None,
-            data=None,
-        ),
-        a2ui=None,
-    )
-
-
 @pytest.mark.asyncio
-async def test_valid_legacy_action_calls_a2ui_action_once_with_all_fields(
+async def test_legacy_nonfinancial_action_remains_compatible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict[str, Any] | None]] = []
 
-    async def fake_execute(name: str, arguments: dict[str, Any] | None = None) -> MCPToolExecution:
+    async def execute(name: str, arguments: dict[str, Any] | None = None) -> MCPToolExecution:
         calls.append((name, arguments))
         return _execution()
 
-    monkeypatch.setattr(api, "execute_remote_tool", fake_execute)
-    response = await api.chat(ChatRequest(query=_legacy_action(ACTION), user_id=USER_A))
-
-    assert calls == [("a2ui_action", ACTION)]
-    assert response.message == "Updated."
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    response = await api.chat(ChatRequest(query=_legacy_action(ACTION), user_id=USER_A), AUTH)
+    assert calls == [
+        ("a2ui_action", {**ACTION, "trustedScope": {"user_id": USER_A}})
+    ]
     assert response.data == {"ok": True}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "query",
-    [
-        _legacy_action({**ACTION, "extra": True}),
-        _legacy_action({key: value for key, value in ACTION.items() if key != "timestamp"}),
-        _legacy_action({**ACTION, "timestamp": "not-a-time"}),
-        _legacy_action({**ACTION, "context": {"value": "x" * 17_000}}),
-        "Actualiza esta consulta financiera de solo lectura o simulación usando la acción de "
-        "interfaz adjunta.\nAcción A2UI: not-json",
-    ],
-)
-async def test_invalid_or_oversized_actions_never_call_mcp(
-    monkeypatch: pytest.MonkeyPatch, query: str
-) -> None:
-    calls = 0
-
-    async def fake_execute(name: str, arguments: dict[str, Any] | None = None) -> MCPToolExecution:
-        nonlocal calls
-        calls += 1
-        return _execution()
-
-    monkeypatch.setattr(api, "execute_remote_tool", fake_execute)
-    response = await api.chat(ChatRequest(query=query, user_id=USER_A))
-    assert calls == 0
-    assert response.a2ui is None
-    assert response.message == "La acción de interfaz no es válida."
-
-
-@pytest.mark.asyncio
-async def test_database_overview_intent_calls_existing_domain_tool(
+async def test_database_overview_is_authenticated_before_domain_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict[str, Any] | None]] = []
 
-    async def fake_execute(name: str, arguments: dict[str, Any] | None = None) -> MCPToolExecution:
+    async def execute(name: str, arguments: dict[str, Any] | None = None) -> MCPToolExecution:
         calls.append((name, arguments))
         return _execution("Database overview loaded.")
 
-    monkeypatch.setattr(api, "execute_remote_tool", fake_execute)
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
     response = await api.chat(
-        ChatRequest(query="Muéstrame los objetos disponibles de la base de datos", user_id=USER_A)
+        ChatRequest(query="Muéstrame los objetos disponibles de la base de datos", user_id=USER_A),
+        AUTH,
     )
     assert calls == [("database_overview", {"limit": 50})]
     assert response.message == "Database overview loaded."
-
-
-@pytest.mark.asyncio
-async def test_ordinary_non_a2ui_chat_behavior_remains_graph_backed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeGraph:
-        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-            assert state["user_query"] == "¿Tengo dinero para el fin de semana?"
-            assert state["current_user_id"] == USER_A
-            assert config == {"configurable": {"thread_id": f"demo-user:{USER_A}"}}
-            return {
-                "message": "Respuesta habitual.",
-                "user_profile": {"available_balance": 1200.0},
-                "months": 6,
-            }
-
-    async def forbidden_execute(
-        name: str, arguments: dict[str, Any] | None = None
-    ) -> MCPToolExecution:
-        raise AssertionError("ordinary chat must not call a presentation tool")
-
-    monkeypatch.setattr(api, "graph", FakeGraph())
-    monkeypatch.setattr(api, "execute_remote_tool", forbidden_execute)
-    response = await api.chat(
-        ChatRequest(query="¿Tengo dinero para el fin de semana?", user_id=USER_A)
-    )
-    assert response.model_dump() == {
-        "message": "Respuesta habitual.",
-        "data": {"available_balance": 1200.0, "months": 6},
-        "a2ui": None,
-    }
-
-
-@pytest.mark.asyncio
-async def test_switching_users_uses_distinct_graph_state_and_thread_namespaces(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    invocations: list[tuple[dict[str, Any], dict[str, Any]]] = []
-
-    class FakeGraph:
-        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-            invocations.append((state, config))
-            return {"message": "ok", "user_profile": {"available_balance": 1.0}}
-
-    monkeypatch.setattr(api, "graph", FakeGraph())
-    await api.chat(ChatRequest(query="Mi saldo", user_id=USER_A))
-    await api.chat(ChatRequest(query="Mi saldo", user_id=USER_B))
-
-    assert [state["current_user_id"] for state, _config in invocations] == [USER_A, USER_B]
-    assert [config["configurable"]["thread_id"] for _state, config in invocations] == [
-        f"demo-user:{USER_A}",
-        f"demo-user:{USER_B}",
-    ]

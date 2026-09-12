@@ -21,13 +21,8 @@ _URL = "https://example.fastmcp.app/mcp"
 _TOKEN = "fmcp_test_placeholder_not_a_real_key"
 
 
-def test_chat_message_is_a_model_visible_tool() -> None:
-    """Regression: every final answer is wrapped through chat_message
-    (graph._chat_message_call), so the graph's tool loop must be allowed to
-    see and call it - omitting it here silently disables that guarantee
-    without any test failing elsewhere, since list_remote_tools() would just
-    quietly drop the tool from what the model loop sees."""
-    assert "chat_message" in MODEL_TOOL_NAMES
+def test_chat_message_is_not_a_model_escape_hatch() -> None:
+    assert "chat_message" not in MODEL_TOOL_NAMES
 
 
 def test_horizon_mode_rejects_missing_api_key() -> None:
@@ -144,7 +139,18 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
                     "hit_target": "standard",
                 }
             ],
-            "accounts": [{"available_balance": "1250.50"}],
+            "accounts": [
+                {
+                    "account_type": "checking",
+                    "currency": "MXN",
+                    "available_balance": "1250.50",
+                },
+                {
+                    "account_type": "credit",
+                    "currency": "MXN",
+                    "available_balance": "9000.00",
+                },
+            ],
             "subscriptions": [{"amount": "19.99", "status": "active"}],
         }
         return rows[table]
@@ -162,6 +168,7 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
         ("subscriptions", user_id),
     ]
     assert profile["available_balance"] == 1250.50
+    assert profile["owned_balances"] == {"MXN": 1250.50}
     assert profile["recurring_expenses"] == 19.99
 
 
@@ -189,7 +196,13 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
         rows: dict[str, list[dict[str, object]]] = {
             "users": [{"id": user_id}],
             "accessibility_preferences": [],
-            "accounts": [{"available_balance": "42.00"}],
+            "accounts": [
+                {
+                    "account_type": "savings",
+                    "currency": "MXN",
+                    "available_balance": "42.00",
+                }
+            ],
             "subscriptions": [],
         }
         return rows[table]
@@ -204,3 +217,13 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
     assert profile["recurring_expenses"] == 0.0
     assert profile["literacy_level"] == "medium"
     assert profile["hit_target"] == "large"
+
+
+def test_owned_money_excludes_credit_and_never_mixes_currencies() -> None:
+    rows = [
+        {"account_type": "checking", "currency": "MXN", "available_balance": 100},
+        {"account_type": "savings", "currency": "MXN", "available_balance": 50},
+        {"account_type": "credit", "currency": "MXN", "available_balance": 900},
+        {"account_type": "checking", "currency": "USD", "available_balance": 20},
+    ]
+    assert mcp_client._owned_balances(rows) == {"MXN": 150.0, "USD": 20.0}

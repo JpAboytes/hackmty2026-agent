@@ -68,18 +68,20 @@ The system consists of independently maintained repositories and deployable comp
 
 - LangGraph implemented in the backend language selected for the orchestration repository.
 - Interprets user intent and obtains the minimum required data by calling the MCP server's tools.
-- Drafts conversational text grounded in that data and extracts structured parameters (e.g. a requested number of months) the MCP server needs to build the right surface.
-- Never invents, translates, or asks the LLM to edit A2UI content. The MCP server is the only component that produces A2UI. The orchestrator validates MCP-produced messages, resolves the MCP-selected static resource, and packages the original validated message objects for the mobile transport.
+- Interprets returned data, then selects one of the finite financial presentation semantics in the shared contract.
+- Constructs Finance v2 `BankingView` payloads through trusted typed builders. The LLM never emits component names, actions, IDs, styles, properties, or raw A2UI JSON.
+- Continues to validate and relay MCP-produced A2UI for legacy/domain tools through the generic bridge.
 - Must not directly mutate client state or generate executable client code.
-- Must enforce confirmation boundaries for actions that could affect financial decisions or user data: user-triggered actions are dispatched deterministically to the MCP server's action tool, never decided or rewritten by the LLM.
+- Verifies the Supabase bearer token at the HTTP boundary, derives `current_user_id` from its authenticated subject, and preserves that identity through graph and MCP scope.
+- Must enforce confirmation boundaries for actions that could affect financial decisions or user data. Read-only `request_financial_view` actions re-enter the same intent/data/presentation graph; state-changing actions remain bounded backend operations and never become LLM decisions.
 
 ### 5.3 MCP Tool Server
 
 - FastMCP in Python. Runnable locally over stdio and deployable remotely (e.g. Horizon) over Streamable HTTP.
 - Provides narrowly scoped, typed tools for retrieving demo financial data and computing derived scores.
-- Owns the full A2UI protocol implementation: templates, resources (served via `resources/read`), `updateDataModel`, validation, `_meta.ui` metadata, user-triggered actions, and A2UI error responses. A2UI content is returned as an `EmbeddedResource` (MIME type `application/a2ui+json`) alongside any plain text or structured content in the same tool result.
+- Defines and validates the bounded data/action surface and the A2UI catalog/schema contract. It may return MCP-owned A2UI resources for its domain tools, while the agent uses the same versioned contract for post-data Finance v2 presentation construction.
 - Tools must validate inputs, return structured errors, and expose only the data required by the current request.
-- The MCP server is the only component that directly accesses Supabase data and the only component that constructs or validates A2UI content.
+- The MCP server is the only component that directly accesses Supabase financial data. It defines/validates allowed contracts and MCP-owned A2UI; the agent's trusted typed builder constructs and validates Finance v2 after interpreting returned data.
 
 ### 5.4 Supabase
 
@@ -100,13 +102,13 @@ It consumes the versioned shared contract package. It must not import source fil
 
 ### 6.2 Agent Orchestrator Repository
 
-Owns LangGraph state, intent routing, prompt and policy logic, the MCP client integration, and orchestrator tests. It does not own template selection or A2UI payload generation - that belongs to the MCP repository.
+Owns LangGraph state, intent routing, prompt and policy logic, financial presentation selection, trusted Finance v2 builders, the MCP client integration, and orchestrator tests.
 
-It consumes the official A2UI schema to validate the envelope it relays; it must never invent, translate, or semantically edit A2UI content. It communicates with the MCP server through its public tool and resource interfaces, whether a local stdio process or its deployed HTTP endpoint. Because Mobile is not an MCP client, the orchestrator combines the MCP-produced static resource messages and embedded dynamic messages into one ordered, self-contained response.
+It consumes the official and shared Finance schemas to validate every envelope it relays or constructs. The LLM may select a known semantic intent but cannot invent protocol values. It communicates with the MCP server through public tool/resource interfaces and returns one ordered, self-contained response because Mobile is not an MCP client.
 
 ### 6.3 MCP and Data Repository
 
-Owns the FastMCP server, tool definitions, the full A2UI protocol implementation (templates, resources, `updateDataModel`, actions, validation, error responses), Supabase migrations, seed data, score computation, and data/tool tests.
+Owns the FastMCP server, bounded tool definitions, data access, action validation, shared A2UI catalog/schema definitions, MCP-owned templates/resources, Supabase migrations, seed data, score computation, and data/tool tests.
 
 It must not contain mobile UI code or assume a local checkout of the mobile repository.
 
@@ -151,8 +153,8 @@ The system implements Google's A2UI protocol as-is: a hard requirement, not a be
 
 ### 8.1 Ownership
 
-- **MCP server**: builds and validates every A2UI artifact - templates, resources, surfaces, the component catalog, `updateDataModel` patches, actions, and A2UI error responses. This is the only component allowed to construct or edit A2UI content.
-- **Agent orchestrator**: calls MCP domain tools, reads `_meta.ui`, resolves the selected MCP resource, validates static and dynamic messages, and returns detached copies in source order. The LLM never sees, generates, or modifies A2UI JSON.
+- **MCP server**: defines and validates allowed catalogs, data access, actions, and MCP-owned templates/resources.
+- **Agent orchestrator**: calls MCP data tools, interprets results, chooses a finite presentation intent, and uses trusted typed builders for Finance v2. It also resolves and validates MCP-owned A2UI. The LLM never sees, generates, or modifies A2UI JSON.
 - **Mobile client**: implements the A2UI renderer, the component catalog, per-surface state, data bindings, and dispatches user actions. It is not an MCP client and never dereferences an `a2ui://` URI.
 
 ### 8.2 Transport shape
@@ -209,15 +211,15 @@ The generic bridge uses public FastMCP result fields. It reads runtime `CallTool
 
 Validated static templates are cached by MCP server identity plus resource URI in a bounded process-local LRU cache. The cache never stores `updateDataModel` data, returns detached copies, coalesces concurrent reads for the same uncached key, and does not retain failed reads. Static messages are included on every response because Mobile treats each response as a self-contained replacement.
 
-The bridge allowlists exactly the v0.9.1 Basic Catalog and `https://fluidbank.app/a2ui/catalogs/finance/v1`. Basic remains `Text`, `Button`, `Card`, and `Column`; Finance adds the strict `Chart` component. Each template is validated with the catalog declared by `createSurface`, so `Chart` under Basic, unknown Finance components, inline catalogs, and all other catalog IDs fail before forwarding.
+Validation allowlists the v0.9.1 Basic Catalog, Finance v1, and `https://fluidbank.app/a2ui/catalogs/finance/v2`. Basic remains `Text`, `Button`, `Card`, and `Column`; Finance v1 adds strict `Chart`; Finance v2 adds only strict `BankingView`. Unknown components, arbitrary properties, inline catalogs, and all other catalog IDs fail before forwarding.
 
-The agent carries a checked-in copy of Finance v1 because the bridge validates offline and must not expose MCP credentials or ask Expo to fetch resources. A parity test compares that copy with the MCP source catalog, checks the Expo catalog ID, and shares representative accepted/rejected chart fixtures. The generic bridge still branches on `_meta.ui`, not tool names: it reads and caches `a2ui://finance/data-chart`, validates the static messages, appends only the dynamic `updateDataModel`, and returns JSON objects in static-before-dynamic order. Cache entries never contain banking rows.
+The agent carries a checked-in copy of Finance v1 and strict Python models matching the shared Finance v2 `BankingView` contract so validation is offline. Parity tests compare Finance v1 with MCP and exercise accepted/rejected Finance v2 payloads. The generic bridge still branches on `_meta.ui`, not tool names, while the Finance v2 builder produces a complete validated message sequence after data interpretation. Cache entries never contain banking rows.
 
 The one wire component binds `{kind: "area", accessibleSummary?, props}` or `{kind: "heatmap", accessibleSummary?, props}`. The agent enforces stable unique area series IDs, 240 area points, 500 heatmap cells, finite bounded values, actual calendar dates, unique labels/dates, and forbidden unknown properties. Future catalog components require a versioned SDK-valid schema, matching agent/client validators, a trusted Expo adapter, and cross-repository fixtures; they do not require tool-name special cases in this bridge.
 
 ### 8.5 Actions
 
-User-triggered actions (button presses, confirmations) call the MCP server's `a2ui_action` tool deterministically from the mobile/agent layer. During the temporary chat-transport compatibility period, the agent strictly parses Mobile's serialized action JSON, requires exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`, and forwards those values unchanged. Actions never enter the LLM. The MCP action registry enforces action/component allowlists, and any A2UI-enabled result returns through the same generic bridge.
+The API accepts a structured action envelope and temporarily preserves the legacy action-over-chat parser. It requires exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`. The API forwards every action to MCP's allowlist with trusted application identity carried separately as `trustedScope`. A successfully normalized `request_financial_view` re-enters the authenticated graph with the same `current_user_id`; rejected actions do not reach the graph. Actions never enter the LLM.
 
 ### 8.6 Accessibility boundary
 

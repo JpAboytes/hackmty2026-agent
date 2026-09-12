@@ -30,11 +30,14 @@ from pydantic import (
     model_validator,
 )
 
+from .banking_view import FINANCIAL_INTENTS, validate_banking_view
+
 A2UI_VERSION = "v0.9.1"
 A2UI_SDK_VERSION = "0.9.1"
 A2UI_MIME_TYPE = "application/a2ui+json"
 A2UI_BASIC_CATALOG = "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json"
 A2UI_FINANCE_CATALOG = "https://fluidbank.app/a2ui/catalogs/finance/v1"
+A2UI_FINANCE_V2_CATALOG = "https://fluidbank.app/a2ui/catalogs/finance/v2"
 
 MAX_RESOURCE_BYTES = 262_144
 MAX_MESSAGES = 100
@@ -240,7 +243,19 @@ class _ChartComponent(_ComponentBase):
     chart: ChartValue
 
 
-Component = _TextComponent | _ButtonComponent | _CardComponent | _ColumnComponent | _ChartComponent
+class _BankingViewComponent(_ComponentBase):
+    component: Literal["BankingView"]
+    view: JsonValue | _Binding
+
+
+Component = (
+    _TextComponent
+    | _ButtonComponent
+    | _CardComponent
+    | _ColumnComponent
+    | _ChartComponent
+    | _BankingViewComponent
+)
 
 
 class _Theme(_StrictModel):
@@ -260,6 +275,7 @@ class _CreateSurfaceBody(_StrictModel):
     catalog_id: Literal[
         "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json",
         "https://fluidbank.app/a2ui/catalogs/finance/v1",
+        "https://fluidbank.app/a2ui/catalogs/finance/v2",
     ] = Field(alias="catalogId")
     theme: _Theme | None = None
     send_data_model: StrictBool | None = Field(default=None, alias="sendDataModel")
@@ -316,7 +332,7 @@ class _MappingCatalogProvider(A2uiCatalogProvider):  # type: ignore[misc]
         return deepcopy(self._catalog)
 
 
-def _finance_catalog_config() -> CatalogConfig:
+def _finance_catalog_config(*, version: Literal["v1", "v2"] = "v1") -> CatalogConfig:
     resource = files("fluidbank_orchestrator.a2ui_catalogs").joinpath("finance_v1.json")
     try:
         loaded = json.loads(resource.read_text(encoding="utf-8"))
@@ -328,8 +344,47 @@ def _finance_catalog_config() -> CatalogConfig:
         or loaded.get("$id") != A2UI_FINANCE_CATALOG
     ):
         raise RuntimeError("The finance A2UI catalog has an unexpected identifier")
+    loaded = deepcopy(dict(loaded))
+    if version == "v2":
+        loaded["$id"] = A2UI_FINANCE_V2_CATALOG
+        loaded["catalogId"] = A2UI_FINANCE_V2_CATALOG
+        loaded["title"] = "Fluidbank Finance Catalog v2"
+        components = loaded.get("components")
+        definitions = loaded.get("$defs")
+        if not isinstance(components, dict) or not isinstance(definitions, dict):
+            raise RuntimeError("The finance A2UI catalog is malformed")
+        components["BankingView"] = {
+            "type": "object",
+            "allOf": [
+                {
+                    "$ref": (
+                        "https://a2ui.org/specification/v0_9/common_types.json"
+                        "#/$defs/ComponentCommon"
+                    )
+                },
+                {"$ref": "#/$defs/CatalogComponentCommon"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "BankingView"},
+                        "view": {
+                            "anyOf": [
+                                {"$ref": "#/$defs/DataBinding"},
+                                {"type": "object"},
+                            ]
+                        },
+                    },
+                    "required": ["component", "view"],
+                },
+            ],
+            "unevaluatedProperties": False,
+        }
+        any_component = definitions.get("anyComponent")
+        if not isinstance(any_component, dict) or not isinstance(any_component.get("oneOf"), list):
+            raise RuntimeError("The finance A2UI catalog is malformed")
+        any_component["oneOf"].append({"$ref": "#/components/BankingView"})
     return CatalogConfig(
-        name="fluidbank-finance-v1",
+        name=f"fluidbank-finance-{version}",
         provider=_MappingCatalogProvider(loaded),
     )
 
@@ -373,10 +428,16 @@ _SDK_VALIDATORS = {
         BasicCatalog.get_config(A2UI_SDK_VERSION), A2UI_BASIC_CATALOG
     ),
     A2UI_FINANCE_CATALOG: _catalog_validator(_finance_catalog_config(), A2UI_FINANCE_CATALOG),
+    A2UI_FINANCE_V2_CATALOG: _catalog_validator(
+        _finance_catalog_config(version="v2"), A2UI_FINANCE_V2_CATALOG
+    ),
 }
 _COMPONENTS_BY_CATALOG = {
     A2UI_BASIC_CATALOG: frozenset({"Text", "Button", "Card", "Column"}),
     A2UI_FINANCE_CATALOG: frozenset({"Text", "Button", "Card", "Column", "Chart"}),
+    A2UI_FINANCE_V2_CATALOG: frozenset(
+        {"Text", "Button", "Card", "Column", "Chart", "BankingView"}
+    ),
 }
 _OPERATIONS = ("createSurface", "updateComponents", "updateDataModel", "deleteSurface")
 
@@ -538,7 +599,7 @@ def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id
     if not isinstance(catalog_id, str) or catalog_id not in _SDK_VALIDATORS:
         raise A2UIValidationError("A2UI sequence uses an unsupported catalog")
     validated = validate_messages(messages, expected_surface_id=surface_id, catalog_id=catalog_id)
-    if catalog_id == A2UI_FINANCE_CATALOG:
+    if catalog_id in {A2UI_FINANCE_CATALOG, A2UI_FINANCE_V2_CATALOG}:
         chart_components = [
             component
             for message in validated
@@ -561,6 +622,57 @@ def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id
                 _CHART_VALUE_ADAPTER.validate_python(candidate, strict=True)
             except Exception as exc:
                 raise A2UIValidationError("Finance chart data model is invalid") from exc
+    if catalog_id == A2UI_FINANCE_V2_CATALOG:
+        finance_components = [
+            component
+            for message in validated
+            for component in message.get("updateComponents", {}).get("components", [])
+        ]
+        banking_components = [
+            component
+            for component in finance_components
+            if component.get("component") == "BankingView"
+        ]
+        if not banking_components:
+            raise A2UIValidationError("Finance v2 must contain a BankingView")
+        banking_data_model: Any = None
+        for message in validated:
+            update = message.get("updateDataModel")
+            if isinstance(update, Mapping):
+                banking_data_model = _apply_data_update(banking_data_model, update)
+        for component in banking_components:
+            view = component.get("view")
+            candidate = (
+                _resolve_data_path(banking_data_model, view["path"])
+                if isinstance(view, Mapping) and isinstance(view.get("path"), str)
+                else view
+            )
+            if candidate is _MISSING:
+                raise A2UIValidationError("Finance BankingView data binding could not be resolved")
+            try:
+                validate_banking_view(candidate)
+            except Exception as exc:
+                raise A2UIValidationError("Finance BankingView data model is invalid") from exc
+        for component in finance_components:
+            if component.get("component") != "Button":
+                continue
+            event = component.get("action", {}).get("event", {})
+            context = event.get("context") if isinstance(event, Mapping) else None
+            intent_value = context.get("intent") if isinstance(context, Mapping) else None
+            resolved_intent = (
+                _resolve_data_path(banking_data_model, intent_value["path"])
+                if isinstance(intent_value, Mapping)
+                and isinstance(intent_value.get("path"), str)
+                else intent_value
+            )
+            if (
+                not isinstance(event, Mapping)
+                or event.get("name") != "request_financial_view"
+                or not isinstance(context, Mapping)
+                or set(context) != {"intent"}
+                or resolved_intent not in FINANCIAL_INTENTS
+            ):
+                raise A2UIValidationError("Finance v2 contains an unsupported action")
     _sdk_validate(validated, catalog_id)
 
 

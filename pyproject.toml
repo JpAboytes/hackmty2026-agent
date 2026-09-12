@@ -13,6 +13,7 @@ dependencies = [
     "fastapi>=0.115,<1",
     "fastmcp>=4.0.3,<5",
     "google-genai>=2.4,<3",
+    "httpx>=0.28,<1",
     "langgraph>=0.6,<1",
     "pydantic>=2.8,<3",
     "python-dotenv>=1.0,<2",

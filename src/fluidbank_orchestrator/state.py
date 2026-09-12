@@ -1,8 +1,4 @@
-"""State contract for the FluidBank LangGraph workflow.
-
-No A2UI type lives here: template/surface generation is owned by the MCP
-server's A2UI implementation, not the agent.
-"""
+"""State contract for the FluidBank LangGraph workflow."""
 
 from __future__ import annotations
 
@@ -17,9 +13,10 @@ class UserProfile(TypedDict):
     font_scale: str
     contrast: str
     hit_target: str
-    overdraft_risk: float
+    overdraft_risk: float | None
     recurring_expenses: float
-    available_balance: float
+    available_balance: float | None
+    owned_balances: dict[str, float]
 
 
 class GraphState(TypedDict, total=False):
@@ -27,6 +24,10 @@ class GraphState(TypedDict, total=False):
 
     user_query: str
     current_user_id: str
+    requested_intent: str
+    action_requested: bool
+    financial_request_intent: str
+    presentation_intent: str
     user_profile: UserProfile
     context_available: bool
     message: str
@@ -35,4 +36,5 @@ class GraphState(TypedDict, total=False):
     tool_calls: list[dict[str, Any]]
     tool_observations: list[dict[str, Any]]
     final_tool_execution: object
+    financial_presentation: object
     tool_loop_count: int

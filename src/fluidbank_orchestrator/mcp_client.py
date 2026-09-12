@@ -136,7 +136,6 @@ MODEL_TOOL_NAMES = frozenset(
         "select_rows",
         "database_overview",
         "visualize_allowed_data",
-        "chat_message",
     }
 )
 
@@ -261,6 +260,22 @@ def _overdraft_risk(available_balance: float, recurring_expenses: float) -> floa
     return max(0.0, min(1.0, shortfall))
 
 
+def _owned_balances(account_rows: list[dict[str, object]]) -> dict[str, float]:
+    """Aggregate owned cash by currency without treating credit as money."""
+    balances: dict[str, float] = {}
+    for row in account_rows:
+        account_type = _string_value(row, "account_type")
+        if account_type == "credit":
+            continue
+        if account_type not in {"checking", "savings"}:
+            raise UserContextError("the MCP user context was invalid")
+        currency = _string_value(row, "currency")
+        if currency not in {"MXN", "USD"}:
+            raise UserContextError("the MCP user context was invalid")
+        balances[currency] = balances.get(currency, 0.0) + _float_value(row, "available_balance")
+    return balances
+
+
 def _string_value(row: Mapping[str, object], key: str) -> str:
     value = row.get(key)
     if not isinstance(value, str):
@@ -314,7 +329,8 @@ async def fetch_user_context(current_user_id: str) -> UserProfile:
     # An account with no stored preferences reads with the accessible defaults
     # rather than losing its real balances to the generic fallback profile.
     prefs = prefs_rows[0] if prefs_rows else _DEFAULT_PREFERENCES
-    available_balance = sum(_float_value(row, "available_balance") for row in account_rows)
+    owned_balances = _owned_balances(account_rows)
+    available_balance = next(iter(owned_balances.values())) if len(owned_balances) == 1 else None
     recurring_expenses = sum(
         _float_value(row, "amount")
         for row in subscription_rows
@@ -329,5 +345,10 @@ async def fetch_user_context(current_user_id: str) -> UserProfile:
         "hit_target": _string_value(prefs, "hit_target") or _DEFAULT_PREFERENCES["hit_target"],
         "available_balance": available_balance,
         "recurring_expenses": recurring_expenses,
-        "overdraft_risk": _overdraft_risk(available_balance, recurring_expenses),
+        "overdraft_risk": (
+            _overdraft_risk(available_balance, recurring_expenses)
+            if available_balance is not None
+            else None
+        ),
+        "owned_balances": owned_balances,
     }

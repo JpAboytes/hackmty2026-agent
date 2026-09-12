@@ -14,12 +14,15 @@ from mcp.types import EmbeddedResource, TextContent, TextResourceContents
 from fluidbank_orchestrator.schemas.a2ui import (
     A2UI_BASIC_CATALOG,
     A2UI_FINANCE_CATALOG,
+    A2UI_FINANCE_V2_CATALOG,
     A2UI_MIME_TYPE,
     A2UIValidationError,
     validate_complete_sequence,
     validate_static_template,
 )
 from fluidbank_orchestrator.services.a2ui_bridge import A2UIBridge
+from fluidbank_orchestrator.services.financial_presentation import build_financial_presentation
+from fluidbank_orchestrator.state import UserProfile
 
 RESOURCE_URI = "a2ui://finance/data-chart"
 SURFACE_ID = "data-chart"
@@ -185,11 +188,11 @@ def test_cross_repository_catalog_id_schema_and_fixture_parity() -> None:
     monorepo = Path(__file__).resolve().parents[2]
     agent_catalog = json.loads(
         (
-            monorepo / "hackmty2026/src/fluidbank_orchestrator/a2ui_catalogs/finance_v1.json"
+            monorepo / "hackmty2026-agent/src/fluidbank_orchestrator/a2ui_catalogs/finance_v1.json"
         ).read_text(encoding="utf-8")
     )
     mcp_catalog = json.loads(
-        (monorepo / "hackmty2026-mcp/src/supabase_mcp/a2ui_support/catalogs/finance_v1.json").read_text(
+        (monorepo / "mcp/src/supabase_mcp/a2ui_support/catalogs/finance_v1.json").read_text(
             encoding="utf-8"
         )
     )
@@ -206,3 +209,92 @@ def test_cross_repository_catalog_id_schema_and_fixture_parity() -> None:
     assert agent_catalog["catalogId"] == A2UI_FINANCE_CATALOG
     assert A2UI_FINANCE_CATALOG in mobile_types
     assert mobile_fixtures == _fixtures()
+
+
+def test_finance_v2_banking_view_accepts_valid_summary_and_rejects_unknown_props() -> None:
+    profile: UserProfile = {
+        "literacy_level": "medium",
+        "font_scale": "lg",
+        "contrast": "high",
+        "hit_target": "large",
+        "overdraft_risk": 0.0,
+        "recurring_expenses": 0.0,
+        "available_balance": 100.0,
+        "owned_balances": {"MXN": 100.0},
+    }
+    observations = [
+        {
+            "name": "select_rows",
+            "arguments": {"table": "accounts"},
+            "is_error": False,
+            "data": {
+                "rows": [
+                    {
+                        "id": "checking",
+                        "account_type": "checking",
+                        "currency": "MXN",
+                        "available_balance": 100,
+                    }
+                ]
+            },
+        }
+    ]
+    bundle = build_financial_presentation("financial-summary", observations, profile).a2ui
+    assert bundle.messages[0]["createSurface"]["catalogId"] == A2UI_FINANCE_V2_CATALOG
+    assert bundle.resource_uri == "a2ui://finance/view"
+    assert bundle.messages[0]["createSurface"]["surfaceId"] == "financial-view"
+    canonical_template = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "mcp/src/supabase_mcp/a2ui_support/templates/financial_view.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert bundle.messages[:2] == canonical_template
+    assert bundle.messages[1]["updateComponents"]["components"] == [
+        {
+            "id": "root",
+            "component": "Column",
+            "children": ["banking_view", "request_financial_view_button"],
+        },
+        {"id": "banking_view", "component": "BankingView", "view": {"path": "/view"}},
+        {
+            "id": "request_financial_view_label",
+            "component": "Text",
+            "text": {"path": "/actionLabel"},
+        },
+        {
+            "id": "request_financial_view_button",
+            "component": "Button",
+            "child": "request_financial_view_label",
+            "variant": "primary",
+            "action": {
+                "event": {
+                    "name": "request_financial_view",
+                    "context": {"intent": {"path": "/requestIntent"}},
+                }
+            },
+        },
+    ]
+    assert bundle.messages[2]["updateDataModel"]["value"]["actionLabel"] == (
+        "Ver gastos del último mes"
+    )
+    validate_complete_sequence(bundle.messages, "financial-view")
+
+    invalid = deepcopy(bundle.messages)
+    invalid[-1]["updateDataModel"]["value"]["view"]["style"] = {"color": "red"}
+    with pytest.raises(A2UIValidationError):
+        validate_complete_sequence(invalid, "financial-view")
+
+
+def test_all_shared_mobile_banking_view_examples_validate() -> None:
+    monorepo = Path(__file__).resolve().parents[2]
+    examples = json.loads(
+        (monorepo / "HackMTY2026_Mobile/docs/a2ui/banking-view.examples.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(examples) == 13
+    for example in examples:
+        messages = example["a2ui"]["messages"]
+        surface_id = messages[0]["createSurface"]["surfaceId"]
+        validate_complete_sequence(messages, surface_id)

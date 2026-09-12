@@ -1,29 +1,32 @@
 # Agent Orchestrator
 
-LangGraph agent for the accessibility-first banking demo. It fetches financial and accessibility context through the read-only FastMCP server, drafts ordinary conversational replies with Gemini, and bridges MCP-produced A2UI v0.9.1 surfaces to Expo. It never invents components or lets the LLM inspect or modify A2UI messages. See `PROJECT_SPEC.MD` for the full architecture and contract.
+LangGraph agent for the accessibility-first banking demo. It verifies Supabase sessions, fetches user-scoped financial data through FastMCP, interprets returned data, and chooses a bounded financial presentation. Trusted Python builders produce strict Finance v2 `BankingView` surfaces; Gemini never emits or edits A2UI JSON. The generic bridge remains available for MCP-produced A2UI v0.9.1 surfaces.
 
 ```text
 Expo
   → POST /api/v1/agent/chat
-  → agent selects an MCP domain tool
-  → MCP result metadata selects an A2UI resource
-  → agent reads/caches the static resource and validates the embedded updateDataModel
-  → Expo receives one self-contained ordered v0.9.1 message sequence
+  → verify Supabase bearer token and derive current_user_id
+  → interpret intent and execute scoped MCP data reads
+  → interpret all retained results and select a known financial semantic intent
+  → trusted builder constructs and validates Finance v2 BankingView
+  → Expo receives one self-contained ordered v0.9.1 sequence
 ```
 
 ## Layout
 
 ```text
-src/fluidbank_orchestrator/
+  src/fluidbank_orchestrator/
   graph.py         LangGraph workflow: runtime tools -> agent -> tools -> agent
   state.py         Graph state (TypedDict)
+  auth.py          Supabase bearer-token verification
   mcp_client.py     Generic tool execution, validated config, Horizon bearer auth
   schemas/
     a2ui.py         Strict official-envelope and supported-catalog models
+    banking_view.py Strict Finance v2 intent/data models
     a2ui_action.py  Strict parser for the temporary action-over-chat transport
   services/
     a2ui_bridge.py  Resource resolution, validation, bounded static-template cache
-  personas.py       Canonical UUIDs and emails for the fixed seeded demo users
+    financial_presentation.py  Deterministic selection and trusted BankingView builder
   api.py            FastAPI entrypoint
 scripts/
   run_local.py      Run the graph once from the CLI, without an HTTP server
@@ -47,13 +50,14 @@ HTTP API:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
+  -H 'Authorization: Bearer <supabase-access-token>' \
   -H 'Content-Type: application/json' \
-  -d '{"query": "Tengo dinero para el fin de semana?", "user_id": "68dc4d66-07b8-5893-95f1-07f06989a552"}'
+  -d '{"query": "¿Cuánto dinero tengo?", "user_id": "<supabase-user-uuid>"}'
 ```
 
-The API accepts only the three configured seeded demo-user UUIDs. It stores the selected UUID as `current_user_id`, namespaces the LangGraph thread as `demo-user:<uuid>`, and injects/overwrites `scope.user_id` immediately before `select_rows` and `visualize_allowed_data` calls. Model-provided ownership filters are discarded; business filters remain and the MCP combines them with the canonical scope using `AND`. The UUID stays in application state and is never inferred from conversation text.
+Configure `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE_ANON_KEY`). The API resolves the bearer token through Supabase Auth and requires the compatibility body `user_id` to equal the authenticated subject. It rejects anonymous or unconfirmed users, namespaces the LangGraph thread as `user:<uuid>`, and injects/overwrites `scope.user_id` immediately before scoped MCP reads. Model-provided ownership filters are discarded. Identity never comes from action context, model arguments, email mappings, or demo constants.
 
-A request for a database overview or available database objects deterministically calls the existing MCP `database_overview` domain tool. Explicit chart, graph, trend, daily-activity, calendar-heatmap, and series-comparison requests enter the graph's tool loop. The agent loads the active deployment's actual tool schemas, confirms `visualize_allowed_data` is available, discovers exact allowlisted object and column names through `list_allowed_tables` and `describe_table`, and only then calls the visualization tool. Area charts are used for ordered trends/comparisons and heatmaps for date-based intensity. No component-selection tool exists.
+A request for database metadata still calls the MCP `database_overview` domain tool. Financial requests enter the normal graph, retain all relevant tool observations, and select their presentation only after data retrieval. Scalar balance questions use `financial-summary`; spending can combine category, trend, and daily-activity views when the same verified data supports them. Users do not need to say “chart” or “visualize,” and charts are not forced into scalar answers.
 
 The selected domain tool chooses the entire A2UI surface through `_meta.ui.resourceUri`. The agent calls FastMCP with `raise_on_error=False` so sanitized error `CallToolResult` objects are preserved instead of becoming generic transport failures. For successful presentations it retains the raw result, reads the static `createSurface` and `updateComponents` resource through MCP, combines it with the embedded dynamic `updateDataModel`, and returns:
 
@@ -74,11 +78,11 @@ The selected domain tool chooses the entire A2UI surface through `_meta.ui.resou
 
 The bodies above are abbreviated; actual messages are complete JSON objects rather than strings. Static templates are cached by MCP server identity plus resource URI, but included in every response. The cache is bounded, stores no dynamic or financial data, returns detached copies, coalesces concurrent reads, and retains only successfully validated templates. Query results, `updateDataModel` messages, chart rows, and graph state are not globally cached.
 
-This is hackathon-MVP application-level filtering, not a production authorization boundary. It does not add RLS, Supabase Auth verification, or JWT verification.
+Supabase Auth verification at the API boundary and MCP scoping are both mandatory. They complement rather than replace database RLS and a least-privilege MCP database role.
 
-Expo's temporary action serialization is parsed as strict JSON and forwarded directly to `a2ui_action` with exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`. It never goes through Gemini. The MCP action registry remains authoritative for allowed action/component pairs, and action results use the same A2UI bridge.
+The request body may contain either `query` or a structured `action` with exactly `name`, `surfaceId`, `sourceComponentId`, `timestamp`, and `context`. The legacy serialized action format remains temporarily supported. Before graph re-entry, every action is sent to MCP's `a2ui_action` allowlist with the trusted authenticated UUID in the separate `trustedScope` field. MCP normalizes `request_financial_view` to an enumerated intent; only a successful normalized result re-enters the same authenticated graph. Actions never go through Gemini, and client context never supplies identity.
 
-Only the official v0.9.1 Basic Catalog and the fixed Finance v1 catalog are accepted. Basic supports Expo's `Text`, `Button`, `Card`, and `Column` subset. Finance adds the strict `Chart` union, which can resolve only to the existing area or heatmap adapters. `database_overview` is an integration proof over allowlisted database objects, not a consumer banking screen. Future financial tools that follow the same MCP metadata/resource/update contract need no component-specific bridge code.
+The official v0.9.1 Basic Catalog, Finance v1, and Finance v2 are accepted. Basic supports `Text`, `Button`, `Card`, and `Column`; Finance v1 adds strict `Chart`; Finance v2 adds strict `BankingView` for the 13 shared intents. Unknown components, actions, styles, IDs, and properties are rejected. `database_overview` remains an integration proof rather than a consumer banking screen.
 
 One-off local run (no HTTP server):
 

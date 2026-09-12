@@ -5,14 +5,15 @@ from __future__ import annotations
 import logging
 import unicodedata
 from copy import deepcopy
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from mcp.types import TextContent
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from .auth import AuthenticationError, verify_supabase_access_token
 from .graph import graph
 from .mcp_client import (
     MCPConfigurationError,
@@ -21,7 +22,15 @@ from .mcp_client import (
     execute_remote_tool,
 )
 from .schemas.a2ui import A2UIBundle
-from .schemas.a2ui_action import A2UIActionPayloadError, parse_legacy_a2ui_action
+from .schemas.a2ui_action import (
+    A2UIActionPayloadError,
+    A2UIActionRequest,
+    parse_legacy_a2ui_action,
+)
+from .services.financial_presentation import (
+    FinancialPresentation,
+    normalize_action_intent,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -43,14 +52,19 @@ def health() -> dict[str, str]:
 class ChatRequest(BaseModel):
     """A chat turn for one signed-in application user.
 
-    The id is the caller's authenticated Supabase user id. Membership is not
-    re-checked here: MCP resolves every scoped query against public.users and
-    fails closed on an id that belongs to nobody, so there is no second
-    allowlist to keep in sync.
+    ``user_id`` is a temporary compatibility field. The endpoint accepts it
+    only when it equals the subject resolved from the Supabase bearer token.
     """
 
-    query: str = Field(min_length=1, max_length=20_000)
+    query: Annotated[str, Field(min_length=1, max_length=20_000)] | None = None
+    action: A2UIActionRequest | None = None
     user_id: UUID
+
+    @model_validator(mode="after")
+    def exactly_one_input(self) -> ChatRequest:
+        if (self.query is None) == (self.action is None):
+            raise ValueError("exactly one of query or action is required")
+        return self
 
 
 class ChatResponse(BaseModel):
@@ -101,10 +115,28 @@ def _unavailable_response() -> ChatResponse:
 
 
 @app.post("/api/v1/agent/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(
+    request: ChatRequest,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> ChatResponse:
     """Route structured actions directly, then domain intents, then ordinary chat."""
     try:
-        action = parse_legacy_a2ui_action(request.query)
+        current_user_id = await verify_supabase_access_token(authorization)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail="Authentication required") from exc
+    if str(request.user_id) != current_user_id:
+        raise HTTPException(status_code=403, detail="Authenticated user does not match user_id")
+
+    action: dict[str, Any] | None = None
+    query = request.query
+    if request.action is not None:
+        try:
+            action = request.action.as_payload()
+        except A2UIActionPayloadError:
+            return ChatResponse(message="La acción de interfaz no es válida.", data={}, a2ui=None)
+    try:
+        if query is not None:
+            action = parse_legacy_a2ui_action(query)
     except A2UIActionPayloadError:
         return ChatResponse(
             message="La acción de interfaz no es válida.",
@@ -113,12 +145,49 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
     if action is not None:
+        scoped_action = {
+            **action,
+            "trustedScope": {"user_id": current_user_id},
+        }
         try:
-            return _response_from_tool(await execute_remote_tool("a2ui_action", action))
+            action_execution = await execute_remote_tool("a2ui_action", scoped_action)
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()
+        if action["name"] == "request_financial_view":
+            structured = action_execution.result.structured_content
+            request_data = structured.get("request") if isinstance(structured, dict) else None
+            trusted_scope = (
+                structured.get("trustedScope") if isinstance(structured, dict) else None
+            )
+            intent = (
+                normalize_action_intent(request_data.get("intent"))
+                if isinstance(request_data, dict)
+                else None
+            )
+            if (
+                not isinstance(structured, dict)
+                or structured.get("ok") is not True
+                or not isinstance(trusted_scope, dict)
+                or trusted_scope.get("user_id") != current_user_id
+                or intent is None
+            ):
+                return ChatResponse(
+                    message="La acción de interfaz no es válida.", data={}, a2ui=None
+                )
+            result = await graph.ainvoke(
+                {
+                    "user_query": f"request_financial_view:{intent}",
+                    "requested_intent": intent,
+                    "action_requested": True,
+                    "current_user_id": current_user_id,
+                },
+                config={"configurable": {"thread_id": f"user:{current_user_id}"}},
+            )
+            return _response_from_graph(result)
+        return _response_from_tool(action_execution)
 
-    if _requests_database_overview(request.query):
+    assert query is not None
+    if _requests_database_overview(query):
         try:
             return _response_from_tool(
                 await execute_remote_tool("database_overview", {"limit": 50})
@@ -126,15 +195,25 @@ async def chat(request: ChatRequest) -> ChatResponse:
         except (MCPConfigurationError, UserContextError):
             return _unavailable_response()
 
-    current_user_id = str(request.user_id)
     result = await graph.ainvoke(
-        {"user_query": request.query, "current_user_id": current_user_id},
-        config={"configurable": {"thread_id": f"demo-user:{current_user_id}"}},
+        {"user_query": query, "current_user_id": current_user_id},
+        config={"configurable": {"thread_id": f"user:{current_user_id}"}},
     )
+    return _response_from_graph(result)
+
+
+def _response_from_graph(result: dict[str, Any]) -> ChatResponse:
+    presentation = result.get("financial_presentation")
+    if isinstance(presentation, FinancialPresentation):
+        return ChatResponse(
+            message=presentation.message,
+            data=deepcopy(presentation.data),
+            a2ui=presentation.a2ui,
+        )
     final_execution = result.get("final_tool_execution")
     if isinstance(final_execution, MCPToolExecution):
         return _response_from_tool(final_execution)
-    data: dict[str, Any] = dict(result["user_profile"])
+    data: dict[str, Any] = dict(result.get("user_profile", {}))
     if "months" in result:
         data["months"] = result["months"]
     return ChatResponse(message=result["message"], data=data, a2ui=None)

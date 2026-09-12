@@ -27,7 +27,9 @@ class A2UIActionPayloadError(ValueError):
     """The query claimed to be an A2UI action but failed strict validation."""
 
 
-class _A2UIAction(BaseModel):
+class A2UIActionRequest(BaseModel):
+    """The exact action envelope accepted by the structured API branch."""
+
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True, populate_by_name=True)
 
     name: Identifier
@@ -48,6 +50,20 @@ class _A2UIAction(BaseModel):
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError("timestamp must include an offset")
         return value
+
+    def as_payload(self) -> dict[str, Any]:
+        payload = self.model_dump(mode="json", by_alias=True)
+        _validate_context_tree(payload["context"])
+        if (
+            len(
+                json.dumps(payload["context"], ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+            > ACTION_CONTEXT_MAX_BYTES
+        ):
+            raise A2UIActionPayloadError("A2UI action context is too large")
+        return payload
 
 
 def _reject_json_constant(_: str) -> None:
@@ -97,7 +113,7 @@ def parse_legacy_a2ui_action(query: str) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         raise A2UIActionPayloadError("A2UI action must be a JSON object")
     try:
-        action = _A2UIAction.model_validate(raw, strict=True)
+        action = A2UIActionRequest.model_validate(raw, strict=True)
     except Exception as exc:
         raise A2UIActionPayloadError("Invalid A2UI action fields") from exc
 
