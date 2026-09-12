@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fluidbank.app/a2ui/catalogs/finance/v1",
+  "title": "Fluidbank Finance Catalog v1",
+  "description": "A bounded A2UI v0.9.1 catalog for trusted mobile finance surfaces.",
+  "catalogId": "https://fluidbank.app/a2ui/catalogs/finance/v1",
+  "components": {
+    "Text": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"},
+        {"$ref": "#/$defs/CatalogComponentCommon"},
+        {
+          "type": "object",
+          "properties": {
+            "component": {"const": "Text"},
+            "text": {"$ref": "#/$defs/SafeDynamicString"},
+            "variant": {
+              "type": "string",
+              "enum": ["h1", "h2", "h3", "h4", "h5", "caption", "body"]
+            }
+          },
+          "required": ["component", "text"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "Button": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"},
+        {"$ref": "#/$defs/CatalogComponentCommon"},
+        {
+          "type": "object",
+          "properties": {
+            "component": {"const": "Button"},
+            "child": {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentId"},
+            "variant": {"type": "string", "enum": ["default", "primary", "borderless"]},
+            "action": {"$ref": "#/$defs/ServerAction"}
+          },
+          "required": ["component", "child", "action"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "Card": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"},
+        {"$ref": "#/$defs/CatalogComponentCommon"},
+        {
+          "type": "object",
+          "properties": {
+            "component": {"const": "Card"},
+            "child": {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentId"}
+          },
+          "required": ["component", "child"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "Column": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"},
+        {"$ref": "#/$defs/CatalogComponentCommon"},
+        {
+          "type": "object",
+          "properties": {
+            "component": {"const": "Column"},
+            "children": {
+              "type": "array",
+              "items": {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentId"},
+              "maxItems": 500
+            },
+            "justify": {
+              "type": "string",
+              "enum": ["start", "center", "end", "spaceBetween", "spaceAround", "spaceEvenly", "stretch"]
+            },
+            "align": {"type": "string", "enum": ["start", "center", "end", "stretch"]}
+          },
+          "required": ["component", "children"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "Chart": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"},
+        {"$ref": "#/$defs/CatalogComponentCommon"},
+        {
+          "type": "object",
+          "properties": {
+            "component": {"const": "Chart"},
+            "chart": {
+              "oneOf": [
+                {"$ref": "#/$defs/DataBinding"},
+                {"$ref": "#/$defs/AreaChart"},
+                {"$ref": "#/$defs/HeatmapChart"}
+              ]
+            }
+          },
+          "required": ["component", "chart"]
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  },
+  "functions": {},
+  "$defs": {
+    "CatalogComponentCommon": {
+      "type": "object",
+      "properties": {
+        "weight": {"type": "number", "minimum": 0, "maximum": 100}
+      }
+    },
+    "theme": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "DataBinding": {
+      "type": "object",
+      "properties": {"path": {"type": "string", "maxLength": 512}},
+      "required": ["path"],
+      "additionalProperties": false
+    },
+    "SafeDynamicString": {
+      "oneOf": [
+        {"type": "string", "maxLength": 4000},
+        {"$ref": "#/$defs/DataBinding"}
+      ]
+    },
+    "SafeDynamicValue": {
+      "oneOf": [
+        {"type": "string", "maxLength": 4000},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "array", "maxItems": 100},
+        {"$ref": "#/$defs/DataBinding"}
+      ]
+    },
+    "ServerAction": {
+      "type": "object",
+      "properties": {
+        "event": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 128},
+            "context": {
+              "type": "object",
+              "additionalProperties": {"$ref": "#/$defs/SafeDynamicValue"}
+            }
+          },
+          "required": ["name"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event"],
+      "additionalProperties": false
+    },
+    "Series": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 80},
+        "tone": {"type": "string", "enum": ["blue", "violet", "green", "orange"]}
+      },
+      "required": ["id", "label"],
+      "additionalProperties": false
+    },
+    "AreaPoint": {
+      "type": "object",
+      "properties": {
+        "label": {"type": "string", "minLength": 1, "maxLength": 80},
+        "values": {
+          "type": "array",
+          "items": {"type": "number", "minimum": -1000000000000000, "maximum": 1000000000000000},
+          "minItems": 1,
+          "maxItems": 4
+        }
+      },
+      "required": ["label", "values"],
+      "additionalProperties": false
+    },
+    "AreaProps": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "maxLength": 100},
+        "subtitle": {"type": "string", "maxLength": 200},
+        "data": {"type": "array", "items": {"$ref": "#/$defs/AreaPoint"}, "maxItems": 240},
+        "series": {"type": "array", "items": {"$ref": "#/$defs/Series"}, "minItems": 1, "maxItems": 4},
+        "height": {"type": "number", "minimum": 180, "maximum": 500},
+        "currency": {"type": "string", "enum": ["MXN", "USD"]},
+        "status": {"type": "string", "enum": ["ready", "loading"]}
+      },
+      "required": ["data", "series"],
+      "additionalProperties": false
+    },
+    "HeatmapCell": {
+      "type": "object",
+      "properties": {
+        "date": {"type": "string", "format": "date", "minimum": "1900-01-01", "maximum": "2100-12-31"},
+        "value": {"type": "number", "minimum": 0, "maximum": 1000000000000000}
+      },
+      "required": ["date", "value"],
+      "additionalProperties": false
+    },
+    "HeatmapProps": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "maxLength": 100},
+        "subtitle": {"type": "string", "maxLength": 200},
+        "data": {"type": "array", "items": {"$ref": "#/$defs/HeatmapCell"}, "maxItems": 500},
+        "initialDate": {"type": "string", "format": "date"},
+        "initialView": {"type": "string", "enum": ["year", "month", "week"]},
+        "tone": {"type": "string", "enum": ["green", "blue", "violet", "orange"]},
+        "currency": {"type": "string", "enum": ["MXN", "USD"]},
+        "status": {"type": "string", "enum": ["ready", "loading"]}
+      },
+      "required": ["data"],
+      "additionalProperties": false
+    },
+    "AreaChart": {
+      "type": "object",
+      "properties": {
+        "kind": {"const": "area"},
+        "accessibleSummary": {"type": "string", "maxLength": 500},
+        "props": {"$ref": "#/$defs/AreaProps"}
+      },
+      "required": ["kind", "props"],
+      "additionalProperties": false
+    },
+    "HeatmapChart": {
+      "type": "object",
+      "properties": {
+        "kind": {"const": "heatmap"},
+        "accessibleSummary": {"type": "string", "maxLength": 500},
+        "props": {"$ref": "#/$defs/HeatmapProps"}
+      },
+      "required": ["kind", "props"],
+      "additionalProperties": false
+    },
+    "anyComponent": {
+      "oneOf": [
+        {"$ref": "#/components/Text"},
+        {"$ref": "#/components/Button"},
+        {"$ref": "#/components/Card"},
+        {"$ref": "#/components/Column"},
+        {"$ref": "#/components/Chart"}
+      ],
+      "discriminator": {"propertyName": "component"}
+    },
+    "anyFunction": {"not": {}}
+  }
+}

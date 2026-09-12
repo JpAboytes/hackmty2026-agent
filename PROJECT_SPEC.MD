@@ -209,7 +209,11 @@ The generic bridge uses public FastMCP result fields. It reads runtime `CallTool
 
 Validated static templates are cached by MCP server identity plus resource URI in a bounded process-local LRU cache. The cache never stores `updateDataModel` data, returns detached copies, coalesces concurrent reads for the same uncached key, and does not retain failed reads. Static messages are included on every response because Mobile treats each response as a self-contained replacement.
 
-The supported catalog is exactly the v0.9.1 Basic Catalog. The currently implemented Mobile subset is `Text`, `Button`, `Card`, and `Column`. Charts remain local-only; network-delivered charts require a future, explicitly versioned custom catalog shared by MCP, agent, and Mobile. Future financial domain tools that publish the same metadata/resource/embedded-update contract require no component-specific changes to this bridge.
+The bridge allowlists exactly the v0.9.1 Basic Catalog and `https://fluidbank.app/a2ui/catalogs/finance/v1`. Basic remains `Text`, `Button`, `Card`, and `Column`; Finance adds the strict `Chart` component. Each template is validated with the catalog declared by `createSurface`, so `Chart` under Basic, unknown Finance components, inline catalogs, and all other catalog IDs fail before forwarding.
+
+The agent carries a checked-in copy of Finance v1 because the bridge validates offline and must not expose MCP credentials or ask Expo to fetch resources. A parity test compares that copy with the MCP source catalog, checks the Expo catalog ID, and shares representative accepted/rejected chart fixtures. The generic bridge still branches on `_meta.ui`, not tool names: it reads and caches `a2ui://finance/data-chart`, validates the static messages, appends only the dynamic `updateDataModel`, and returns JSON objects in static-before-dynamic order. Cache entries never contain banking rows.
+
+The one wire component binds `{kind: "area", accessibleSummary?, props}` or `{kind: "heatmap", accessibleSummary?, props}`. The agent enforces stable unique area series IDs, 240 area points, 500 heatmap cells, finite bounded values, actual calendar dates, unique labels/dates, and forbidden unknown properties. Future catalog components require a versioned SDK-valid schema, matching agent/client validators, a trusted Expo adapter, and cross-repository fixtures; they do not require tool-name special cases in this bridge.
 
 ### 8.5 Actions
 

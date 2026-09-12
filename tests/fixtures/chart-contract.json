@@ -1,0 +1,62 @@
+{
+  "accepted": [
+    {
+      "kind": "area",
+      "accessibleSummary": "Two months of income.",
+      "props": {
+        "series": [{"id": "income", "label": "Income", "tone": "blue"}],
+        "data": [
+          {"label": "Jan", "values": [10]},
+          {"label": "Feb", "values": [-2.5]}
+        ]
+      }
+    },
+    {
+      "kind": "heatmap",
+      "accessibleSummary": "Daily activity.",
+      "props": {
+        "data": [{"date": "2026-09-12", "value": 42.5}]
+      }
+    },
+    {
+      "kind": "area",
+      "props": {
+        "series": [{"id": "balance", "label": "Balance"}],
+        "data": []
+      }
+    },
+    {
+      "kind": "heatmap",
+      "props": {"data": []}
+    }
+  ],
+  "rejected": [
+    {
+      "kind": "pie",
+      "props": {"data": []}
+    },
+    {
+      "kind": "area",
+      "style": {"color": "red"},
+      "props": {
+        "series": [{"id": "income", "label": "Income"}],
+        "data": []
+      }
+    },
+    {
+      "kind": "area",
+      "onPointSelect": "callback",
+      "props": {
+        "series": [{"id": "income", "label": "Income"}],
+        "data": []
+      }
+    },
+    {
+      "kind": "heatmap",
+      "props": {
+        "data": [{"date": "2026-02-30", "value": 1}]
+      }
+    }
+  ]
+}
+
