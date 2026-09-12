@@ -552,3 +552,33 @@ def test_gemini_declarations_keep_a_union_that_is_only_arrays() -> None:
     schema = {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
 
     assert graph_module._gemini_safe_schema(schema) == schema
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_user_never_hears_placeholder_figures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback profile's numbers are nobody's money and must not be reported."""
+
+    async def failing_context(_user_id: str) -> UserProfile:
+        raise graph_module.UserContextError("unknown user")
+
+    async def load_tools() -> list[MCPToolDefinition]:
+        return _tools()
+
+    calls: list[str] = []
+
+    async def execute(name: str, arguments: Mapping[str, Any] | None) -> MCPToolExecution:
+        calls.append(name)
+        return _execution(name, dict(arguments or {}))
+
+    monkeypatch.setattr(graph_module, "fetch_user_context", failing_context)
+    model = FakeModel("Tu saldo disponible es de $1,200.00.")
+    result = await build_graph(
+        model=model, tool_loader=load_tools, tool_executor=execute
+    ).ainvoke({"user_query": "cual es mi saldo", "current_user_id": USER_A})
+
+    # The model is never consulted, so it cannot narrate the placeholder balance.
+    assert model.bound_tool_names == []
+    assert calls == ["chat_message"]
+    assert "1,200" not in str(result.get("message", ""))

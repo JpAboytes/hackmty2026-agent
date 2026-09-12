@@ -490,10 +490,25 @@ def build_graph(
         try:
             profile = await fetch_user_context(state["current_user_id"])
         except (MCPConfigurationError, UserContextError):
-            profile = _FALLBACK_PROFILE.copy()
-        return {"user_profile": profile}
+            # The fallback profile carries placeholder figures. They keep the
+            # graph runnable, but they are nobody's money, so the turn is
+            # marked unresolved rather than letting them be reported as real.
+            return {"user_profile": _FALLBACK_PROFILE.copy(), "context_available": False}
+        return {"user_profile": profile, "context_available": True}
 
     async def agent_node(state: GraphState) -> GraphState:
+        if state.get("context_available") is False:
+            if _observations(state, "chat_message"):
+                return {"tool_calls": []}
+            return {
+                "message": "",
+                "tool_calls": [
+                    _chat_message_call(
+                        "No pude identificar tu cuenta, así que no puedo mostrarte "
+                        "cifras. Vuelve a iniciar sesión e inténtalo de nuevo."
+                    )
+                ],
+            }
         observations = state.get("tool_observations", [])
         visualization_kind = _visualization_kind(state["user_query"])
         latest_visualization = _observations(state, "visualize_allowed_data")

@@ -28,6 +28,7 @@ class GraphState(TypedDict, total=False):
     user_query: str
     current_user_id: str
     user_profile: UserProfile
+    context_available: bool
     message: str
     months: int
     available_tools: list[dict[str, Any]]
