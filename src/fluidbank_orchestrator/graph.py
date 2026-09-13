@@ -335,14 +335,27 @@ def _model_tool_schema(tool: MCPToolDefinition) -> dict[str, Any]:
 
 
 def _tool_definitions(state: GraphState) -> list[MCPToolDefinition]:
+    """Every tool the endpoint advertises, model-facing or not."""
     definitions: list[MCPToolDefinition] = []
     for value in state.get("available_tools", []):
         name = value.get("name")
         description = value.get("description")
         schema = value.get("input_schema")
         if isinstance(name, str) and isinstance(description, str) and isinstance(schema, dict):
-            definitions.append(MCPToolDefinition(name, description, schema))
+            definitions.append(
+                MCPToolDefinition(name, description, schema, value.get("model_visible", True))
+            )
     return definitions
+
+
+def _model_tool_definitions(state: GraphState) -> list[MCPToolDefinition]:
+    """Only what the server declares a model may see.
+
+    Some tools are advertised purely so the orchestrator can address them by
+    name; the server marks those app-only and the host - this graph - is what
+    keeps them out of the prompt.
+    """
+    return [tool for tool in _tool_definitions(state) if tool.model_visible]
 
 
 def _text_from_execution(execution: MCPToolExecution) -> str:
@@ -638,7 +651,7 @@ def build_graph(
         candidate = await resolved_model.generate(
             query=state["user_query"],
             profile=state["user_profile"],
-            tools=_tool_definitions(state),
+            tools=_model_tool_definitions(state),
             observations=observations,
         )
         if candidate.tool_calls:
@@ -676,7 +689,9 @@ def build_graph(
         # Two sources of calls, two reasons they are allowed: the model may only
         # use what the server advertised (the discovery pair), and the
         # deterministic classifier may only use the scoped financial set.
-        permitted = {tool.name for tool in _tool_definitions(state)} | FINANCIAL_DOMAIN_TOOL_NAMES
+        permitted = {
+            tool.name for tool in _model_tool_definitions(state)
+        } | FINANCIAL_DOMAIN_TOOL_NAMES
         observations = list(state.get("tool_observations", []))
         update: GraphState = {
             "tool_calls": [],

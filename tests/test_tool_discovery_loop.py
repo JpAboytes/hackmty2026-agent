@@ -11,6 +11,7 @@ from fastmcp.client.client import CallToolResult
 from mcp.types import TextContent
 
 import fluidbank_orchestrator.graph as graph_module
+from fluidbank_orchestrator import mcp_client
 from fluidbank_orchestrator.graph import ModelTurn, ToolAwareModel, build_graph
 from fluidbank_orchestrator.mcp_client import (
     CALL_TOOL_NAME,
@@ -308,3 +309,83 @@ def test_an_envelope_nested_beyond_reason_is_not_followed_forever() -> None:
     target, _ = resolve_tool_call(CALL_TOOL_NAME, envelope)
 
     assert target == CALL_TOOL_NAME
+
+
+# --- reachability on a proxied deployment -------------------------------------
+# A hosted MCP resolves `tools/call` against the advertised catalog, so a tool
+# hidden by discovery answers `Unknown tool` by name. This is what broke user
+# context in production: `select_rows` was hidden, addressed by name, and lost.
+
+
+async def _advertise(names: dict[str, bool]) -> list[MCPToolDefinition]:
+    return [
+        MCPToolDefinition(name, f"ES / EN {name}", {"type": "object"}, model_visible=visible)
+        for name, visible in names.items()
+    ]
+
+
+async def test_an_unadvertised_tool_is_addressed_through_the_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def listed() -> list[MCPToolDefinition]:
+        return await _advertise({SEARCH_TOOL_NAME: True, CALL_TOOL_NAME: True})
+
+    monkeypatch.setattr(mcp_client, "list_remote_tools", listed)
+
+    name, arguments = await mcp_client._wire_call("get_debt_overview", {"request": {}})
+
+    assert name == CALL_TOOL_NAME
+    assert arguments == {"name": "get_debt_overview", "arguments": {"request": {}}}
+
+
+async def test_an_advertised_tool_is_still_addressed_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinned orchestrator tools must not be wrapped: the proxy refuses them."""
+
+    async def listed() -> list[MCPToolDefinition]:
+        return await _advertise(
+            {SEARCH_TOOL_NAME: True, CALL_TOOL_NAME: True, "select_rows": False}
+        )
+
+    monkeypatch.setattr(mcp_client, "list_remote_tools", listed)
+
+    name, arguments = await mcp_client._wire_call("select_rows", {"table": "users"})
+
+    assert name == "select_rows"
+    assert arguments == {"table": "users"}
+
+
+async def test_an_unreadable_catalog_keeps_the_direct_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unavailable() -> list[MCPToolDefinition]:
+        raise mcp_client.UserContextError("down")
+
+    monkeypatch.setattr(mcp_client, "list_remote_tools", unavailable)
+
+    assert await mcp_client._wire_call("get_accounts", {"request": {}}) == (
+        "get_accounts",
+        {"request": {}},
+    )
+
+
+def test_a_pinned_app_only_tool_never_reaches_the_prompt() -> None:
+    """Pinning widens what the host can address, not what the model can see."""
+    state = {
+        "available_tools": [
+            tool.as_dict()
+            for tool in [
+                MCPToolDefinition(SEARCH_TOOL_NAME, "search", {}, model_visible=True),
+                MCPToolDefinition(CALL_TOOL_NAME, "call", {}, model_visible=True),
+                MCPToolDefinition("select_rows", "rows", {}, model_visible=False),
+                MCPToolDefinition("a2ui_action", "action", {}, model_visible=False),
+            ]
+        ]
+    }
+
+    advertised = {tool.name for tool in graph_module._tool_definitions(state)}
+    offered = {tool.name for tool in graph_module._model_tool_definitions(state)}
+
+    assert advertised == {SEARCH_TOOL_NAME, CALL_TOOL_NAME, "select_rows", "a2ui_action"}
+    assert offered == {SEARCH_TOOL_NAME, CALL_TOOL_NAME}

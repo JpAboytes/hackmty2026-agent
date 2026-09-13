@@ -75,12 +75,17 @@ class MCPToolDefinition:
     name: str
     description: str
     input_schema: dict[str, Any]
+    #: Whether the server declares this tool visible to a model. The MCP Apps
+    #: spec puts that filtering on the host, and for the model-facing tool set
+    #: this orchestrator is the host.
+    model_visible: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "input_schema": dict(self.input_schema),
+            "model_visible": self.model_visible,
         }
 
 
@@ -435,9 +440,21 @@ def _detached(tools: Sequence[MCPToolDefinition]) -> list[MCPToolDefinition]:
             name=tool.name,
             description=tool.description,
             input_schema=deepcopy(tool.input_schema),
+            model_visible=tool.model_visible,
         )
         for tool in tools
     ]
+
+
+def _declared_model_visible(meta: Mapping[str, Any] | None) -> bool:
+    """Read `_meta.ui.visibility` exactly as the MCP Apps spec defines it."""
+    ui = (meta or {}).get("ui")
+    if not isinstance(ui, Mapping):
+        return True
+    visibility = ui.get("visibility")
+    if not isinstance(visibility, list):
+        return True
+    return "model" in visibility
 
 
 def _fresh_tools(identity: str, ttl: float) -> list[MCPToolDefinition] | None:
@@ -503,11 +520,13 @@ async def _load_remote_tools() -> list[MCPToolDefinition]:
                 name=tool.name,
                 description=tool.description or "",
                 input_schema=schema,
+                model_visible=_declared_model_visible(tool.meta),
             )
         )
     logger.info(
-        "Loaded MCP model tools count=%d discovery=%s",
+        "Loaded MCP tools advertised=%d model_visible=%d discovery=%s",
         len(definitions),
+        sum(tool.model_visible for tool in definitions),
         DISCOVERY_TOOL_NAMES <= {tool.name for tool in definitions},
     )
     return definitions
@@ -550,6 +569,34 @@ async def call_mcp_tool(
     return MCPToolExecution(result=result, a2ui=a2ui)
 
 
+async def _wire_call(
+    name: str, arguments: Mapping[str, Any] | None
+) -> tuple[str, Mapping[str, Any] | None]:
+    """Address a tool the way the active endpoint can actually reach it.
+
+    A hosted deployment fronts the server with a proxy that resolves
+    `tools/call` against the advertised catalog, so a tool hidden by
+    progressive discovery answers `Unknown tool` when addressed by name and has
+    to be reached through the `call_tool` proxy instead. A tool the server does
+    advertise is called directly, which is how the pinned orchestrator-driven
+    tools keep working.
+
+    The decision follows the live catalog rather than a hardcoded list, so
+    pinning or unpinning a tool server-side needs no change here. If the
+    catalog cannot be read, the direct call is kept - the pre-discovery
+    behaviour - rather than inventing an envelope.
+    """
+    if name in DISCOVERY_TOOL_NAMES:
+        return name, arguments
+    try:
+        advertised = {tool.name for tool in await list_remote_tools()}
+    except (MCPConfigurationError, UserContextError):
+        return name, arguments
+    if name in advertised:
+        return name, arguments
+    return CALL_TOOL_NAME, {"name": name, "arguments": dict(arguments or {})}
+
+
 async def execute_remote_tool(
     name: str,
     arguments: Mapping[str, Any] | None = None,
@@ -561,13 +608,14 @@ async def execute_remote_tool(
     effective_name, _ = resolve_tool_call(name, arguments)
     if effective_name in SCOPED_TOOL_NAMES:
         require_current_user_id(current_user_id)
+    wire_name, wire_arguments = await _wire_call(name, arguments)
     try:
         async with _session(name) as (client, identity):
             return await call_mcp_tool(
                 client,
                 identity,
-                name,
-                arguments,
+                wire_name,
+                wire_arguments,
                 current_user_id=current_user_id,
                 bridge=bridge,
             )

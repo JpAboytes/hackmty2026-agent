@@ -68,6 +68,15 @@ through them, so Gemini is bound to two schemas per turn instead of seventeen.
 agent -> search_tools("deudas pendientes") -> agent -> call_tool(...) -> agent
 ```
 
+A hosted MCP resolves `tools/call` against its advertised catalog, so a tool
+hidden by discovery is not callable by name there — it has to be addressed
+through `call_tool`. `_wire_call` makes that decision from the live catalog, so
+pinning or unpinning a tool server-side needs no change here. The tools the
+server does advertise purely so a host can address them (`select_rows`,
+`a2ui_action`, `a2ui_form`) are called directly and are kept out of the prompt
+by their own `_meta.ui.visibility` declaration, which this orchestrator honours
+as the host the MCP Apps spec expects.
+
 The orchestrator takes the model-facing tool set straight from `tools/list` and
 applies no local allowlist; re-deriving the catalog here would put every schema
 back into the prompt and defeat the server's discovery. That is deliberately
