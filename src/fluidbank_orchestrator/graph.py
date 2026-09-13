@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from .mcp_client import (
     FINANCIAL_DOMAIN_TOOL_NAMES,
+    SEARCH_TOOL_NAME,
     MCPConfigurationError,
     MCPToolDefinition,
     MCPToolExecution,
@@ -29,6 +30,7 @@ from .mcp_client import (
     fetch_user_context,
     list_remote_tools,
     require_current_user_id,
+    resolve_tool_call,
 )
 from .observability import event, preview, stage
 from .schemas.banking_view import FinancialIntent
@@ -84,24 +86,14 @@ _MODEL_PROMPT = """Eres un asistente bancario accesible y conciso. Responde en e
 Usa exclusivamente los datos proporcionados y las herramientas MCP disponibles.
 Después de consultar datos financieros, elige como máximo una semántica de presentación
 de la lista permitida. Las tools financieras ya devuelven contratos semánticos y chart-ready;
-no consultes ni interpretes el esquema PostgreSQL y no uses select_rows para finanzas.
-Selección rápida / Quick selection:
-Resumen general / General overview -> get_financial_overview
-Cuentas o tarjetas / Accounts or cards -> get_accounts
-Movimientos específicos / Specific transactions -> get_transactions
-Patrones, categorías o comercios / Patterns, categories, merchants -> analyze_spending
-Ingresos contra gastos / Income versus expenses -> get_cash_flow
-Presupuestos / Budgets -> get_budget_progress
-Metas de ahorro / Savings goals -> get_savings_progress
-Deudas y crédito / Debts and credit cards -> get_debt_overview
-Próximos pagos / Upcoming payments -> get_upcoming_payments
-Alertas / Alerts -> get_financial_alerts
-Estados de cuenta / Bank statements -> get_bank_statements
-Actividad de pagos / Payment activity -> get_payment_activity
-Beneficiarios / Beneficiaries -> get_beneficiaries
-Aclaraciones / Disputes -> get_transaction_disputes
-Escenarios de deuda / Debt scenarios -> compare_debt_scenarios
-Usa la menor cantidad de tools. No llames get_transactions antes de analyze_spending.
+no consultes ni interpretes el esquema PostgreSQL.
+Descubrimiento de herramientas / Tool discovery:
+1. Llama search_tools con una consulta en lenguaje natural que describa la intención
+   financiera del usuario, por ejemplo "deudas pendientes" o "gasto por categoría".
+2. Lee las definiciones devueltas y llama call_tool con {{"name": <herramienta>,
+   "arguments": {{...}}}} usando el esquema que search_tools acaba de darte.
+Las definiciones que devuelve search_tools son completas: no vuelvas a buscar la misma
+intención si ya obtuviste una herramienta adecuada. Usa la menor cantidad de tools.
 No generes ni copies JSON A2UI: el puente de la aplicación conserva el resultado MCP.
 El ámbito de usuario lo aplica la aplicación: nunca elijas ni cambies scope, user_id,
 customer_id, account_id, owner_id o persona_id.
@@ -337,18 +329,33 @@ def _model_tool_schema(tool: MCPToolDefinition) -> dict[str, Any]:
     schema = _gemini_safe_schema(deepcopy(tool.input_schema))
     if tool.name in FINANCIAL_DOMAIN_TOOL_NAMES | {"select_rows", "visualize_allowed_data"}:
         schema = _strip_model_identity_fields(schema)
+    # `call_tool.arguments` is declared `object | null`; gemini-3.6-flash
+    # populates that union correctly, so it is passed through unchanged.
     return cast("dict[str, Any]", schema)
 
 
 def _tool_definitions(state: GraphState) -> list[MCPToolDefinition]:
+    """Every tool the endpoint advertises, model-facing or not."""
     definitions: list[MCPToolDefinition] = []
     for value in state.get("available_tools", []):
         name = value.get("name")
         description = value.get("description")
         schema = value.get("input_schema")
         if isinstance(name, str) and isinstance(description, str) and isinstance(schema, dict):
-            definitions.append(MCPToolDefinition(name, description, schema))
+            definitions.append(
+                MCPToolDefinition(name, description, schema, value.get("model_visible", True))
+            )
     return definitions
+
+
+def _model_tool_definitions(state: GraphState) -> list[MCPToolDefinition]:
+    """Only what the server declares a model may see.
+
+    Some tools are advertised purely so the orchestrator can address them by
+    name; the server marks those app-only and the host - this graph - is what
+    keeps them out of the prompt.
+    """
+    return [tool for tool in _tool_definitions(state) if tool.model_visible]
 
 
 def _text_from_execution(execution: MCPToolExecution) -> str:
@@ -400,6 +407,49 @@ def _normalized_query(value: str) -> str:
     )
 
 
+def _already_searched(state: GraphState, arguments: Mapping[str, Any]) -> bool:
+    """Whether this exact discovery query already produced tool definitions.
+
+    Re-searching the same intent burns a model turn and returns the same
+    definitions. A search that found nothing is allowed to run again with a
+    different phrasing, which is the only case worth retrying.
+    """
+    query = arguments.get("query")
+    if not isinstance(query, str):
+        return False
+    wanted = _normalized_query(query)
+    return any(
+        observation.get("name") == SEARCH_TOOL_NAME
+        and observation.get("is_error") is not True
+        and observation.get("data", {}).get("result")
+        and isinstance(observation.get("arguments"), Mapping)
+        and _normalized_query(str(observation["arguments"].get("query", ""))) == wanted
+        for observation in state.get("tool_observations", [])
+    )
+
+
+def _discovered_tool_schemas(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove trusted identity fields from schemas handed back by search.
+
+    The server's schemas legitimately declare `scope`, because the orchestrator
+    fills it in. Showing it to the model would invite a fabricated user id that
+    `enforce_trusted_user_scope` then has to overwrite; better that the model
+    never sees the field at all.
+    """
+    result = data.get("result")
+    if not isinstance(result, list):
+        return data
+    return {
+        **data,
+        "result": [
+            {**entry, "inputSchema": _strip_model_identity_fields(entry["inputSchema"])}
+            if isinstance(entry, dict) and isinstance(entry.get("inputSchema"), dict)
+            else entry
+            for entry in result
+        ],
+    }
+
+
 def _has_tool_observation(state: GraphState, tool_name: str) -> bool:
     return any(
         observation.get("name") == tool_name for observation in state.get("tool_observations", [])
@@ -408,7 +458,11 @@ def _has_tool_observation(state: GraphState, tool_name: str) -> bool:
 
 def _financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTurn:
     """Plan the smallest bilingual financial-domain read for the request."""
-    available = {tool.name for tool in _tool_definitions(state)}
+    # This classifier knows which capability an intent needs, so it skips
+    # discovery entirely; what it must still check is that MCP answered at all.
+    # The capability set is the scoped-execution boundary, never the (now tiny)
+    # set of schemas the model was handed.
+    available = FINANCIAL_DOMAIN_TOOL_NAMES if _tool_definitions(state) else frozenset()
     text = _normalized_query(state["user_query"])
     tool_by_intent = {
         "financial-summary": "get_financial_overview",
@@ -597,7 +651,7 @@ def build_graph(
         candidate = await resolved_model.generate(
             query=state["user_query"],
             profile=state["user_profile"],
-            tools=_tool_definitions(state),
+            tools=_model_tool_definitions(state),
             observations=observations,
         )
         if candidate.tool_calls:
@@ -632,7 +686,12 @@ def build_graph(
             return await _run_tools(state, pending)
 
     async def _run_tools(state: GraphState, pending: list[dict[str, Any]]) -> GraphState:
-        available = {tool.name for tool in _tool_definitions(state)}
+        # Two sources of calls, two reasons they are allowed: the model may only
+        # use what the server advertised (the discovery pair), and the
+        # deterministic classifier may only use the scoped financial set.
+        permitted = {
+            tool.name for tool in _model_tool_definitions(state)
+        } | FINANCIAL_DOMAIN_TOOL_NAMES
         observations = list(state.get("tool_observations", []))
         update: GraphState = {
             "tool_calls": [],
@@ -643,7 +702,7 @@ def build_graph(
             arguments = call.get("arguments")
             if (
                 not isinstance(name, str)
-                or name not in available
+                or name not in permitted
                 or not isinstance(arguments, dict)
             ):
                 event("tool.rejected", name=str(name), reason="unavailable")
@@ -657,12 +716,18 @@ def build_graph(
                     }
                 )
                 continue
-            preview(f"tool.{name}.arguments", arguments)
+            # Everything downstream reasons about the domain tool, not the
+            # `call_tool` envelope the model wrapped it in.
+            target, target_arguments = resolve_tool_call(name, arguments)
+            if target == SEARCH_TOOL_NAME and _already_searched(state, arguments):
+                event("tool.skipped", name=target, reason="duplicate_search")
+                continue
+            preview(f"tool.{target}.arguments", target_arguments)
             try:
                 async with stage(
                     "tool.call",
-                    name=name,
-                    table=arguments.get("table"),
+                    name=target,
+                    discovered=target != name,
                 ) as step:
                     execution = await tool_executor(
                         name,
@@ -677,16 +742,19 @@ def build_graph(
                         else None,
                         a2ui=execution.a2ui is not None,
                     )
+                data = deepcopy(structured) if isinstance(structured, dict) else {}
+                if target == SEARCH_TOOL_NAME:
+                    data = _discovered_tool_schemas(data)
                 observations.append(
                     {
-                        "name": name,
-                        "arguments": deepcopy(arguments),
+                        "name": target,
+                        "arguments": deepcopy(dict(target_arguments or {})),
                         "is_error": bool(execution.result.is_error),
-                        "data": deepcopy(structured) if isinstance(structured, dict) else {},
+                        "data": data,
                         "text": _text_from_execution(execution),
                     }
                 )
-                if name in {"visualize_allowed_data", "database_overview"}:
+                if target in {"visualize_allowed_data", "database_overview"}:
                     update["final_tool_execution"] = execution
             except (MCPConfigurationError, UserContextError) as exc:
                 event("tool.failed", name=name, reason=type(exc).__name__)

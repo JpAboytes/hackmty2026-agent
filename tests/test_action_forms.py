@@ -10,7 +10,7 @@ from mcp.types import TextContent
 
 from fluidbank_orchestrator import api
 from fluidbank_orchestrator.a2ui_actions.routing import requested_form
-from fluidbank_orchestrator.mcp_client import MODEL_TOOL_NAMES, enforce_trusted_user_scope
+from fluidbank_orchestrator.mcp_client import SCOPED_TOOL_NAMES, enforce_trusted_user_scope
 from fluidbank_orchestrator.schemas.a2ui import validate_complete_sequence
 
 
@@ -27,7 +27,11 @@ from fluidbank_orchestrator.schemas.a2ui import validate_complete_sequence
 )
 def test_form_routing_only_prepares_forms(query, expected):
     assert requested_form(query) == expected
-    assert "a2ui_action" not in MODEL_TOOL_NAMES
+    # `a2ui_action` is never a model-facing tool. Under progressive discovery
+    # that is enforced on the server, which declares it app-only so neither
+    # search nor the `call_tool` proxy can reach it; here the invariant that
+    # remains client-side is that it is always scoped to the authenticated user.
+    assert "a2ui_action" in SCOPED_TOOL_NAMES
 
 
 def test_all_forms_pass_official_sdk_and_agent_validation():

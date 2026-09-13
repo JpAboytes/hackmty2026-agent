@@ -14,7 +14,9 @@ from mcp.types import TextContent
 
 from fluidbank_orchestrator import mcp_client
 from fluidbank_orchestrator.mcp_client import (
-    MODEL_TOOL_NAMES,
+    CALL_TOOL_NAME,
+    DISCOVERY_TOOL_NAMES,
+    SEARCH_TOOL_NAME,
     MCPConfig,
     MCPConfigurationError,
     MCPToolDefinition,
@@ -30,10 +32,61 @@ from fluidbank_orchestrator.mcp_client import (
 
 _URL = "https://example.fastmcp.app/mcp"
 _TOKEN = "fmcp_test_placeholder_not_a_real_key"
+_CURRENT_USER = UUID("11111111-1111-1111-1111-111111111111")
+_OTHER_USER = UUID("22222222-2222-2222-2222-222222222222")
 
 
-def test_chat_message_is_not_a_model_escape_hatch() -> None:
-    assert "chat_message" not in MODEL_TOOL_NAMES
+def test_the_model_facing_catalog_is_not_filtered_locally() -> None:
+    """Whatever `tools/list` returns is what the model gets.
+
+    A local allowlist here would defeat the server's progressive discovery by
+    re-deriving the full catalog client-side, so there must not be one.
+    """
+    assert not hasattr(mcp_client, "MODEL_TOOL_NAMES")
+    assert DISCOVERY_TOOL_NAMES == {SEARCH_TOOL_NAME, CALL_TOOL_NAME}
+
+
+def test_discovery_is_not_an_identity_bypass() -> None:
+    """A scoped tool reached through the proxy is scoped exactly as a direct call."""
+    envelope = mcp_client.enforce_trusted_user_scope(
+        CALL_TOOL_NAME,
+        {
+            "name": "get_transactions",
+            "arguments": {"request": {"scope": {"user_id": str(_OTHER_USER)}, "period": "today"}},
+        },
+        _CURRENT_USER,
+    )
+
+    assert envelope is not None
+    assert envelope["name"] == "get_transactions"
+    assert envelope["arguments"]["request"]["scope"] == {"user_id": str(_CURRENT_USER)}
+    assert envelope["arguments"]["request"]["period"] == "today"
+
+
+def test_a_scoped_tool_behind_the_proxy_still_needs_an_authenticated_user() -> None:
+    with pytest.raises(TrustedUserScopeError):
+        mcp_client.enforce_trusted_user_scope(
+            CALL_TOOL_NAME,
+            {"name": "get_debt_overview", "arguments": {"request": {}}},
+            None,
+        )
+
+
+def test_the_proxy_cannot_be_pointed_at_the_discovery_tools() -> None:
+    """`call_tool(name="call_tool")` must not become an unscoped passthrough.
+
+    Envelope normalization unwraps a re-wrapped call, so this checks the thing
+    that matters: it never resolves to a discovery tool, and the payload that
+    reaches the server is the model's own, left for the server to refuse.
+    """
+    for target in (CALL_TOOL_NAME, SEARCH_TOOL_NAME):
+        envelope = {"name": target, "arguments": {"request": {}}}
+
+        name, _arguments = mcp_client.resolve_tool_call(CALL_TOOL_NAME, envelope)
+        sent = mcp_client.enforce_trusted_user_scope(CALL_TOOL_NAME, envelope, _CURRENT_USER)
+
+        assert name == CALL_TOOL_NAME
+        assert sent == envelope
 
 
 def test_horizon_mode_rejects_missing_api_key() -> None:

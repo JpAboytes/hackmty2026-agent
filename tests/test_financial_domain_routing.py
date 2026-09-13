@@ -8,8 +8,11 @@ import pytest
 
 from fluidbank_orchestrator.graph import _financial_data_turn, _model_tool_schema
 from fluidbank_orchestrator.mcp_client import (
+    CALL_TOOL_NAME,
+    DISCOVERY_TOOL_NAMES,
     FINANCIAL_DOMAIN_TOOL_NAMES,
-    MODEL_TOOL_NAMES,
+    SCOPED_TOOL_NAMES,
+    SEARCH_TOOL_NAME,
     MCPToolDefinition,
     enforce_trusted_user_scope,
 )
@@ -86,9 +89,37 @@ def test_authenticated_uuid_overwrites_model_identity_for_every_financial_tool()
         assert original["request"]["scope"] == {"user_id": str(USER_B)}
 
 
-def test_generic_schema_tools_are_not_in_the_model_financial_path() -> None:
-    assert FINANCIAL_DOMAIN_TOOL_NAMES <= MODEL_TOOL_NAMES
-    assert {"select_rows", "describe_table", "list_allowed_tables"}.isdisjoint(MODEL_TOOL_NAMES)
+def test_every_financial_tool_stays_inside_the_scoping_boundary() -> None:
+    """Discovery changed how tools are found, not which ones carry a user scope."""
+    assert FINANCIAL_DOMAIN_TOOL_NAMES <= SCOPED_TOOL_NAMES
+    assert DISCOVERY_TOOL_NAMES.isdisjoint(SCOPED_TOOL_NAMES)
+
+
+def test_the_deterministic_router_ignores_the_model_facing_catalog() -> None:
+    """The classifier routes on capability, not on what the model was shown.
+
+    With progressive discovery the model sees only the search pair, so gating
+    this path on that list would make every classified financial query fail.
+    """
+    state = _state("¿Cuánto debo y cuándo pago?")
+    state["available_tools"] = [
+        MCPToolDefinition(name, f"ES / EN {name}", {"type": "object"}).as_dict()
+        for name in (SEARCH_TOOL_NAME, CALL_TOOL_NAME)
+    ]
+
+    turn = _financial_data_turn(state, "debts")  # type: ignore[arg-type]
+
+    assert [call["name"] for call in turn.tool_calls] == ["get_debt_overview"]
+
+
+def test_an_unreachable_mcp_server_does_not_invent_a_financial_answer() -> None:
+    state = _state("¿Cuánto debo y cuándo pago?")
+    state["available_tools"] = []
+
+    turn = _financial_data_turn(state, "debts")  # type: ignore[arg-type]
+
+    assert turn.tool_calls == ()
+    assert "No está disponible" in turn.message
 
 
 def test_financial_model_schema_hides_nested_scope() -> None:
