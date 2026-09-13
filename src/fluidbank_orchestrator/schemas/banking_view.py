@@ -95,6 +95,30 @@ class Account(_StrictModel):
     status: Literal["active", "blocked", "inactive"] = "active"
 
 
+LastFour = Annotated[str, StringConstraints(strict=True, pattern=r"^\d{4}$")]
+# Percentage points, like `credit_card_terms.annual_interest_rate`; never a fraction.
+Rate = Annotated[float, Field(ge=0, le=1000, allow_inf_nan=False)]
+
+
+class PaymentCard(_StrictModel):
+    """Masked projection of `public.cards`.
+
+    There is deliberately no field for a full card number, CVV, expiry day or
+    cardholder document: the contract cannot carry one even if a caller has it.
+    """
+
+    card_id: ItemId = Field(alias="cardId")
+    card_name: Label = Field(alias="cardName")
+    card_type: Literal["debit", "credit"] = Field(alias="cardType")
+    network: Literal["visa", "mastercard", "amex", "other"]
+    last_four: LastFour = Field(alias="lastFour")
+    status: Literal["active", "blocked", "inactive"] = "active"
+    expires: (
+        Annotated[str, StringConstraints(strict=True, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")] | None
+    ) = None
+    account_id: ItemId | None = Field(default=None, alias="accountId")
+
+
 class Transaction(_StrictModel):
     transaction_id: ItemId = Field(alias="transactionId")
     title: Label
@@ -232,11 +256,19 @@ class FinancialSummaryView(_ViewBase):
     accounts: Annotated[list[Account], Field(max_length=30)]
     income: Money | None = None
     expenses: Money | None = None
+    cards: Annotated[list[PaymentCard], Field(max_length=12)] | None = None
 
     @model_validator(mode="after")
     def unique_accounts(self) -> FinancialSummaryView:
         if len({item.account_id for item in self.accounts}) != len(self.accounts):
             raise ValueError("account identifiers must be unique")
+        cards = self.cards or []
+        if len({item.card_id for item in cards}) != len(cards):
+            raise ValueError("card identifiers must be unique")
+        owned = {item.account_id for item in self.accounts}
+        for card in cards:
+            if card.account_id is not None and card.account_id not in owned:
+                raise ValueError("card does not belong to an account in this summary")
         return self
 
 
@@ -295,6 +327,10 @@ class SpendingAnalysisView(_ViewBase):
             raise ValueError("categories must be unique")
         if self.activity is not None and len(self.activity.data) > 366:
             raise ValueError("spending activity is limited to 366 days")
+        # The headline may exceed the breakdown when categories are truncated, but
+        # the visible slices can never add up to more than the total they belong to.
+        if sum(item.amount for item in self.categories) > self.total_spent + 0.01:
+            raise ValueError("categories add up to more than totalSpent")
         return self
 
 
@@ -357,16 +393,38 @@ class RecurringPaymentsView(_ViewBase):
 class CreditCardView(_ViewBase):
     intent: Literal["credit-card"]
     card_name: Label = Field(alias="cardName")
-    last_four: Annotated[str, StringConstraints(strict=True, pattern=r"^\d{4}$")] | None = Field(
-        default=None, alias="lastFour"
-    )
+    last_four: LastFour | None = Field(default=None, alias="lastFour")
     debt: Money
     available_credit: Money = Field(alias="availableCredit")
     minimum_payment: Money = Field(alias="minimumPayment")
     interest_free_payment: Money = Field(alias="interestFreePayment")
     due_date: Day = Field(alias="dueDate")
+    card: PaymentCard | None = None
+    credit_limit: PositiveMoney | None = Field(default=None, alias="creditLimit")
+    statement_balance: Money | None = Field(default=None, alias="statementBalance")
+    cutoff_date: Day | None = Field(default=None, alias="cutoffDate")
+    annual_interest_rate: Rate | None = Field(default=None, alias="annualInterestRate")
+    cat_percentage: Rate | None = Field(default=None, alias="catPercentage")
 
     _validate_date = field_validator("due_date")(_valid_day)
+
+    @field_validator("cutoff_date")
+    @classmethod
+    def validate_cutoff(cls, value: str | None) -> str | None:
+        return None if value is None else _valid_day(value)
+
+    @model_validator(mode="after")
+    def validate_terms(self) -> CreditCardView:
+        if self.credit_limit is not None and self.credit_limit < self.available_credit:
+            raise ValueError("availableCredit must not exceed creditLimit")
+        if self.cutoff_date is not None and self.cutoff_date > self.due_date:
+            raise ValueError("cutoffDate must not follow dueDate")
+        if self.card is not None:
+            if self.card.card_type != "credit":
+                raise ValueError("a credit-card view only accepts a credit card")
+            if self.last_four is not None and self.card.last_four != self.last_four:
+                raise ValueError("lastFour contradicts the card")
+        return self
 
 
 class DebtsView(_ViewBase):
@@ -398,12 +456,20 @@ class TransfersView(_ViewBase):
 class CardSecurityView(_ViewBase):
     intent: Literal["card-security"]
     card_name: Label = Field(alias="cardName")
-    last_four: Annotated[str, StringConstraints(strict=True, pattern=r"^\d{4}$")] | None = Field(
-        default=None, alias="lastFour"
-    )
+    last_four: LastFour | None = Field(default=None, alias="lastFour")
     status: Literal["active", "blocked", "inactive"]
     reported_transaction: Transaction | None = Field(default=None, alias="reportedTransaction")
     guidance: Description
+    card: PaymentCard | None = None
+
+    @model_validator(mode="after")
+    def validate_card(self) -> CardSecurityView:
+        if self.card is not None:
+            if self.card.status != self.status:
+                raise ValueError("the card status contradicts the view status")
+            if self.last_four is not None and self.card.last_four != self.last_four:
+                raise ValueError("lastFour contradicts the card")
+        return self
 
 
 class SavingsGoalsView(_ViewBase):
