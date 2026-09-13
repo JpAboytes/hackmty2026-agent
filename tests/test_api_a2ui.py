@@ -267,3 +267,49 @@ async def test_database_overview_is_authenticated_before_domain_tool(
     )
     assert calls == [("database_overview", {"limit": 50}, USER_A)]
     assert response.message == "Database overview loaded."
+
+
+def _preflight(origin: str, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(api, "_allowed_origins", lambda environment=None: [])
+    application = FastAPI()
+    application.post("/api/v1/agent/chat")(lambda: {"ok": True})
+    api._install_cors(application)
+    with TestClient(application) as client:
+        return client.options(
+            "/api/v1/agent/chat",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+
+
+def test_the_expo_web_dev_server_passes_preflight_on_any_localhost_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without this the browser blocks every call before it is ever sent."""
+    for origin in ("http://localhost:8082", "http://localhost:19006", "http://127.0.0.1:8081"):
+        response = _preflight(origin, monkeypatch)
+        assert response.headers.get("access-control-allow-origin") == origin, origin
+        assert "authorization" in response.headers.get("access-control-allow-headers", "").lower()
+
+
+def test_an_unrelated_origin_is_not_granted_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _preflight("https://evil.example.com", monkeypatch)
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_configured_origins_replace_the_localhost_pattern() -> None:
+    assert api._allowed_origins(
+        {"AGENT_ALLOWED_ORIGINS": "https://app.example.com/, , https://b.io"}
+    ) == [
+        "https://app.example.com",
+        "https://b.io",
+    ]
+    assert api._allowed_origins({}) == []

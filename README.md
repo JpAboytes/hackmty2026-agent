@@ -93,6 +93,13 @@ export SUPABASE_ACCESS_TOKEN='<supabase-access-token>'
 ./.venv/bin/python scripts/run_local.py "¿Cuánto dinero tengo?"
 ```
 
+Expo's web build is a browser origin and is therefore subject to CORS, while the
+native builds are not. With `AGENT_ALLOWED_ORIGINS` unset the API answers
+preflight for any localhost port, which is what the Expo dev server binds to;
+set it to a comma-separated list of exact origins to serve a deployed web build.
+Credentials are disabled because the API authenticates with an explicit
+`Authorization` header rather than a cookie.
+
 Tool schemas are loaded once per endpoint and reused for `MCP_TOOLS_CACHE_SECONDS`
 (default 300). Concurrent turns that miss together load the collection once, the
 cache hands out detached copies, and `MCP_TOOLS_CACHE_SECONDS=0` disables it so a

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import os
 import unicodedata
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Annotated, Any
 from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from mcp.types import TextContent
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -40,6 +43,44 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FluidBank Orchestrator", version="0.1.0")
+
+# Expo's web build is a browser origin, so it is subject to CORS while the
+# native builds are not. The dev server picks whatever port is free, so
+# localhost is matched by pattern rather than enumerated; a deployed web origin
+# must be listed explicitly in AGENT_ALLOWED_ORIGINS.
+_LOCALHOST_ORIGIN_PATTERN = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+
+
+def _allowed_origins(environment: Mapping[str, str] | None = None) -> list[str]:
+    """Parse the explicitly configured browser origins, if any."""
+    env = os.environ if environment is None else environment
+    raw = env.get("AGENT_ALLOWED_ORIGINS", "")
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
+
+def _install_cors(application: FastAPI) -> None:
+    """Allow the configured browser origins, or any localhost port in development.
+
+    Credentials stay off: this API authenticates with an explicit Authorization
+    header, never a cookie, so no origin needs permission to send one.
+    """
+    configured = _allowed_origins()
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=configured,
+        allow_origin_regex=None if configured else _LOCALHOST_ORIGIN_PATTERN,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept"],
+        max_age=600,
+    )
+    logger.info(
+        "CORS configured origins=%s",
+        ",".join(configured) if configured else "localhost-pattern",
+    )
+
+
+_install_cors(app)
 
 
 @app.get("/health")
