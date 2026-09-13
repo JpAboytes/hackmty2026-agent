@@ -509,3 +509,139 @@ def recurring_view(observations: Sequence[Mapping[str, Any]], profile: UserProfi
         "payments": payments[:_MAX_RECURRING_PAYMENTS],
     }
     return view, {"presentation_intent": "recurring-payments"}, "Estos son tus próximos cobros."
+
+
+def credit_card_view(
+    observations: Sequence[Mapping[str, Any]], profile: UserProfile
+) -> ViewResult:
+    """One verified credit account, its masked card and current contractual terms."""
+    domain = next(
+        (
+            observation.get("data")
+            for observation in reversed(observations)
+            if observation.get("name") == "get_accounts"
+            and observation.get("is_error") is not True
+            and isinstance(observation.get("data"), Mapping)
+        ),
+        None,
+    )
+    accounts = domain.get("accounts") if isinstance(domain, Mapping) else None
+    if not isinstance(accounts, list):
+        return _empty_result(
+            "credit-card",
+            "No encontré datos verificables de tu tarjeta de crédito.",
+            profile_currency(profile) or "MXN",
+        )
+
+    for raw_account in accounts:
+        if not isinstance(raw_account, Mapping) or raw_account.get("account_type") != "credit":
+            continue
+        account_id = raw_account.get("id")
+        currency = raw_account.get("currency")
+        available_credit = number(raw_account.get("available_balance"))
+        terms = raw_account.get("credit_terms")
+        cards = raw_account.get("cards")
+        if (
+            not isinstance(account_id, str)
+            or currency not in {"MXN", "USD"}
+            or available_credit is None
+            or available_credit < 0
+            or not isinstance(terms, Mapping)
+            or terms.get("currency") != currency
+            or not isinstance(cards, list)
+        ):
+            continue
+
+        candidates = [
+            card
+            for card in cards
+            if isinstance(card, Mapping)
+            and card.get("card_type") == "credit"
+            and card.get("status") in _CARD_STATUSES
+        ]
+        candidates.sort(key=lambda card: (card.get("status") != "active", str(card.get("id"))))
+        if not candidates:
+            continue
+        raw_card = candidates[0]
+        card_id = raw_card.get("id")
+        card_name = raw_card.get("display_name")
+        network = raw_card.get("network")
+        status = raw_card.get("status")
+        masked = raw_card.get("masked_last_four")
+        last_four = masked[-4:] if isinstance(masked, str) else ""
+        debt = number(terms.get("current_debt"))
+        minimum = number(terms.get("minimum_payment"))
+        interest_free = number(terms.get("interest_free_payment"))
+        credit_limit = number(terms.get("credit_limit"))
+        statement = number(terms.get("statement_balance"))
+        annual_rate = number(terms.get("annual_interest_rate"))
+        cat = number(terms.get("cat_percentage"))
+        due_date = terms.get("due_date")
+        cutoff_date = terms.get("cutoff_date")
+        if (
+            not isinstance(card_id, str)
+            or not isinstance(card_name, str)
+            or not card_name.strip()
+            or network not in _CARD_NETWORKS
+            or status not in _CARD_STATUSES
+            or len(last_four) != 4
+            or not last_four.isdigit()
+            or debt is None
+            or debt < 0
+            or minimum is None
+            or minimum < 0
+            or interest_free is None
+            or interest_free < 0
+            or credit_limit is None
+            or credit_limit <= 0
+            or credit_limit < available_credit
+            or not isinstance(due_date, str)
+            or not isinstance(cutoff_date, str)
+        ):
+            continue
+        card = {
+            "cardId": card_id,
+            "cardName": card_name.strip()[:120],
+            "cardType": "credit",
+            "network": network,
+            "lastFour": last_four,
+            "status": status,
+            "accountId": account_id,
+        }
+        expires = _expiry(raw_card)
+        if expires is not None:
+            card["expires"] = expires
+        view: dict[str, Any] = {
+            "intent": "credit-card",
+            "title": TITLES["credit-card"],
+            "currency": currency,
+            "cardName": card["cardName"],
+            "lastFour": last_four,
+            "debt": debt,
+            "availableCredit": available_credit,
+            "minimumPayment": minimum,
+            "interestFreePayment": interest_free,
+            "dueDate": due_date,
+            "card": card,
+            "creditLimit": credit_limit,
+            "cutoffDate": cutoff_date,
+        }
+        if statement is not None and statement >= 0:
+            view["statementBalance"] = statement
+        if annual_rate is not None and 0 <= annual_rate <= 1000:
+            view["annualInterestRate"] = annual_rate
+        if cat is not None and 0 <= cat <= 1000:
+            view["catPercentage"] = cat
+        data = {
+            "presentation_intent": "credit-card",
+            "account_id": account_id,
+            "card_id": card_id,
+            "currency": currency,
+        }
+        return view, data, f"Tu deuda actual es de {debt:,.2f} {currency}."
+
+    return _empty_result(
+        "credit-card",
+        "No encontré una tarjeta de crédito con datos y condiciones verificables.",
+        profile_currency(profile) or "MXN",
+    )

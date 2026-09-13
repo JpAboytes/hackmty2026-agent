@@ -45,6 +45,7 @@ def _state(query: str) -> dict[str, object]:
         ("¿Cuánto me queda de presupuesto de comida?", "budgets", "get_budget_progress"),
         ("¿Cómo va mi meta para vacaciones?", "savings-goals", "get_savings_progress"),
         ("¿Cuánto debo y cuándo pago?", "debts", "get_debt_overview"),
+        ("Muéstrame mi tarjeta de crédito", "credit-card", "get_accounts"),
         (
             "¿Qué pagos tengo en los próximos 15 días?",
             "recurring-payments",
@@ -58,6 +59,11 @@ def test_financial_intent_routes_to_one_domain_tool(query: str, intent: str, exp
     turn = financial_data_turn(_state(query), intent)  # type: ignore[arg-type]
     assert [call["name"] for call in turn.tool_calls] == [expected]
     assert turn.tool_calls[0]["name"] != "select_rows"
+
+
+def test_credit_card_request_limits_the_account_read_to_credit() -> None:
+    turn = financial_data_turn(_state("Muéstrame mi tarjeta de crédito"), "credit-card")
+    assert turn.tool_calls[0]["arguments"] == {"request": {"account_type": "credit"}}
 
 
 def test_compare_scenarios_resolves_owned_debt_then_calls_comparator() -> None:
@@ -390,3 +396,60 @@ def test_a_card_is_dropped_when_it_cannot_be_verified() -> None:
     ]["updateDataModel"]["value"]["view"]
 
     assert "cards" not in view
+
+
+def test_credit_card_query_builds_the_masked_payment_card_from_get_accounts() -> None:
+    observations = [
+        {
+            "name": "get_accounts",
+            "arguments": {"request": {"account_type": "credit"}},
+            "is_error": False,
+            "data": {
+                "ok": True,
+                "accounts": [
+                    {
+                        "id": "04803dbe-97f1-4986-ace7-54c2d6196151",
+                        "account_type": "credit",
+                        "currency": "MXN",
+                        "available_balance": 1500,
+                        "display_name": "Tarjeta Oro",
+                        "cards": [
+                            {
+                                "id": "5d3ec491-64dc-500e-b357-e732850cf990",
+                                "account_id": "04803dbe-97f1-4986-ace7-54c2d6196151",
+                                "display_name": "Oro de ejemplo",
+                                "card_type": "credit",
+                                "network": "mastercard",
+                                "masked_last_four": "•••• 9012",
+                                "status": "active",
+                                "expires_month": 12,
+                                "expires_year": 2029,
+                            }
+                        ],
+                        "credit_terms": {
+                            "currency": "MXN",
+                            "credit_limit": 10000,
+                            "current_debt": 8500,
+                            "statement_balance": 6200,
+                            "minimum_payment": 420,
+                            "interest_free_payment": 6200,
+                            "annual_interest_rate": 42,
+                            "cat_percentage": 53.2,
+                            "cutoff_date": "2026-09-06",
+                            "due_date": "2026-09-26",
+                        },
+                    }
+                ],
+            },
+        }
+    ]
+
+    presentation = build_financial_presentation("credit-card", observations, _PROFILE)
+    view = presentation.a2ui.messages[2]["updateDataModel"]["value"]["view"]
+
+    assert view["intent"] == "credit-card"
+    assert view["card"]["cardName"] == "Oro de ejemplo"
+    assert view["card"]["lastFour"] == "9012"
+    assert view["card"]["expires"] == "2029-12"
+    assert view["debt"] == 8500
+    assert view["interestFreePayment"] == 6200
