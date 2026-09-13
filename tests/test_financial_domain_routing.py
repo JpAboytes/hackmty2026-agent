@@ -6,7 +6,8 @@ from uuid import UUID
 
 import pytest
 
-from fluidbank_orchestrator.graph import _financial_data_turn, _model_tool_schema
+from fluidbank_orchestrator.agent.retrieval import financial_data_turn
+from fluidbank_orchestrator.agent.tool_visibility import model_tool_schema
 from fluidbank_orchestrator.mcp_client import (
     CALL_TOOL_NAME,
     DISCOVERY_TOOL_NAMES,
@@ -54,7 +55,7 @@ def _state(query: str) -> dict[str, object]:
     ],
 )
 def test_financial_intent_routes_to_one_domain_tool(query: str, intent: str, expected: str) -> None:
-    turn = _financial_data_turn(_state(query), intent)  # type: ignore[arg-type]
+    turn = financial_data_turn(_state(query), intent)  # type: ignore[arg-type]
     assert [call["name"] for call in turn.tool_calls] == [expected]
     assert turn.tool_calls[0]["name"] != "select_rows"
 
@@ -68,7 +69,7 @@ def test_compare_scenarios_resolves_owned_debt_then_calls_comparator() -> None:
             "data": {"debts": [{"id": "33333333-3333-3333-3333-333333333333"}]},
         }
     ]
-    turn = _financial_data_turn(state, "debts")  # type: ignore[arg-type]
+    turn = financial_data_turn(state, "debts")  # type: ignore[arg-type]
     assert [call["name"] for call in turn.tool_calls] == ["compare_debt_scenarios"]
 
 
@@ -107,7 +108,7 @@ def test_the_deterministic_router_ignores_the_model_facing_catalog() -> None:
         for name in (SEARCH_TOOL_NAME, CALL_TOOL_NAME)
     ]
 
-    turn = _financial_data_turn(state, "debts")  # type: ignore[arg-type]
+    turn = financial_data_turn(state, "debts")  # type: ignore[arg-type]
 
     assert [call["name"] for call in turn.tool_calls] == ["get_debt_overview"]
 
@@ -116,7 +117,7 @@ def test_an_unreachable_mcp_server_does_not_invent_a_financial_answer() -> None:
     state = _state("¿Cuánto debo y cuándo pago?")
     state["available_tools"] = []
 
-    turn = _financial_data_turn(state, "debts")  # type: ignore[arg-type]
+    turn = financial_data_turn(state, "debts")  # type: ignore[arg-type]
 
     assert turn.tool_calls == ()
     assert "No está disponible" in turn.message
@@ -140,7 +141,7 @@ def test_financial_model_schema_hides_nested_scope() -> None:
             },
         },
     )
-    request_schema = _model_tool_schema(definition)["properties"]["request"]
+    request_schema = model_tool_schema(definition)["properties"]["request"]
     assert "scope" not in request_schema["properties"]
     assert request_schema["required"] == ["period"]
 

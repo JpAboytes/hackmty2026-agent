@@ -29,6 +29,9 @@ from fluidbank_orchestrator.mcp_client import (
     list_remote_tools,
     load_mcp_config,
 )
+from fluidbank_orchestrator.mcp_client import catalog as mcp_catalog
+from fluidbank_orchestrator.mcp_client import session as mcp_session_module
+from fluidbank_orchestrator.mcp_client import user_context as mcp_user_context
 
 _URL = "https://example.fastmcp.app/mcp"
 _TOKEN = "fmcp_test_placeholder_not_a_real_key"
@@ -137,7 +140,7 @@ def test_none_mode_does_not_require_or_attach_token() -> None:
         }
     )
 
-    with patch("fluidbank_orchestrator.mcp_client.Client") as client_class:
+    with patch("fluidbank_orchestrator.mcp_client.config.Client") as client_class:
         created = create_mcp_client(config)
 
     assert created is client_class.return_value
@@ -148,7 +151,7 @@ def test_none_mode_does_not_require_or_attach_token() -> None:
 def test_horizon_client_uses_expected_remote_url_and_raw_token() -> None:
     config = load_mcp_config({"MCP_SERVER_URL": _URL, "HORIZON_API_KEY": _TOKEN})
 
-    with patch("fluidbank_orchestrator.mcp_client.Client") as client_class:
+    with patch("fluidbank_orchestrator.mcp_client.config.Client") as client_class:
         created = create_mcp_client(config)
 
     assert created is client_class.return_value
@@ -230,9 +233,9 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
         }
         return rows[table]
 
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: config)
-    monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
-    monkeypatch.setattr(mcp_client, "_select", fake_select)
+    monkeypatch.setattr(mcp_session_module, "load_mcp_config", lambda: config)
+    monkeypatch.setattr(mcp_session_module, "create_mcp_client", lambda _config: _FakeClient())
+    monkeypatch.setattr(mcp_user_context, "_select", fake_select)
 
     profile = (await fetch_user_context(user_id)).profile
 
@@ -251,7 +254,7 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e10000"])
 def test_float_value_rejects_non_finite_values(value: str) -> None:
     with pytest.raises(UserContextError, match="invalid"):
-        mcp_client._float_value({"amount": value}, "amount")
+        mcp_user_context._float_value({"amount": value}, "amount")
 
 
 @pytest.mark.asyncio
@@ -284,9 +287,9 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
         }
         return rows[table]
 
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: config)
-    monkeypatch.setattr(mcp_client, "create_mcp_client", lambda _config: _FakeClient())
-    monkeypatch.setattr(mcp_client, "_select", fake_select)
+    monkeypatch.setattr(mcp_session_module, "load_mcp_config", lambda: config)
+    monkeypatch.setattr(mcp_session_module, "create_mcp_client", lambda _config: _FakeClient())
+    monkeypatch.setattr(mcp_user_context, "_select", fake_select)
 
     profile = (await fetch_user_context(user_id)).profile
 
@@ -303,7 +306,7 @@ def test_owned_money_excludes_credit_and_never_mixes_currencies() -> None:
         {"account_type": "credit", "currency": "MXN", "available_balance": 900},
         {"account_type": "checking", "currency": "USD", "available_balance": 20},
     ]
-    assert mcp_client._owned_balances(rows) == {"MXN": 150.0, "USD": 20.0}
+    assert mcp_user_context._owned_balances(rows) == {"MXN": 150.0, "USD": 20.0}
 
 
 class _RecordingClient:
@@ -416,8 +419,8 @@ async def test_tool_schemas_are_loaded_once_and_reused(
 ) -> None:
     """Loading them cost up to 4.3s of every production turn."""
     calls: list[int] = []
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
-    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader(calls))
+    monkeypatch.setattr(mcp_catalog, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_catalog, "_load_remote_tools", _tool_loader(calls))
 
     first = await list_remote_tools()
     second = await list_remote_tools()
@@ -437,8 +440,8 @@ async def test_concurrent_misses_load_the_collection_only_once(
         await asyncio.sleep(0.01)
         return [MCPToolDefinition("select_rows", "Select scoped rows.", {"type": "object"})]
 
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
-    monkeypatch.setattr(mcp_client, "_load_remote_tools", slow)
+    monkeypatch.setattr(mcp_catalog, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_catalog, "_load_remote_tools", slow)
 
     await asyncio.gather(*(list_remote_tools() for _ in range(4)))
 
@@ -449,8 +452,8 @@ async def test_concurrent_misses_load_the_collection_only_once(
 async def test_a_cached_schema_cannot_be_mutated_through_a_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
-    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader([]))
+    monkeypatch.setattr(mcp_catalog, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_catalog, "_load_remote_tools", _tool_loader([]))
 
     first = await list_remote_tools()
     first[0].input_schema["injected"] = True
@@ -463,13 +466,13 @@ async def test_an_expired_collection_is_loaded_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[int] = []
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
-    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader(calls))
+    monkeypatch.setattr(mcp_catalog, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_catalog, "_load_remote_tools", _tool_loader(calls))
     monkeypatch.setenv("MCP_TOOLS_CACHE_SECONDS", "60")
 
     await list_remote_tools()
-    clock = [mcp_client.monotonic() + 3_600]
-    monkeypatch.setattr(mcp_client, "monotonic", lambda: clock[0])
+    clock = [mcp_catalog.monotonic() + 3_600]
+    monkeypatch.setattr(mcp_catalog, "monotonic", lambda: clock[0])
     await list_remote_tools()
 
     assert calls == [1, 1]
@@ -481,8 +484,8 @@ async def test_zero_seconds_turns_the_cache_off(
 ) -> None:
     """A redeploy mid-demo can be picked up immediately without a restart."""
     calls: list[int] = []
-    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
-    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader(calls))
+    monkeypatch.setattr(mcp_catalog, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_catalog, "_load_remote_tools", _tool_loader(calls))
     monkeypatch.setenv("MCP_TOOLS_CACHE_SECONDS", "0")
 
     await list_remote_tools()

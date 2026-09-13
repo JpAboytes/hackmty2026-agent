@@ -15,24 +15,31 @@ Expo
 ## Layout
 
 ```text
-  src/fluidbank_orchestrator/
-  graph.py         LangGraph workflow: runtime tools -> agent -> tools -> agent
-  state.py         Graph state (TypedDict)
-  auth.py          Supabase bearer-token verification
-  mcp_client.py     Generic tool execution, validated config, Horizon bearer auth
-  schemas/
-    a2ui.py         Strict official-envelope and supported-catalog models
-    banking_view.py Strict Finance v2 intent/data models
-    a2ui_action.py  Strict parser for the temporary action-over-chat transport
-  services/
-    a2ui_bridge.py  Resource resolution, validation, bounded static-template cache
-    financial_presentation.py  Deterministic selection and trusted BankingView builder
+src/fluidbank_orchestrator/
+  graph.py          LangGraph topology; the compiled graph and CLI entrypoint
+  state.py          Graph state (TypedDict)
+  auth.py           Supabase bearer-token verification
   observability.py  Turn-scoped stage logging and per-turn timing timeline
-  api.py            FastAPI entrypoint
+  api/              HTTP boundary: app, CORS, dispatch, actions, responses
+  agent/            The agent: model port, Gemini adapter, tool visibility,
+                    observation ledger, retrieval planning, tool loop, nodes
+  mcp_client/       MCP boundary: config, session, trusted scope, catalog,
+                    execution, user context
+  schemas/          Strict wire contracts: A2UI, Finance v2, actions, chat
+  services/         A2UI bridge and the Finance v2 presentation builders
+  a2ui_actions/     Canonical action/input JSON and form detection
+  a2ui_catalogs/    Checked-in Finance v1 catalog
 scripts/
   run_local.py      Run the graph once from the CLI, without an HTTP server
+docs/
+  ARCHITECTURE.md   Module responsibilities, dependency direction, boundaries
+  FLOWS.md          The request flows as they actually run today
 langgraph.json      LangGraph CLI / Studio manifest
 ```
+
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) says where to change a given
+behaviour; [`docs/FLOWS.md`](docs/FLOWS.md) walks each request path with the
+modules and invariants involved.
 
 ## Setup
 

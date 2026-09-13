@@ -10,8 +10,8 @@ import pytest
 from fastmcp.client.client import CallToolResult
 from mcp.types import TextContent
 
-import fluidbank_orchestrator.graph as graph_module
-from fluidbank_orchestrator import mcp_client
+import fluidbank_orchestrator.agent.nodes as nodes_module
+import fluidbank_orchestrator.agent.tool_visibility as tool_visibility
 from fluidbank_orchestrator.graph import ModelTurn, ToolAwareModel, build_graph
 from fluidbank_orchestrator.mcp_client import (
     CALL_TOOL_NAME,
@@ -21,6 +21,7 @@ from fluidbank_orchestrator.mcp_client import (
     enforce_trusted_user_scope,
     resolve_tool_call,
 )
+from fluidbank_orchestrator.mcp_client import execution as mcp_execution
 from fluidbank_orchestrator.state import UserProfile
 
 USER_A = UUID("68dc4d66-07b8-5893-95f1-07f06989a552")
@@ -141,7 +142,7 @@ async def _run(
             return _result({"result": [DISCOVERED_DEBT_TOOL]}, "1 tool found.")
         return _result({"ok": True, "debts": [{"id": "d1", "balance": 100}]}, "Datos.")
 
-    monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
     result = await build_graph(
         model=model, tool_loader=_discovery_tools, tool_executor=execute
     ).ainvoke({"user_query": query, "current_user_id": USER_A})
@@ -330,9 +331,9 @@ async def test_an_unadvertised_tool_is_addressed_through_the_proxy(
     async def listed() -> list[MCPToolDefinition]:
         return await _advertise({SEARCH_TOOL_NAME: True, CALL_TOOL_NAME: True})
 
-    monkeypatch.setattr(mcp_client, "list_remote_tools", listed)
+    monkeypatch.setattr(mcp_execution, "list_remote_tools", listed)
 
-    name, arguments = await mcp_client._wire_call("get_debt_overview", {"request": {}})
+    name, arguments = await mcp_execution._wire_call("get_debt_overview", {"request": {}})
 
     assert name == CALL_TOOL_NAME
     assert arguments == {"name": "get_debt_overview", "arguments": {"request": {}}}
@@ -348,9 +349,9 @@ async def test_an_advertised_tool_is_still_addressed_by_name(
             {SEARCH_TOOL_NAME: True, CALL_TOOL_NAME: True, "select_rows": False}
         )
 
-    monkeypatch.setattr(mcp_client, "list_remote_tools", listed)
+    monkeypatch.setattr(mcp_execution, "list_remote_tools", listed)
 
-    name, arguments = await mcp_client._wire_call("select_rows", {"table": "users"})
+    name, arguments = await mcp_execution._wire_call("select_rows", {"table": "users"})
 
     assert name == "select_rows"
     assert arguments == {"table": "users"}
@@ -360,11 +361,11 @@ async def test_an_unreadable_catalog_keeps_the_direct_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def unavailable() -> list[MCPToolDefinition]:
-        raise mcp_client.UserContextError("down")
+        raise mcp_execution.UserContextError("down")
 
-    monkeypatch.setattr(mcp_client, "list_remote_tools", unavailable)
+    monkeypatch.setattr(mcp_execution, "list_remote_tools", unavailable)
 
-    assert await mcp_client._wire_call("get_accounts", {"request": {}}) == (
+    assert await mcp_execution._wire_call("get_accounts", {"request": {}}) == (
         "get_accounts",
         {"request": {}},
     )
@@ -384,8 +385,8 @@ def test_a_pinned_app_only_tool_never_reaches_the_prompt() -> None:
         ]
     }
 
-    advertised = {tool.name for tool in graph_module._tool_definitions(state)}
-    offered = {tool.name for tool in graph_module._model_tool_definitions(state)}
+    advertised = {tool.name for tool in tool_visibility.tool_definitions(state)}
+    offered = {tool.name for tool in tool_visibility.model_tool_definitions(state)}
 
     assert advertised == {SEARCH_TOOL_NAME, CALL_TOOL_NAME, "select_rows", "a2ui_action"}
     assert offered == {SEARCH_TOOL_NAME, CALL_TOOL_NAME}
