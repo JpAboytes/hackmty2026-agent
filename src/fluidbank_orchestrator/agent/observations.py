@@ -67,16 +67,6 @@ def has_tool_observation(state: GraphState, tool_name: str) -> bool:
     )
 
 
-def has_table_observation(state: GraphState, table: str) -> bool:
-    """Whether a successful retained context read verified this table."""
-    return any(
-        observation.get("name") == USER_CONTEXT_TOOL_NAME
-        and observation.get("is_error") is not True
-        and observation.get("arguments", {}).get("table") == table
-        for observation in retained_observations(state)
-    )
-
-
 def already_searched(state: GraphState, arguments: Mapping[str, Any]) -> bool:
     """Whether this exact discovery query already produced tool definitions.
 

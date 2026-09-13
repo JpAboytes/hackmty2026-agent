@@ -6,7 +6,7 @@ Modules:
 * ``gemini``          - the only Gemini-specific code: prompt, adapter, answer schema.
 * ``tool_visibility`` - what a model may see of the tool surface.
 * ``observations``    - the turn's ledger of verified MCP results.
-* ``retrieval``       - deterministic financial retrieval planning.
+* ``status``          - the coarse lifecycle phases a client may display.
 * ``tool_loop``       - executing pending calls and recording provenance.
 * ``nodes``           - each workflow step, plus the routing decision.
 

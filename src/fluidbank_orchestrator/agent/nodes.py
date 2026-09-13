@@ -3,23 +3,37 @@
 Every node is built by a small factory so its external dependency is explicit
 and injectable; ``graph`` wires them into the topology and nothing else.
 
-The policy that matters lives in ``agent_node``, in this order:
+The policy that matters lives in ``agent_node``. It is deliberately short,
+because *deciding what the user needs is the model's job*: whether data is
+required, which capability provides it, how many capabilities, whether another
+discovery round is worthwhile, and whether the turn should end in a
+presentation, an action form, or plain text. The node only enforces the
+invariants the model must not be trusted with:
 
 1. no verified user context - answer without figures, never invent them;
 2. an MCP-owned presentation from the current tool batch - relay it;
-3. a classified or action-requested financial intent - plan deterministically
-   through ``retrieval`` and never consult the model;
+3. an action re-entry whose approved view does not validate - refuse it;
 4. the loop limit - stop rather than keep calling tools;
-5. otherwise the model turn, which may only choose tools or a bounded answer.
+5. an explicitly requested view pins the presentation so an approved action
+   cannot be silently upgraded to a different one;
+6. anything the model returns as a protocol value is re-normalized before it
+   can reach a builder or MCP.
+
+Coarse lifecycle phases are reported through ``status.emit_status``. They carry
+an identifier and nothing else - never prompt text, reasoning, arguments or
+rows.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import Any
 
 from langgraph.graph import END
 
+from ..a2ui_actions.forms import normalize_form_arguments, normalize_form_name
 from ..mcp_client import (
+    SEARCH_TOOL_NAME,
     MCPConfigurationError,
     MCPToolDefinition,
     MCPToolExecution,
@@ -30,7 +44,6 @@ from ..mcp_client import (
 from ..observability import event, stage
 from ..services.financial_presentation import (
     build_financial_presentation,
-    classify_financial_request,
     normalize_action_intent,
     select_presentation_intent,
 )
@@ -41,7 +54,7 @@ from .observations import (
     retained_observations,
     text_from_execution,
 )
-from .retrieval import financial_data_observed, financial_data_turn
+from .status import AgentStatus, emit_status
 from .tool_loop import ToolExecutor, run_pending_tools
 from .tool_visibility import model_tool_definitions
 
@@ -51,6 +64,7 @@ FALLBACK_PROFILE: UserProfile = {
     "literacy_level": "medium",
     "font_scale": "lg",
     "contrast": "high",
+    "color_vision_mode": "none",
     "hit_target": "large",
     "overdraft_risk": None,
     "recurring_expenses": 0.0,
@@ -63,13 +77,23 @@ MAX_TOOL_TURNS = 8
 Node = Callable[[GraphState], Awaitable[GraphState]]
 ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
 
+#: The tool that prepares - never saves - an A2UI action form.
+FORM_TOOL_NAME = "a2ui_form"
 
-def _copy_tool_calls(calls: tuple[ToolCall, ...]) -> list[ToolCall]:
+
+def _copy_tool_calls(calls: Sequence[ToolCall]) -> list[ToolCall]:
     return [{"name": call["name"], "arguments": dict(call["arguments"])} for call in calls]
 
 
 async def validate_identity_node(state: GraphState) -> GraphState:
-    """Validate identity and reset every turn-scoped workflow channel."""
+    """Authenticate the turn, then reset every turn-scoped workflow channel.
+
+    The graph is checkpointed per user, so a channel left behind by the
+    previous turn would otherwise be read as this turn's decision. Only
+    ``requested_intent`` survives, and only when the client actually sent an
+    approved action - it is trusted input, so it is normalized here once.
+    """
+    emit_status("interpreting")
     action_requested = state.get("action_requested") is True
     requested_intent = (
         normalize_action_intent(state.get("requested_intent")) if action_requested else None
@@ -78,8 +102,9 @@ async def validate_identity_node(state: GraphState) -> GraphState:
         "current_user_id": require_current_user_id(state.get("current_user_id")),
         "requested_intent": requested_intent,
         "action_requested": action_requested,
-        "financial_request_intent": None,
         "presentation_intent": None,
+        "action_form": None,
+        "action_form_arguments": {},
         "message": "",
         "months": None,
         "tool_calls": [],
@@ -142,6 +167,21 @@ def make_agent_node(model: ToolAwareModel) -> Node:
     return agent_node
 
 
+def _phase_before_model(observations: Sequence[Mapping[str, Any]]) -> AgentStatus:
+    """Which coarse phase the upcoming model turn represents.
+
+    Reading only the shape of the ledger, never its contents: an empty ledger
+    means the request is still being interpreted, a fresh discovery result
+    means candidate tools are being chosen, and domain results mean they are
+    being read.
+    """
+    if not observations:
+        return "interpreting"
+    if observations[-1].get("name") == SEARCH_TOOL_NAME:
+        return "selecting_tools"
+    return "interpreting_results"
+
+
 async def _agent_turn(state: GraphState, step: stage, model: ToolAwareModel) -> GraphState:
     if state.get("context_available") is False:
         step.set(decision="no_context")
@@ -152,110 +192,96 @@ async def _agent_turn(state: GraphState, step: stage, model: ToolAwareModel) -> 
             ),
             "tool_calls": [],
         }
-    observations = state.get("tool_observations", [])
+
+    # Ownership comes from MCP: either the bridge produced a validated bundle,
+    # or `_meta.ui` claimed the surface and its safe fallback is the answer.
     final_execution = state.get("final_tool_execution")
     if isinstance(final_execution, MCPToolExecution) and (
         final_execution.mcp_ui_owned or final_execution.a2ui is not None
     ):
         step.set(decision="tool_presentation")
-        return {
-            "financial_request_intent": None,
-            "presentation_intent": None,
-            "financial_presentation": None,
-            "message": text_from_execution(final_execution),
-            "tool_calls": [],
-        }
+        return {"message": text_from_execution(final_execution), "tool_calls": []}
 
-    explicit_intent = (
-        normalize_action_intent(state.get("requested_intent"))
-        if state.get("action_requested") is True
-        else None
-    )
-    if state.get("action_requested") is True and explicit_intent is None:
+    # An approved action re-enters with the view the user actually approved.
+    # A value that does not survive the finite vocabulary is a protocol fault,
+    # not a question for the model.
+    if state.get("action_requested") is True and state.get("requested_intent") is None:
         step.set(decision="invalid_action_intent")
         return {
-            "financial_request_intent": None,
-            "presentation_intent": None,
-            "financial_presentation": None,
             "message": "La presentación financiera solicitada no es válida.",
             "tool_calls": [],
         }
-    financial_intent = explicit_intent or classify_financial_request(state["user_query"])
-    if financial_intent is not None:
-        candidate = financial_data_turn(state, financial_intent)
-        # The deterministic financial path never reaches Gemini; seeing this
-        # decision with no model.gemini stage after it is the fast path.
-        step.set(
-            decision="financial_retrieval" if candidate.tool_calls else "financial_ready",
-            intent=financial_intent,
-            source="action" if explicit_intent is not None else "classifier",
-            calls=",".join(call["name"] for call in candidate.tool_calls) or None,
-        )
-        return {
-            "financial_request_intent": financial_intent,
-            "presentation_intent": None,
-            "financial_presentation": None,
-            "message": candidate.message,
-            "tool_calls": _copy_tool_calls(candidate.tool_calls),
-        }
+
     if state.get("tool_loop_count", 0) >= MAX_TOOL_TURNS:
         step.set(decision="loop_limit", limit=MAX_TOOL_TURNS)
         return {
-            "financial_request_intent": None,
-            "presentation_intent": None,
-            "financial_presentation": None,
             "message": "No pude completar la consulta dentro del límite seguro de pasos.",
             "tool_calls": [],
         }
 
+    observations = state.get("tool_observations", [])
+    emit_status(_phase_before_model(observations))
     candidate = await model.generate(
         query=state["user_query"],
         profile=state["user_profile"],
         tools=model_tool_definitions(state),
         observations=observations,
     )
-    return _from_model_turn(candidate, step)
+    return _from_model_turn(candidate, state, step)
 
 
-def _from_model_turn(candidate: ModelTurn, step: stage) -> GraphState:
-    """Accept a model turn as tool calls, an intent selection, or a message.
+def _from_model_turn(candidate: ModelTurn, state: GraphState, step: stage) -> GraphState:
+    """Accept a model turn as tool calls, a form, an intent, or a message.
 
-    The model may select from the finite presentation vocabulary; it cannot
-    invent one, because the value is normalized again downstream.
+    Every protocol value the model produced is re-normalized here, so a
+    hallucinated intent, form name or prefill becomes ``None`` rather than
+    reaching a builder or MCP. An explicitly requested view outranks the
+    model's choice: an approved action must present the view it was approved
+    for.
     """
+    pinned = normalize_action_intent(state.get("requested_intent"))
+    # Each branch below owns exactly one outcome, so the two routing channels
+    # start empty and only the selected one is filled.
+    result: GraphState = {
+        "message": "",
+        "tool_calls": [],
+        "presentation_intent": None,
+        "action_form": None,
+        "action_form_arguments": {},
+    }
     if candidate.tool_calls:
         step.set(
             decision="model_tool_calls",
             calls=",".join(call["name"] for call in candidate.tool_calls),
         )
-        result: GraphState = {
-            "financial_request_intent": None,
-            "presentation_intent": None,
-            "financial_presentation": None,
-            "message": "",
-            "tool_calls": _copy_tool_calls(candidate.tool_calls),
-        }
-    elif candidate.presentation_intent is not None:
-        step.set(decision="model_presentation", intent=candidate.presentation_intent)
-        result = {
-            "message": candidate.message,
-            "tool_calls": [],
-            "financial_request_intent": candidate.presentation_intent,
-            "presentation_intent": None,
-            "financial_presentation": None,
-        }
+        result["tool_calls"] = _copy_tool_calls(candidate.tool_calls)
+    elif (form_name := normalize_form_name(candidate.action_form)) is not None:
+        arguments = normalize_form_arguments(
+            form_name,
+            amount=candidate.form_amount,
+            recipient=candidate.form_recipient,
+        )
+        step.set(
+            decision="model_action_form",
+            form=form_name,
+            prefilled=",".join(sorted(arguments)) or None,
+        )
+        result["message"] = candidate.message
+        result["action_form"] = form_name
+        result["action_form_arguments"] = arguments
+    elif (intent := pinned or normalize_action_intent(candidate.presentation_intent)) is not None:
+        step.set(
+            decision="model_presentation",
+            intent=intent,
+            source="requested" if pinned is not None else "model",
+        )
+        result["message"] = candidate.message
+        result["presentation_intent"] = intent
     else:
         step.set(decision="model_message", message_chars=len(candidate.message.strip()))
-        message_text = candidate.message.strip() or (
+        result["message"] = candidate.message.strip() or (
             "No tengo una respuesta para mostrar en este momento."
         )
-        result = {
-            "financial_request_intent": None,
-            "presentation_intent": None,
-            "financial_presentation": None,
-            "message": message_text,
-            "tool_calls": [],
-        }
     if candidate.months is not None:
         result["months"] = candidate.months
     return result
@@ -264,22 +290,74 @@ def _from_model_turn(candidate: ModelTurn, step: stage) -> GraphState:
 def make_tools_node(tool_executor: ToolExecutor) -> Node:
     async def tools_node(state: GraphState) -> GraphState:
         pending = state.get("tool_calls", [])
+        emit_status(
+            "discovering_tools"
+            if any(call.get("name") == SEARCH_TOOL_NAME for call in pending)
+            else "executing_tools"
+        )
         async with stage("node.tools", calls=len(pending)):
             return await run_pending_tools(state, pending, tool_executor)
 
     return tools_node
 
 
+def make_prepare_action_node(tool_executor: ToolExecutor) -> Node:
+    """Ask MCP to prepare the form the model selected.
+
+    Preparing a form is not performing its write: ``a2ui_form`` reads current
+    values and returns a surface, and only a later user Button event reaches an
+    action handler. The name and every prefilled value are re-validated here
+    because the model chose them, and the rendered form stays authoritative.
+    """
+
+    async def prepare_action_node(state: GraphState) -> GraphState:
+        emit_status("preparing_action")
+        form_name = normalize_form_name(state.get("action_form"))
+        async with stage("node.prepare_action", form=form_name) as step:
+            if form_name is None:
+                step.set(outcome="invalid")
+                return {"message": "La acción solicitada no está disponible."}
+            raw_arguments = state.get("action_form_arguments") or {}
+            arguments = normalize_form_arguments(
+                form_name,
+                amount=raw_arguments.get("initial_amount"),
+                recipient=raw_arguments.get("initial_recipient"),
+            )
+            try:
+                execution = await tool_executor(
+                    FORM_TOOL_NAME,
+                    {"name": form_name, **arguments},
+                    current_user_id=require_current_user_id(state.get("current_user_id")),
+                )
+            except (MCPConfigurationError, UserContextError) as exc:
+                step.set(outcome="unavailable", reason=type(exc).__name__)
+                return {"message": "No pude preparar la acción en este momento."}
+            emit_status("building_ui")
+            step.set(
+                outcome="prepared",
+                is_error=bool(execution.result.is_error),
+                a2ui=execution.a2ui is not None,
+            )
+            if execution.a2ui is not None:
+                emit_status("validating_ui")
+            return {
+                "message": text_from_execution(execution),
+                "final_tool_execution": execution,
+            }
+
+    return prepare_action_node
+
+
 async def select_presentation_node(state: GraphState) -> GraphState:
-    """Choose the presentation semantics, only once retrieval has happened."""
+    """Refine the presentation semantics against what retrieval actually returned."""
     async with stage("node.select_presentation") as step:
-        requested = normalize_action_intent(state.get("financial_request_intent"))
-        if requested is None or not financial_data_observed(state, requested):
+        requested = normalize_action_intent(state.get("presentation_intent"))
+        if requested is None:
             step.set(outcome="invalid")
             return {
                 "presentation_intent": None,
                 "financial_presentation": None,
-                "message": "No hay datos financieros verificados para construir esta vista.",
+                "message": "La presentación financiera solicitada no es válida.",
             }
         selected = select_presentation_intent(
             requested,
@@ -293,14 +371,14 @@ async def select_presentation_node(state: GraphState) -> GraphState:
 
 async def build_presentation_node(state: GraphState) -> GraphState:
     """Build the trusted Finance v2 surface from retained observations only."""
+    emit_status("building_ui")
     async with stage("node.build_presentation") as step:
         intent = normalize_action_intent(state.get("presentation_intent"))
-        requested = normalize_action_intent(state.get("financial_request_intent"))
-        if intent is None or requested is None or not financial_data_observed(state, requested):
+        if intent is None:
             step.set(outcome="invalid")
             return {
                 "financial_presentation": None,
-                "message": "No hay datos financieros verificados para construir esta vista.",
+                "message": "La presentación financiera solicitada no es válida.",
             }
         presentation = build_financial_presentation(
             intent,
@@ -312,19 +390,26 @@ async def build_presentation_node(state: GraphState) -> GraphState:
             a2ui_messages=len(presentation.a2ui.messages),
             data_keys=",".join(sorted(presentation.data)) or "none",
         )
+        emit_status("validating_ui")
         return {"message": presentation.message, "financial_presentation": presentation}
 
 
 def route_after_agent(state: GraphState) -> str:
-    """Tool calls loop back; a financial intent presents; anything else ends."""
+    """Tool calls loop back; a form prepares; an intent presents; else the turn ends.
+
+    Presenting additionally requires that something was actually read this turn.
+    A presentation intent with an empty ledger means the model named a view
+    without any data behind it, and provenance is the one thing it does not get
+    to assert: with nothing retained there is nothing to render, so the turn
+    ends conversationally instead of publishing an empty surface.
+    """
     if state.get("tool_calls"):
         destination = "tools"
+    elif normalize_form_name(state.get("action_form")) is not None:
+        destination = "prepare_action"
+    elif normalize_action_intent(state.get("presentation_intent")) is not None:
+        destination = "select_presentation" if retained_observations(state) else END
     else:
-        financial_intent = normalize_action_intent(state.get("financial_request_intent"))
-        destination = (
-            "select_presentation"
-            if financial_intent is not None and financial_data_observed(state, financial_intent)
-            else END
-        )
+        destination = END
     event("graph.route", node="agent", next=destination)
     return destination

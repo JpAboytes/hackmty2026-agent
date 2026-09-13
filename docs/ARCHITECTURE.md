@@ -5,10 +5,13 @@ where to make a given change. Runtime behaviour is described in
 [FLOWS.md](FLOWS.md).
 
 This service is the **Agent Orchestrator** of the system described in
-`PROJECT_SPEC.MD`. It owns intent routing, prompt/policy logic, presentation
-selection, the trusted Finance v2 builders, and the MCP client integration. It
-does **not** own data access, the A2UI catalog definition, action validation, or
-the renderer — those belong to the MCP/data repository and the mobile client.
+`PROJECT_SPEC.MD`. It owns the graph topology, prompt/policy logic, the finite
+protocol vocabularies the model selects from, presentation selection, the
+trusted Finance v2 builders, and the MCP client integration. It does **not**
+own data access, the A2UI catalog definition, action validation, or the renderer
+— those belong to the MCP/data repository and the mobile client. It also does
+not classify requests: there is no phrase table and no pre-graph router, so
+"what does this user need" is a model decision bounded by enumerated values.
 
 ## Package layout
 
@@ -22,18 +25,18 @@ src/fluidbank_orchestrator/
 
   api/                        the HTTP boundary
     __init__.py               ASGI app, CORS, /health, /api/v1/agent/chat,
-                              authenticated dispatch order
+                              /api/v1/agent/chat/stream, dispatch order,
+                              the NDJSON status allowlist
     actions.py                A2UI action transport and its trust checks
-    query_routing.py          deterministic pre-graph query classification
     responses.py              ChatResponse construction and response logging
 
   agent/                      the LangGraph agent
     model.py                  ToolAwareModel port + ModelTurn
     gemini.py                 the only Gemini-specific code: prompt, adapter,
-                              bounded answer schema
+                              bounded answer schema, profile projection
+    status.py                 the eight lifecycle status ids and emit_status
     tool_visibility.py        what a model may see of the tool surface
     observations.py           the turn's ledger of verified MCP results
-    retrieval.py              deterministic financial retrieval planning
     tool_loop.py              executing pending calls, recording provenance
     nodes.py                  each workflow step, plus the routing decision
 
@@ -63,9 +66,17 @@ src/fluidbank_orchestrator/
       surface.py              the trusted A2UI message-sequence builder
       builder.py              observations -> one validated presentation
 
-  a2ui_actions/               canonical action/input JSON + form detection
+  a2ui_actions/               canonical action/input JSON, synchronized from MCP
+    forms.py                  ACTION_FORM_NAMES: the four preparable form names
   a2ui_catalogs/              checked-in Finance v1 catalog
 ```
+
+Two finite vocabularies bound everything the model is allowed to select:
+`schemas/banking_view.py:FINANCIAL_INTENTS` (13 presentation intents, normalized
+by `services/financial_presentation/intents.py:normalize_action_intent`) and
+`a2ui_actions/forms.py:ACTION_FORM_NAMES` (4 preparable A2UI forms, normalized
+by `normalize_form_name`). Both are re-validated after the model answers, so an
+invented value becomes "no branch" rather than an unchecked call.
 
 ## Dependency direction
 
@@ -82,7 +93,8 @@ Rules that hold today and should keep holding:
 * `schemas`, `state` and `observability` are leaves. They import nothing from
   the rest of the package.
 * `mcp_client` never imports `agent`, `api` or `graph`.
-* `agent` never imports `api`.
+* `agent` never imports `api`. The one reverse-direction dependency is
+  `api/__init__.py` importing `agent.status`'s id set to allowlist the stream.
 * `graph.py` imports only `agent`, `mcp_client` and `state`; it contains no
   behaviour of its own.
 * `services.financial_presentation` depends on `mcp_client` for one thing only:
@@ -96,8 +108,14 @@ Rules that hold today and should keep holding:
 | what a node does (context, agent policy, presentation) | `agent/nodes.py` |
 | the prompt, model name, or Gemini request shape | `agent/gemini.py` |
 | swapping Gemini for another model | implement `agent/model.py:ToolAwareModel`, pass it to `build_graph(model=…)` |
-| which tool a financial intent reads from | `agent/retrieval.py` |
-| which phrases map to which intent | `services/financial_presentation/intents.py` |
+| the per-turn tool-call cap | `agent/gemini.py:MAX_CALLS_PER_TURN` |
+| the number of model↔tools iterations | `agent/nodes.py:MAX_TOOL_TURNS` |
+| what the model sees of the user profile | `agent/gemini.py:_MODEL_PROFILE_KEYS` |
+| which A2UI forms the model may ask MCP to prepare | `a2ui_actions/forms.py:ACTION_FORM_NAMES` |
+| which intents are legal protocol values | `schemas/banking_view.py:FINANCIAL_INTENTS` |
+| whether observations support a different view than requested | `services/financial_presentation/intents.py:select_presentation_intent` |
+| which lifecycle phases exist, or where one is reported | `agent/status.py`, then the `emit_status` call in `agent/nodes.py` |
+| the words a user reads for a phase | **not here** — `HackMTY2026_Mobile/src/features/assistant/agent-status.ts` |
 | what a model may see of a tool schema | `agent/tool_visibility.py` |
 | the tool-loop guard rails, provenance recording | `agent/tool_loop.py` |
 | how a Finance v2 view payload is built | `services/financial_presentation/views.py` |
@@ -112,7 +130,7 @@ Rules that hold today and should keep holding:
 | the HTTP request/response shape | `schemas/chat.py` |
 | CORS, endpoints, dispatch order | `api/__init__.py` |
 | how an action result is trusted | `api/actions.py` |
-| which plain queries bypass the graph | `api/query_routing.py` |
+| what may travel on the status stream | `api/__init__.py:_status_line` |
 | what the client envelope looks like and what is logged | `api/responses.py` |
 | accepted A2UI components/catalogs | `schemas/a2ui.py` |
 | the Finance v2 data contract | `schemas/banking_view.py` |
@@ -133,10 +151,19 @@ call past it. `require_current_user_id` fails closed on anything that is not a
 
 **Model containment.** The model may do exactly two things: choose tool calls
 from what the server advertises as model-visible, and return the bounded
-`_Intent` answer (a message, an optional month count, an optional intent from
-the finite vocabulary). It never sees or emits A2UI JSON, component names, IDs,
-styles or protocol values. Any intent it returns is normalized again by
-`normalize_action_intent` before it can reach a builder.
+`_Intent` answer (a message, an optional month count, an optional presentation
+intent, an optional action form — the last two declared as enums over the finite
+vocabularies). It never sees or emits A2UI JSON, component names, IDs, styles or
+protocol values. Both protocol fields are normalized again — by
+`normalize_action_intent` and `normalize_form_name` — before either can reach a
+builder or MCP.
+
+What it is *handed* is bounded too. `agent/gemini.py:model_profile` projects
+`UserProfile` down to `literacy_level`, so `available_balance`,
+`owned_balances`, `overdraft_risk` and `recurring_expenses` never enter a
+prompt: the trusted builder renders every figure from MCP observations, and the
+client owns appearance, so sending them bought no behaviour and put the user's
+money in every request of every turn.
 
 **Tool discovery vs. the security boundary.** These are separate on purpose.
 Discovery (`DISCOVERY_TOOL_NAMES`, `search_tools -> call_tool`) decides *how a
@@ -158,10 +185,32 @@ a successful MCP call. `agent/observations.py` is the ledger,
 `builder.py` turns a failed domain read into an explicit empty view rather than
 an estimate.
 
-**Determinism.** A classified financial request never reaches the model:
-`agent/nodes.py` routes it to `agent/retrieval.py`, which plans at most one tool
-call from the intent and the normalized query text. Same request, same intent,
-same observations, same plan.
+**Determinism.** Determinism here means identity, validation, protocol and
+approval — **not** request classification. Deciding what a user needs is the
+model's job and is not deterministic; everything that could let that decision
+cause harm is:
+
+* *identity* is derived once from the token and re-imposed on every scoped call;
+* *validation* is exhaustive and offline — every intent, form name, view payload
+  and message sequence is checked against a checked-in contract, twice for a
+  surface;
+* *protocol values* come from closed vocabularies, so the set of reachable
+  outcomes is fixed at build time even though the choice among them is not;
+* *approval gates* mean no state change happens without an explicit user event
+  that MCP re-validates against the template that declared the button.
+
+Given the same tool observations, the same intent produces the same surface
+byte for byte: `services/financial_presentation/` is pure. Nothing upstream of
+the model classifies anything.
+
+**Lifecycle reporting.** `agent/status.py` publishes eight coarse phase ids over
+LangGraph's custom stream channel, and `api/__init__.py:_status_line` allowlists
+the payload at the HTTP boundary, so a node cannot widen a progress channel into
+a reasoning channel: only the discriminator and a known id are ever forwarded.
+No prompt text, reasoning, tool name, argument or row can travel on it.
+`emit_status` is a no-op when nobody is streaming, so the plain route and the
+tests run the identical graph. The copy a user reads is client-owned and lives
+only in the mobile repo.
 
 **A2UI ownership.** Two paths, never mixed. Finance v2 surfaces are constructed
 by the trusted Python builder in

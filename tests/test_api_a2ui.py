@@ -512,10 +512,17 @@ async def test_legacy_nonfinancial_action_remains_compatible(
 
 
 @pytest.mark.asyncio
-async def test_database_overview_is_authenticated_before_domain_tool(
+async def test_a_plain_query_reaches_the_graph_and_never_a_phrase_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, dict[str, Any] | None, UUID | None]] = []
+    """No query bypasses the graph.
+
+    `database_overview` used to be reached by matching phrases before the graph
+    ran. It is a model-visible tool, so the model now discovers and calls it
+    like any other capability, and the boundary's only job is to authenticate
+    and hand the turn to the graph.
+    """
+    invoked: list[dict[str, Any]] = []
 
     async def execute(
         name: str,
@@ -523,16 +530,24 @@ async def test_database_overview_is_authenticated_before_domain_tool(
         *,
         current_user_id: UUID | None = None,
     ) -> MCPToolExecution:
-        calls.append((name, arguments, current_user_id))
-        return _execution("Database overview loaded.")
+        raise AssertionError(f"the boundary must not call {name} itself")
+
+    class _Graph:
+        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+            invoked.append(state)
+            return {"message": "Database overview loaded.", "tool_loop_count": 2}
 
     monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
     monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", _Graph())
     response = await api.chat(
         ChatRequest(query="Muéstrame los objetos disponibles de la base de datos"),
         AUTH,
     )
-    assert calls == [("database_overview", {"limit": 50}, USER_A)]
+    assert [state["user_query"] for state in invoked] == [
+        "Muéstrame los objetos disponibles de la base de datos"
+    ]
+    assert invoked[0]["current_user_id"] == USER_A
     assert response.message == "Database overview loaded."
 
 
@@ -580,3 +595,83 @@ def test_configured_origins_replace_the_localhost_pattern() -> None:
         "https://b.io",
     ]
     assert api._allowed_origins({}) == []
+
+
+# --------------------------------------------------------------------------
+# The streaming route
+# --------------------------------------------------------------------------
+
+
+class _StatusGraph:
+    """A graph that reports two phases and then finishes."""
+
+    def __init__(self, *payloads: dict[str, Any]) -> None:
+        self._payloads = payloads
+        self.states: list[dict[str, Any]] = []
+
+    async def astream(
+        self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: list[str]
+    ) -> Any:
+        self.states.append(state)
+        assert stream_mode == ["custom", "values"]
+        for payload in self._payloads:
+            yield "custom", payload
+        yield "values", {"message": "Listo.", "user_profile": {}, "tool_loop_count": 1}
+
+
+async def _lines(request: ChatRequest, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    body = await api.chat_stream(request, AUTH)
+    chunks = [chunk async for chunk in body.body_iterator]
+    text = b"".join(
+        chunk if isinstance(chunk, bytes) else chunk.encode() for chunk in chunks
+    ).decode()
+    return [json.loads(line) for line in text.splitlines() if line]
+
+
+@pytest.mark.asyncio
+async def test_the_stream_reports_phases_then_one_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _StatusGraph(
+        {"type": "agent_status", "status": "interpreting"},
+        {"type": "agent_status", "status": "building_ui"},
+    )
+    monkeypatch.setattr(api, "graph", graph)
+
+    lines = await _lines(ChatRequest(query="¿Cuánto tengo?"), monkeypatch)
+
+    assert [line["type"] for line in lines] == ["agent_status", "agent_status", "result"]
+    assert [line["status"] for line in lines[:2]] == ["interpreting", "building_ui"]
+    assert lines[-1]["result"]["message"] == "Listo."
+    assert graph.states[0]["current_user_id"] == USER_A
+
+
+@pytest.mark.asyncio
+async def test_the_stream_forwards_no_payload_that_is_not_a_known_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node cannot turn the progress channel into a reasoning channel."""
+    graph = _StatusGraph(
+        {"type": "reasoning", "text": "the user looks overdrawn"},
+        {"type": "agent_status", "status": "pondering"},
+        {"type": "agent_status", "status": "validating_ui", "note": "internal"},
+    )
+    monkeypatch.setattr(api, "graph", graph)
+
+    lines = await _lines(ChatRequest(query="¿Cuánto tengo?"), monkeypatch)
+
+    assert [line["type"] for line in lines] == ["agent_status", "result"]
+    assert lines[0] == {"type": "agent_status", "status": "validating_ui"}
+    assert "overdrawn" not in json.dumps(lines)
+
+
+@pytest.mark.asyncio
+async def test_the_stream_refuses_a_body_user_id_that_disagrees_with_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "verify_supabase_access_token", _authenticate_as_a)
+    with pytest.raises(HTTPException) as raised:
+        body = await api.chat_stream(ChatRequest(query="Hola", user_id=USER_B), AUTH)
+        [chunk async for chunk in body.body_iterator]
+    assert raised.value.status_code == 403

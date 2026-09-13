@@ -2,9 +2,14 @@
 
 Every call that runs is recorded as an observation whatever its outcome, so a
 later stage can tell "MCP said there is nothing" from "MCP was never asked".
-Two independent gates decide what may run at all: the model may only use what
-the server advertised as model-visible (under progressive discovery, the search
-pair), and the deterministic planner may only use the scoped financial set.
+
+One gate decides what may run: ``_permitted_tool_names``, the union of what the
+server advertised as model-visible (under progressive discovery, the search
+pair) and ``FINANCIAL_DOMAIN_TOOL_NAMES``. The domain half is what lets a tool
+the model reached *through* ``call_tool`` execute once ``resolve_tool_call`` has
+unwrapped it, since the domain tool itself is never advertised to the model.
+Permission is not scoping: whose data a call may touch is decided by
+``mcp_client.trusted_scope`` regardless of how the call got here.
 """
 
 from __future__ import annotations

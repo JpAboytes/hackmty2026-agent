@@ -1,8 +1,13 @@
 """The port the graph depends on instead of on any particular model vendor.
 
 One turn of a tool-aware model produces either tool calls or an answer, never
-both. ``build_graph`` takes any object satisfying ``ToolAwareModel``, which is
-what lets the tests drive the whole workflow with a scripted model.
+both. An answer may additionally select a presentation intent or an action
+form; both are selections from a finite vocabulary, never invented values. A
+selected form may carry suggested defaults, which are bounded and validated
+before they reach MCP.
+
+``build_graph`` takes any object satisfying ``ToolAwareModel``, which is what
+lets the tests drive the whole workflow with a scripted model.
 """
 
 from __future__ import annotations
@@ -24,6 +29,14 @@ class ModelTurn:
     tool_calls: tuple[ToolCall, ...] = ()
     months: int | None = None
     presentation_intent: FinancialIntent | None = None
+    #: A form the model wants MCP to prepare. Validated against the finite
+    #: vocabulary in `a2ui_actions.forms` before it can reach MCP.
+    action_form: str | None = None
+    #: Suggested defaults for that form, read out of the user's own words.
+    #: Both are re-validated by `a2ui_actions.forms.normalize_form_arguments`,
+    #: and the form the user confirms remains authoritative.
+    form_amount: float | None = None
+    form_recipient: str | None = None
 
 
 class ToolAwareModel(Protocol):

@@ -29,6 +29,7 @@ _DEFAULT_PREFERENCES: dict[str, str] = {
     "literacy_level": "medium",
     "font_scale": "lg",
     "contrast": "high",
+    "color_vision_mode": "none",
     "hit_target": "large",
 }
 
@@ -69,6 +70,18 @@ def _owned_balances(account_rows: list[dict[str, object]]) -> dict[str, float]:
     return balances
 
 
+def _preference(prefs: Mapping[str, object], key: str) -> str:
+    """One accessibility preference, or its default.
+
+    A preference column is optional on purpose: a row written before the column
+    existed, or a deployment that has not applied the migration yet, must fall
+    back to the default rather than invalidate the whole user context. Financial
+    columns keep using `_string_value`, which still fails closed.
+    """
+    value = prefs.get(key)
+    return value if isinstance(value, str) and value else _DEFAULT_PREFERENCES[key]
+
+
 def _string_value(row: Mapping[str, object], key: str) -> str:
     value = row.get(key)
     if not isinstance(value, str):
@@ -102,11 +115,13 @@ def _profile(
         if _string_value(row, "status") == "active"
     )
     return {
-        "literacy_level": _string_value(prefs, "literacy_level")
-        or _DEFAULT_PREFERENCES["literacy_level"],
-        "font_scale": _string_value(prefs, "font_scale") or _DEFAULT_PREFERENCES["font_scale"],
-        "contrast": _string_value(prefs, "contrast") or _DEFAULT_PREFERENCES["contrast"],
-        "hit_target": _string_value(prefs, "hit_target") or _DEFAULT_PREFERENCES["hit_target"],
+        "literacy_level": _preference(prefs, "literacy_level"),
+        "font_scale": _preference(prefs, "font_scale"),
+        "contrast": _preference(prefs, "contrast"),
+        # Stored and seeded in `accessibility_preferences`, so it belongs in the
+        # profile; dropping it here silently discarded the whole preference.
+        "color_vision_mode": _preference(prefs, "color_vision_mode"),
+        "hit_target": _preference(prefs, "hit_target"),
         "available_balance": available_balance,
         "recurring_expenses": recurring_expenses,
         "overdraft_risk": (

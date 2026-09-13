@@ -67,8 +67,11 @@ The system consists of independently maintained repositories and deployable comp
 ### 5.2 Agent Orchestrator
 
 - LangGraph implemented in the backend language selected for the orchestration repository.
-- Interprets user intent and obtains the minimum required data by calling the MCP server's tools.
+- There is **no intent routing**: no phrase table, no pre-graph classifier, no deterministic retrieval planner. One graph handles every query, and the model decides whether data is needed, which capabilities provide it, how many, and whether the turn ends in a presentation, an A2UI action form, or plain prose. The topology only makes each outcome reachable.
+- Discovers capabilities through the MCP server's `search_tools` and calls one or more of them through `call_tool`; how many is the model's decision, bounded by a per-turn call cap and an iteration limit rather than by a "use one tool" policy.
 - Interprets returned data, then selects one of the finite financial presentation semantics in the shared contract.
+- May instead select one of the four enumerated A2UI action forms and ask MCP to *prepare* it. Preparing a form performs no write; only a subsequent explicit user event does.
+- Reports coarse lifecycle phases on an optional streaming route as an enumerated identifier and nothing else — no prompt text, reasoning, tool names, arguments or rows. The user-facing wording of those phases belongs to the mobile client.
 - Constructs Finance v2 `BankingView` payloads through trusted typed builders. The LLM never emits component names, actions, IDs, styles, properties, or raw A2UI JSON.
 - Continues to validate and relay MCP-produced A2UI for legacy/domain tools through the generic bridge.
 - Must not directly mutate client state or generate executable client code.
@@ -102,7 +105,7 @@ It consumes the versioned shared contract package. It must not import source fil
 
 ### 6.2 Agent Orchestrator Repository
 
-Owns LangGraph state, intent routing, prompt and policy logic, financial presentation selection, trusted Finance v2 builders, the MCP client integration, and orchestrator tests.
+Owns LangGraph state and topology, prompt and policy logic, the finite protocol vocabularies the model selects from, financial presentation selection, trusted Finance v2 builders, the lifecycle status vocabulary, the MCP client integration, and orchestrator tests.
 
 It consumes the official and shared Finance schemas to validate every envelope it relays or constructs. The LLM may select a known semantic intent but cannot invent protocol values. It communicates with the MCP server through public tool/resource interfaces and returns one ordered, self-contained response because Mobile is not an MCP client.
 
@@ -124,7 +127,31 @@ A future Next.js dashboard for small-business management may be created as a sep
 
 ## 7. Accessibility and Personalization
 
-The backend computes or retrieves these user-context values:
+Accessibility is split across two independent mechanisms. This section records
+which is which, because the difference is load-bearing and an earlier draft of
+this document described the two as one thing.
+
+### 7.1 Appearance is client-owned and device-local
+
+Everything the user actually sees adapt is decided on the device. `Configuración
+→ Accesibilidad` (also reachable from the sign-in screen before there is an
+account) edits ten Zod-validated preferences — `textScale`, `lineSpacing`,
+`letterSpacing`, `boldText`, `appearance`, `highContrast`, `colorPalette`,
+`reduceMotion`, `largeTargets`, `chartDataTable` — persisted in AsyncStorage per
+profile per device under `accessibility:v1:*`. They are **never** written to
+Supabase user metadata and **never** sent to the agent or the MCP server. See
+`HackMTY2026_Mobile/src/features/accessibility/README.md` for the full table and
+the rules new components must follow. There is no onboarding questionnaire; the
+settings panel is the only way these values are set.
+
+Because the renderer's A2UI adapters are the same components the rest of the app
+uses, a generated surface inherits those preferences automatically — which is the
+real meaning of "every renderer component applies them consistently".
+
+### 7.2 The backend profile is advisory and mostly unused
+
+The MCP server stores five values in `accessibility_preferences`, and
+`mcp_client/user_context.py` reads all five into `UserProfile`:
 
 - `literacy_level`: `low`, `medium`, or `high`.
 - `font_scale`: `sm`, `md`, `lg`, or `xl`.
@@ -132,20 +159,39 @@ The backend computes or retrieves these user-context values:
 - `color_vision_mode`: `none` or `deuteranopia`.
 - `hit_target`: `normal` or `large`.
 
-These values influence language, information density, component properties, and layout selection. Accessibility settings are not cosmetic metadata: every renderer component must apply them consistently.
+Only `literacy_level` has an effect today: `agent/gemini.py:model_profile`
+projects the profile down to that one key before it reaches the prompt, where it
+shapes the wording of the model's prose. The other four describe appearance,
+which the client owns from §7.1, so the orchestrator deliberately does not act on
+them and does not put them in a prompt. A missing preference column falls back to
+its default rather than invalidating the whole user context.
 
-Functional tags may include:
+### 7.3 What is specified but not implemented
 
-- `alert-critical`: Critical financial warning.
-- `high-contrast`: High-contrast borders and text.
-- `large-targets`: Controls with a minimum height of 64 pixels.
-- `action-first`: Prioritize primary actions over secondary details.
-- `simple-view`: Show only the most important metrics.
+- **Functional tags.** `alert-critical`, `high-contrast`, `large-targets`,
+  `action-first` and `simple-view` have **zero** implementations in any of the
+  three repositories: nothing emits them, nothing validates them, nothing
+  renders differently because of them. They remain a naming reservation. Before
+  any of them is used, the wire mechanism has to be specified — which message
+  carries them and which validator accepts them — and versioned in the shared
+  contract.
+- **Backend-driven information density and layout selection.** Which view an
+  intent produces is decided by the intent and the verified data, not by the
+  accessibility profile. There is no low-literacy variant of a surface.
 
-Tag names are part of the shared contract. New tags must be documented and versioned there.
+### 7.4 What A2UI does carry
 
+Accessible names are on the wire and are not optional. Every component of the
+trusted Finance v2 surface declares `accessibility.label` bound to a data-model
+key (`/viewLabel`, `/actionLabel`), and MCP's own
+`templates/financial_view.json` mirrors it, so a generated surface announces
+itself to a screen reader as well as a hand-written screen does. This is the
+documented A2UI accessibility attribute set; no `meta.accessibility` block and no
+arbitrary labels were added to the protocol.
 
-Template selection must be deterministic for the same normalized request, user context, and data snapshot. Templates may be extended only through the shared contract and corresponding renderer support.
+Template selection must be deterministic for the same normalized request, user
+context, and data snapshot. Templates may be extended only through the shared
+contract and corresponding renderer support.
 
 ## 8. A2UI Contract
 
@@ -223,7 +269,7 @@ The API accepts a structured action envelope and temporarily preserves the legac
 
 ### 8.6 Accessibility boundary
 
-Personal accessibility preferences (font scale, high contrast, dark mode, reduced motion, screen reader state, large touch targets) are a Mobile/renderer concern and are not sent to the MCP server. The MCP server emits semantic components (e.g. `variant: "h1"`, not `fontSize: 28`) and lets the renderer map them to accessible native widgets. The MCP server only needs to know about an accessibility preference when it changes *what content or structure* to send, not merely its style - for example `prefersDataTable`, `requiresTextAlternative`, or `avoidTimeLimitedInteractions` passed via request `_meta`, never inside the LLM prompt.
+Personal accessibility preferences (font scale, high contrast, dark mode, reduced motion, screen reader state, large touch targets) are a Mobile/renderer concern and are not sent to the MCP server. The MCP server emits semantic components (e.g. `variant: "h1"`, not `fontSize: 28`) and lets the renderer map them to accessible native widgets. The MCP server would only need to know about an accessibility preference if it changed *what content or structure* to send, not merely its style. No such preference exists today: `prefersDataTable`, `requiresTextAlternative` and `avoidTimeLimitedInteractions` are named here as the shape a future request-`_meta` field should take, and none of them is implemented or sent. If one is added it travels in request `_meta`, never inside the LLM prompt.
 
 ### 8.7 Current integration proof
 

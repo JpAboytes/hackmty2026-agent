@@ -8,7 +8,6 @@ from uuid import UUID
 
 import pytest
 from fastmcp.client.client import CallToolResult
-from langgraph.graph import END
 from mcp.types import TextContent
 
 import fluidbank_orchestrator.agent.gemini as gemini_module
@@ -25,6 +24,7 @@ from fluidbank_orchestrator.mcp_client import (
     UserContext,
     UserContextError,
     enforce_trusted_user_scope,
+    resolve_tool_call,
 )
 from fluidbank_orchestrator.schemas.a2ui import A2UIBundle
 from fluidbank_orchestrator.services.financial_presentation import build_financial_presentation
@@ -36,6 +36,7 @@ PROFILE: UserProfile = {
     "literacy_level": "medium",
     "font_scale": "lg",
     "contrast": "high",
+    "color_vision_mode": "none",
     "hit_target": "large",
     "overdraft_risk": 0.1,
     "recurring_expenses": 200.0,
@@ -55,6 +56,83 @@ class FakeModel(ToolAwareModel):
     ) -> ModelTurn:
         del query, profile, tools, observations
         return ModelTurn(message="Hola, ¿en qué te ayudo?")
+
+
+class ScriptedModel(ToolAwareModel):
+    """A model that plays a fixed sequence of turns and records what it saw.
+
+    Which capability answers a question is the model's decision now, so the
+    tests drive that decision explicitly instead of relying on a phrase table.
+    What is still asserted is everything downstream: scoping, provenance, the
+    presentation and the surface.
+    """
+
+    def __init__(self, *turns: ModelTurn) -> None:
+        self._turns = list(turns)
+        self.seen: list[dict[str, Any]] = []
+
+    async def generate(
+        self,
+        *,
+        query: str,
+        profile: UserProfile,
+        tools: Sequence[MCPToolDefinition],
+        observations: Sequence[Mapping[str, Any]],
+    ) -> ModelTurn:
+        self.seen.append(
+            {
+                "query": query,
+                "profile": dict(profile),
+                "tools": sorted(tool.name for tool in tools),
+                "observations": [dict(observation) for observation in observations],
+            }
+        )
+        if self._turns:
+            return self._turns.pop(0)
+        return ModelTurn(message="No tengo nada más que consultar.")
+
+
+def _searches(query: str) -> ModelTurn:
+    return ModelTurn(
+        message="", tool_calls=({"name": "search_tools", "arguments": {"query": query}},)
+    )
+
+
+def _calls(*targets: tuple[str, dict[str, Any]]) -> ModelTurn:
+    """One turn that calls 1..N discovered tools through the `call_tool` proxy."""
+    return ModelTurn(
+        message="",
+        tool_calls=tuple(
+            {"name": "call_tool", "arguments": {"name": name, "arguments": arguments}}
+            for name, arguments in targets
+        ),
+    )
+
+
+def _presents(intent: str, message: str = "Listo.") -> ModelTurn:
+    return ModelTurn(message=message, presentation_intent=intent)  # type: ignore[arg-type]
+
+
+def _candidates(*names: str) -> MCPToolExecution:
+    """A ranked `search_tools` result, as the server would return it."""
+    return MCPToolExecution(
+        result=CallToolResult(
+            content=[TextContent(text="Tools found.")],
+            structured_content={
+                "result": [
+                    {
+                        "name": name,
+                        "description": f"{name} description",
+                        "inputSchema": {"type": "object", "properties": {"request": {}}},
+                    }
+                    for name in names
+                ]
+            },
+            meta=None,
+            data=None,
+        ),
+        a2ui=None,
+    )
 
 
 async def _discovery_tools() -> list[MCPToolDefinition]:
@@ -79,11 +157,11 @@ async def _discovery_tools() -> list[MCPToolDefinition]:
     ]
 
 
-def _execution(rows: list[dict[str, Any]]) -> MCPToolExecution:
+def _execution(rows: list[dict[str, Any]], payload_key: str = "rows") -> MCPToolExecution:
     return MCPToolExecution(
         result=CallToolResult(
             content=[TextContent(text="Rows loaded.")],
-            structured_content={"ok": True, "rows": rows},
+            structured_content={"ok": True, payload_key: rows},
             meta=None,
             data=None,
         ),
@@ -96,7 +174,15 @@ async def _run_graph(
     query: str,
     rows: list[dict[str, Any]],
     context_rows: dict[str, list[dict[str, Any]]] | None = None,
+    model: ToolAwareModel | None = None,
+    candidates: tuple[str, ...] = (),
+    payload_key: str = "rows",
 ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+    """Run the graph, recording every call by the *domain* tool it resolved to.
+
+    The model addresses a discovered tool through the `call_tool` envelope, so
+    recording the envelope would say nothing about which capability ran.
+    """
     calls: list[tuple[str, dict[str, Any]]] = []
 
     async def fake_profile(_current_user_id: UUID) -> UserContext:
@@ -109,12 +195,15 @@ async def _run_graph(
         current_user_id: UUID | None = None,
     ) -> MCPToolExecution:
         resolved = enforce_trusted_user_scope(name, arguments, current_user_id) or {}
-        calls.append((name, resolved))
-        return _execution(rows)
+        target, target_arguments = resolve_tool_call(name, resolved)
+        calls.append((target, dict(target_arguments or {})))
+        if target == "search_tools":
+            return _candidates(*candidates)
+        return _execution(rows, payload_key)
 
     monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
     result = await build_graph(
-        model=FakeModel(), tool_loader=_discovery_tools, tool_executor=execute
+        model=model or FakeModel(), tool_loader=_discovery_tools, tool_executor=execute
     ).ainvoke({"user_query": query, "current_user_id": USER_A})
     return result, calls
 
@@ -143,14 +232,25 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
             "available_balance": 900,
         },
     ]
+    model = ScriptedModel(
+        _searches("saldo disponible"),
+        _calls(("get_accounts", {"request": {}})),
+        _presents("financial-summary"),
+    )
     result, calls = await _run_graph(
         monkeypatch,
         "¿Cuánto dinero tengo?",
-        [],
-        context_rows={"accounts": rows, "cards": []},
+        rows,
+        model=model,
+        payload_key="accounts",
+        candidates=("get_accounts", "get_financial_overview", "analyze_spending"),
     )
 
-    assert calls == []
+    assert [name for name, _ in calls] == ["search_tools", "get_accounts"]
+    assert calls[1][1]["request"]["scope"] == {"user_id": str(USER_A)}
+    # The candidate list held three tools and the model picked one of them:
+    # the ranking is an input to its decision, not the decision itself.
+    assert len(model.seen[1]["observations"][0]["data"]["result"]) == 3
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
     assert presentation.data["owned_balance"] == 150
@@ -165,6 +265,7 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
     view = presentation.a2ui.messages[-1]["updateDataModel"]["value"]["view"]
     assert view["totalOwnedBalance"] == 150
     assert all(account["accountType"] != "credit" for account in view["accounts"])
+    assert "chat_message" not in {name for name, _ in calls}
 
 
 @pytest.mark.asyncio
@@ -180,11 +281,16 @@ async def test_context_rows_answer_a_balance_without_a_second_read(
             "available_balance": 150,
         }
     ]
+    # The model is handed the prefetched context and decides no read is needed.
+    # The old deterministic planner could not reach this outcome: it read the
+    # overview again because its plan came from the intent, not from what the
+    # turn already held.
     result, calls = await _run_graph(
         monkeypatch,
         "¿Cuánto dinero tengo?",
         [],
-        context_rows={"accounts": accounts},
+        context_rows={"accounts": accounts, "cards": []},
+        model=ScriptedModel(_presents("financial-summary")),
     )
 
     assert calls == []
@@ -213,6 +319,10 @@ async def test_a_table_the_profile_never_read_is_still_fetched(
         "Muéstrame mis movimientos",
         transactions,
         context_rows={"accounts": [{"id": "checking"}]},
+        model=ScriptedModel(
+            _calls(("get_transactions", {"request": {"period": "current_month"}})),
+            _presents("transactions"),
+        ),
     )
 
     assert [name for name, _ in calls] == ["get_transactions"]
@@ -268,7 +378,7 @@ def test_spending_analysis_retains_and_combines_multiple_tool_results() -> None:
 
 
 @pytest.mark.asyncio
-async def test_semantic_activity_request_does_not_require_chart_keyword(
+async def test_the_tool_and_intent_the_model_chose_flow_through_untouched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rows = [
@@ -281,9 +391,19 @@ async def test_semantic_activity_request_does_not_require_chart_keyword(
             "occurred_at": "2026-09-11T15:00:00+00:00",
         }
     ]
-    result, calls = await _run_graph(monkeypatch, "¿Qué días gasto más?", rows)
+    result, calls = await _run_graph(
+        monkeypatch,
+        "¿Qué días gasto más?",
+        rows,
+        model=ScriptedModel(
+            _calls(("analyze_spending", {"request": {"period": "current_month"}})),
+            _presents("spending-analysis"),
+        ),
+    )
     assert [name for name, _ in calls] == ["analyze_spending"]
+    # The arguments the model chose reach MCP unaltered except for scope.
     assert calls[0][1]["request"]["period"] == "current_month"
+    assert calls[0][1]["request"]["scope"] == {"user_id": str(USER_A)}
     assert result["financial_presentation"].intent == "spending-analysis"
 
 
@@ -385,12 +505,16 @@ async def test_plain_conversation_can_finish_without_chat_message(
 
 
 @pytest.mark.asyncio
-async def test_classified_financial_request_never_invokes_the_model(
+async def test_a_financial_request_is_answered_from_prefetched_context_when_it_suffices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailingModel(ToolAwareModel):
-        async def generate(self, **_kwargs: Any) -> ModelTurn:
-            raise AssertionError("classified requests must not invoke Gemini")
+    """No classifier decides this; the model does, and it may need no tool at all.
+
+    `get_user_context` prefetches the account and card rows, so a balance
+    question can be answered without a domain read. The old deterministic
+    planner could not reach this outcome - it planned from the intent rather
+    than from what the turn already held.
+    """
 
     async def fake_profile(_current_user_id: UUID) -> UserContext:
         return UserContext(
@@ -410,21 +534,22 @@ async def test_classified_financial_request_never_invokes_the_model(
         )
 
     monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
-    result = await build_graph(model=FailingModel(), tool_loader=_discovery_tools).ainvoke(
+    model = ScriptedModel(_presents("financial-summary"))
+    result = await build_graph(model=model, tool_loader=_discovery_tools).ainvoke(
         {"user_query": "¿Cuánto dinero tengo?", "current_user_id": USER_A}
     )
 
     assert result["financial_presentation"].intent == "financial-summary"
+    assert result["financial_presentation"].data["owned_balance"] == 150
+    # The model was consulted exactly once and chose to read nothing further.
+    assert len(model.seen) == 1
 
 
 @pytest.mark.asyncio
-async def test_classified_request_calls_domain_tool_without_search(
+async def test_the_domain_tool_the_model_chose_runs_scoped_without_a_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailingModel(ToolAwareModel):
-        async def generate(self, **_kwargs: Any) -> ModelTurn:
-            raise AssertionError("classified requests must not invoke Gemini")
-
+    """Discovery is available, not mandatory: the model may address a tool directly."""
     calls: list[str] = []
 
     async def fake_profile(_current_user_id: UUID) -> UserContext:
@@ -432,12 +557,13 @@ async def test_classified_request_calls_domain_tool_without_search(
 
     async def execute(
         name: str,
-        _arguments: Mapping[str, Any] | None,
+        arguments: Mapping[str, Any] | None,
         *,
         current_user_id: UUID | None = None,
     ) -> MCPToolExecution:
         assert current_user_id == USER_A
-        calls.append(name)
+        target, _ = resolve_tool_call(name, enforce_trusted_user_scope(name, arguments, current_user_id) or {})
+        calls.append(target)
         return MCPToolExecution(
             result=CallToolResult(
                 content=[TextContent(text="Rows loaded.")],
@@ -449,23 +575,16 @@ async def test_classified_request_calls_domain_tool_without_search(
         )
 
     monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
+    model = ScriptedModel(
+        _calls(("get_transactions", {"request": {"period": "current_month"}})),
+        _presents("transactions"),
+    )
     await build_graph(
-        model=FailingModel(), tool_loader=_discovery_tools, tool_executor=execute
+        model=model, tool_loader=_discovery_tools, tool_executor=execute
     ).ainvoke({"user_query": "Muéstrame mis movimientos", "current_user_id": USER_A})
 
     assert calls == ["get_transactions"]
-
-
-def test_finance_route_requires_a_retained_retrieval_observation() -> None:
-    state: Any = {
-        "user_query": "Muéstrame mis movimientos",
-        "financial_request_intent": "transactions",
-        "tool_calls": [],
-        "tool_observations": [],
-        "context_observations": [],
-    }
-
-    assert route_after_agent(state) == END
+    assert "search_tools" not in calls
 
 
 @pytest.mark.asyncio
@@ -509,7 +628,7 @@ async def test_failed_proxied_tool_is_recorded_as_attempted_domain_tool() -> Non
         **state,
         **update,
         "user_query": "Muéstrame mis movimientos",
-        "financial_request_intent": "transactions",
+        "presentation_intent": "transactions",
     }
     assert route_after_agent(failed_state) == "select_presentation"
 
@@ -606,7 +725,6 @@ async def test_turn_initialization_clears_stale_calls_and_presentations(
             ],
             "final_tool_execution": stale_execution,
             "financial_presentation": stale_finance,
-            "financial_request_intent": "transactions",
             "presentation_intent": "transactions",
         }
     )
@@ -616,7 +734,6 @@ async def test_turn_initialization_clears_stale_calls_and_presentations(
     assert result["tool_observations"] == []
     assert result["final_tool_execution"] is None
     assert result["financial_presentation"] is None
-    assert result["financial_request_intent"] is None
     assert result["presentation_intent"] is None
 
 
@@ -654,9 +771,11 @@ class _RecordingModels:
     def __init__(self, outcomes: list[Any]) -> None:
         self.outcomes = outcomes
         self.configs: list[Any] = []
+        self.prompts: list[str] = []
 
     async def generate_content(self, *, model: str, contents: str, config: Any) -> _FakeResponse:
-        del model, contents
+        del model
+        self.prompts.append(contents)
         self.configs.append(config)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -747,3 +866,98 @@ def test_a_failed_call_is_logged_by_bounded_code_and_status() -> None:
 
     assert _api_failure_reason(_ClientError()) == "_ClientError/400/INVALID_ARGUMENT"
     assert _api_failure_reason(RuntimeError("secreto")) == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_never_carries_the_users_balances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model renders no figures, so it is shown none.
+
+    Every figure the user sees comes from the trusted builder reading MCP
+    observations. Putting balances in the prompt bought no behaviour and put
+    the user's money into every request of every turn.
+    """
+    models = _fake_genai(
+        monkeypatch,
+        [_FakeResponse(), _FakeResponse(parsed=_Intent(message="listo"))],
+    )
+    profile: UserProfile = {
+        **PROFILE,
+        "available_balance": 98765.43,
+        "owned_balances": {"MXN": 98765.43},
+        "overdraft_risk": 0.87,
+        "recurring_expenses": 4321.0,
+    }
+
+    await GeminiToolAwareModel().generate(
+        query="¿Cuánto dinero tengo?", profile=profile, tools=_declared_tools(), observations=[]
+    )
+
+    for prompt in models.prompts:
+        for secret in ("98765", "4321", "0.87", "owned_balances", "available_balance"):
+            assert secret not in prompt
+        # The one thing a model can act on is how plainly to speak.
+        assert "literacy_level" in prompt
+
+
+def test_the_model_profile_projection_keeps_only_literacy_level() -> None:
+    from fluidbank_orchestrator.agent.gemini import model_profile
+
+    assert model_profile(PROFILE) == {"literacy_level": "medium"}
+
+
+@pytest.mark.asyncio
+async def test_the_model_may_select_more_than_two_tools_in_one_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-tool selection was silently truncated to two calls."""
+    from fluidbank_orchestrator.agent.gemini import MAX_CALLS_PER_TURN
+
+    requested = [_FakeFunctionCall(f"tool_{index}", {"limit": index}) for index in range(5)]
+    models = _fake_genai(monkeypatch, [_FakeResponse(function_calls=requested)])
+
+    turn = await GeminiToolAwareModel().generate(
+        query="Necesito varias cosas",
+        profile=PROFILE,
+        tools=_declared_tools(),
+        observations=[],
+    )
+
+    assert MAX_CALLS_PER_TURN >= 5
+    assert [call["name"] for call in turn.tool_calls] == [
+        "tool_0",
+        "tool_1",
+        "tool_2",
+        "tool_3",
+        "tool_4",
+    ]
+    assert len(models.configs) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_runaway_fan_out_is_still_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fluidbank_orchestrator.agent.gemini import MAX_CALLS_PER_TURN
+
+    requested = [
+        _FakeFunctionCall(f"tool_{index}", {}) for index in range(MAX_CALLS_PER_TURN + 6)
+    ]
+    _fake_genai(monkeypatch, [_FakeResponse(function_calls=requested)])
+
+    turn = await GeminiToolAwareModel().generate(
+        query="Llama todo", profile=PROFILE, tools=_declared_tools(), observations=[]
+    )
+
+    assert len(turn.tool_calls) == MAX_CALLS_PER_TURN
+
+
+def test_the_model_may_select_a_form_only_from_the_declared_vocabulary() -> None:
+    """`_Intent.action_form` is an enum, so an invented form cannot be parsed."""
+    import pydantic
+
+    from fluidbank_orchestrator.a2ui_actions.forms import ACTION_FORM_NAMES
+
+    for name in ACTION_FORM_NAMES:
+        assert _Intent(message="", action_form=name).action_form == name
+    with pytest.raises(pydantic.ValidationError):
+        _Intent(message="", action_form="budget.delete")

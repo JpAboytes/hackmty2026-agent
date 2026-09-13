@@ -5,6 +5,11 @@ tool declarations and a structured response schema require. Everything it is
 handed is already safe to show a model: the tool schemas arrive stripped of
 trusted identity fields by ``tool_visibility``, and nothing it returns is
 trusted as identity or as protocol values.
+
+What it is *not* handed matters as much: ``model_profile`` strips the user's
+balances out of the prompt. The model never renders a figure - the trusted
+builder does, from MCP observations - so sending them bought nothing and put
+the user's money in every prompt of every turn.
 """
 
 from __future__ import annotations
@@ -13,12 +18,13 @@ import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+from ..a2ui_actions.forms import ACTION_FORM_NAMES
 from ..mcp_client import MCPToolDefinition
 from ..observability import preview, stage
 from ..schemas.banking_view import FinancialIntent
@@ -28,24 +34,64 @@ from .tool_visibility import model_tool_schema
 
 logger = logging.getLogger(__name__)
 
+#: Declared as an enum so Gemini cannot answer with a form that does not exist.
+_ActionForm = Literal[ACTION_FORM_NAMES]  # type: ignore[valid-type]
+
+#: A turn may legitimately need several capabilities - a budget suggested from
+#: real spending needs both - so the cap only stops a runaway fan-out. It is
+#: not a "use one tool" policy: selecting how many is the model's decision.
+MAX_CALLS_PER_TURN = 6
+
+#: The only profile keys a model turn needs. The rest of ``UserProfile`` is
+#: either the user's money (``available_balance``, ``owned_balances``,
+#: ``overdraft_risk``, ``recurring_expenses``) or appearance the model cannot
+#: act on (``font_scale``, ``contrast``, ``color_vision_mode``, ``hit_target``),
+#: because the trusted builder renders every figure from MCP observations and
+#: the client owns appearance. Sending them put balances in the prompt on every
+#: turn of every query for no behaviour at all.
+_MODEL_PROFILE_KEYS = ("literacy_level",)
+
+
+def model_profile(profile: UserProfile) -> dict[str, Any]:
+    """Project the profile down to what a model turn may see."""
+    return {key: profile[key] for key in _MODEL_PROFILE_KEYS if key in profile}  # type: ignore[literal-required]
+
+
 _MODEL_PROMPT = """Eres un asistente bancario accesible y conciso. Responde en español.
 Usa exclusivamente los datos proporcionados y las herramientas MCP disponibles.
 Después de consultar datos financieros, elige como máximo una semántica de presentación
 de la lista permitida. Las tools financieras ya devuelven contratos semánticos y chart-ready;
 no consultes ni interpretes el esquema PostgreSQL.
 Descubrimiento de herramientas / Tool discovery:
-1. Llama search_tools con una consulta en lenguaje natural que describa la intención
-   financiera del usuario, por ejemplo "deudas pendientes" o "gasto por categoría".
+1. Llama search_tools con una consulta EN INGLÉS que describa la necesidad de
+   información del usuario, por ejemplo "outstanding debt balances" o
+   "spending by category". El catálogo de herramientas está en inglés y la
+   búsqueda es léxica, así que una consulta en inglés encuentra la herramienta
+   correcta; traduce la intención del usuario en lugar de copiar sus palabras.
 2. Lee las definiciones devueltas y llama call_tool con {{"name": <herramienta>,
    "arguments": {{...}}}} usando el esquema que search_tools acaba de darte.
-Las definiciones que devuelve search_tools son completas: no vuelvas a buscar la misma
-intención si ya obtuviste una herramienta adecuada. Usa la menor cantidad de tools.
+3. search_tools devuelve VARIAS herramientas candidatas ordenadas por relevancia.
+   Evalúalas: la primera no es automáticamente la correcta. Llama las que realmente
+   necesites: una sola si basta, varias si la pregunta requiere varias. No llames
+   herramientas de más ni te limites a una si hace falta más de una.
+4. Si las candidatas no sirven, vuelve a llamar search_tools con otra formulación.
+Los resultados de las herramientas vuelven a ti antes de construir cualquier respuesta.
+Cuando el usuario pide realizar una operación (crear o cambiar un presupuesto o una meta
+de ahorro, transferir dinero, pagar la tarjeta de crédito), responde con action_form
+usando uno de estos nombres: {action_forms}.
+Si el usuario menciona una cantidad o un destinatario, puedes sugerirlos en form_amount y
+form_recipient (form_recipient solo aplica a transfer.execute); son valores por omisión
+del formulario, que el usuario todavía tiene que confirmar. Si no los menciona, omítelos:
+nunca los inventes.
+Pide datos con las herramientas antes de preparar el formulario solo si te faltan; si ya
+tienes el contexto necesario, prepáralo directamente. Preparar un formulario no guarda
+nada: solo un evento del usuario guarda.
 No generes ni copies JSON A2UI: el puente de la aplicación conserva el resultado MCP.
 El ámbito de usuario lo aplica la aplicación: nunca elijas ni cambies scope, user_id,
 customer_id, account_id, owner_id o persona_id.
 
 Consulta: {query}
-Perfil: {profile}
+Perfil (solo nivel de comprensión; las cifras vienen de las herramientas): {profile}
 Observaciones MCP anteriores: {observations}
 """
 
@@ -56,6 +102,17 @@ class _Intent(BaseModel):
     message: str
     months: int | None = None
     presentation_intent: FinancialIntent | None = None
+    #: An A2UI form to prepare, from the finite vocabulary MCP accepts. It is
+    #: re-validated by `a2ui_actions.forms.normalize_form_name` downstream, so
+    #: a value outside the enum can only become "no form".
+    action_form: _ActionForm | None = None
+    #: Optional defaults for that form, taken from the user's own words. They
+    #: are deliberately unconstrained here - Gemini's structured-output schema
+    #: supports only a subset of JSON Schema, and a rejected request costs the
+    #: whole turn. `a2ui_actions.forms.normalize_form_arguments` applies the
+    #: bounds MCP accepts and drops anything outside them.
+    form_amount: float | None = None
+    form_recipient: str | None = None
 
 
 def _api_failure_reason(exc: Exception) -> str:
@@ -94,8 +151,9 @@ class GeminiToolAwareModel:
             for tool in tools
         ]
         prompt = _MODEL_PROMPT.format(
+            action_forms=", ".join(ACTION_FORM_NAMES),
             query=query,
-            profile=json.dumps(profile, ensure_ascii=False, sort_keys=True),
+            profile=json.dumps(model_profile(profile), ensure_ascii=False, sort_keys=True),
             observations=json.dumps(list(observations), ensure_ascii=False, sort_keys=True),
         )
         model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
@@ -113,7 +171,7 @@ class GeminiToolAwareModel:
             if calls:
                 step.set(decision="tool_calls", calls=",".join(call["name"] for call in calls))
                 preview("model.gemini.calls", calls)
-                return ModelTurn(message="", tool_calls=tuple(calls[:2]))
+                return ModelTurn(message="", tool_calls=tuple(calls[:MAX_CALLS_PER_TURN]))
             turn = await self._answer(client, model_name, prompt, step)
             if turn is not None:
                 return turn
@@ -191,12 +249,16 @@ class GeminiToolAwareModel:
             decision="message",
             message_chars=len(intent.message),
             presentation_intent=intent.presentation_intent,
+            action_form=intent.action_form,
             months=intent.months,
         )
         return ModelTurn(
             message=intent.message,
             months=intent.months,
             presentation_intent=intent.presentation_intent,
+            action_form=intent.action_form,
+            form_amount=intent.form_amount,
+            form_recipient=intent.form_recipient,
         )
 
     @staticmethod
