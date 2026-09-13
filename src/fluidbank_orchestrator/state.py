@@ -13,6 +13,7 @@ class UserProfile(TypedDict):
     literacy_level: str
     font_scale: str
     contrast: str
+    color_vision_mode: str
     hit_target: str
     overdraft_risk: float | None
     recurring_expenses: float
@@ -25,10 +26,16 @@ class GraphState(TypedDict, total=False):
 
     user_query: str
     current_user_id: UUID
+    #: A view the user explicitly approved through an A2UI action. Trusted
+    #: input, and the only thing that outranks the model's own choice.
     requested_intent: str
     action_requested: bool
-    financial_request_intent: str
+    #: The one intent this turn presents. The model proposes it, the finite
+    #: vocabulary validates it, and `requested_intent` pins it when set.
     presentation_intent: str
+    #: The A2UI form the model asked MCP to prepare, from the finite set in
+    #: `a2ui_actions.forms`.
+    action_form: str
     user_profile: UserProfile
     context_available: bool
     message: str

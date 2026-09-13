@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from .builder import FinancialPresentation, build_financial_presentation
 from .intents import (
-    classify_financial_request,
     normalize_action_intent,
     select_presentation_intent,
 )
@@ -25,7 +24,6 @@ __all__ = [
     "FINANCIAL_VIEW_SURFACE_ID",
     "FinancialPresentation",
     "build_financial_presentation",
-    "classify_financial_request",
     "normalize_action_intent",
     "select_presentation_intent",
 ]

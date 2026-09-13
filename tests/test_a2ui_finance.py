@@ -185,16 +185,17 @@ async def test_finance_template_is_cached_and_forwarded_as_ordered_objects() -> 
 
 
 def test_cross_repository_catalog_id_schema_and_fixture_parity() -> None:
-    monorepo = Path(__file__).resolve().parents[2]
+    repo = Path(__file__).resolve().parents[1]
+    monorepo = repo.parent
     agent_catalog = json.loads(
-        (
-            monorepo / "hackmty2026-agent/src/fluidbank_orchestrator/a2ui_catalogs/finance_v1.json"
-        ).read_text(encoding="utf-8")
-    )
-    mcp_catalog = json.loads(
-        (monorepo / "mcp/src/supabase_mcp/a2ui_support/catalogs/finance_v1.json").read_text(
+        (repo / "src/fluidbank_orchestrator/a2ui_catalogs/finance_v1.json").read_text(
             encoding="utf-8"
         )
+    )
+    mcp_catalog = json.loads(
+        (
+            monorepo / "hackmty2026-mcp/src/supabase_mcp/a2ui_support/catalogs/finance_v1.json"
+        ).read_text(encoding="utf-8")
     )
     mobile_types = (monorepo / "HackMTY2026_Mobile/src/features/a2ui/types.ts").read_text(
         encoding="utf-8"
@@ -246,7 +247,7 @@ def test_finance_v2_banking_view_accepts_valid_summary_and_rejects_unknown_props
     canonical_template = json.loads(
         (
             Path(__file__).resolve().parents[2]
-            / "mcp/src/supabase_mcp/a2ui_support/templates/financial_view.json"
+            / "hackmty2026-mcp/src/supabase_mcp/a2ui_support/templates/financial_view.json"
         ).read_text(encoding="utf-8")
     )
     assert bundle.messages[:2] == canonical_template
@@ -255,8 +256,14 @@ def test_finance_v2_banking_view_accepts_valid_summary_and_rejects_unknown_props
             "id": "root",
             "component": "Column",
             "children": ["banking_view", "request_financial_view_button"],
+            "accessibility": {"label": {"path": "/viewLabel"}},
         },
-        {"id": "banking_view", "component": "BankingView", "view": {"path": "/view"}},
+        {
+            "id": "banking_view",
+            "component": "BankingView",
+            "view": {"path": "/view"},
+            "accessibility": {"label": {"path": "/viewLabel"}},
+        },
         {
             "id": "request_financial_view_label",
             "component": "Text",
@@ -267,6 +274,7 @@ def test_finance_v2_banking_view_accepts_valid_summary_and_rejects_unknown_props
             "component": "Button",
             "child": "request_financial_view_label",
             "variant": "primary",
+            "accessibility": {"label": {"path": "/actionLabel"}},
             "action": {
                 "event": {
                     "name": "request_financial_view",
@@ -275,6 +283,9 @@ def test_finance_v2_banking_view_accepts_valid_summary_and_rejects_unknown_props
             },
         },
     ]
+    # A generated surface announces itself: the accessible name is bound to the
+    # data model, so it names the view the user is actually looking at.
+    assert bundle.messages[2]["updateDataModel"]["value"]["viewLabel"] == "Tu panorama financiero"
     assert bundle.messages[2]["updateDataModel"]["value"]["actionLabel"] == (
         "Ver gastos del último mes"
     )

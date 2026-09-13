@@ -15,6 +15,7 @@ from typing import Any
 
 from ...schemas.a2ui import A2UI_FINANCE_V2_CATALOG, A2UIBundle, validate_complete_sequence
 from ...schemas.banking_view import FinancialIntent, validate_banking_view
+from .intents import TITLES
 
 FINANCIAL_VIEW_SURFACE_ID = "financial-view"
 FINANCIAL_VIEW_RESOURCE_URI = "a2ui://finance/view"
@@ -30,13 +31,26 @@ def _follow_up(intent: FinancialIntent) -> tuple[str, FinancialIntent]:
 
 
 def _components() -> list[dict[str, Any]]:
+    """The fixed component tree, with an accessible name on every component.
+
+    Screen-reader names are part of the surface, not a client-side afterthought:
+    a generated surface must announce itself as well as a hand-written screen
+    does, which is the same rule MCP's own templates already follow. The names
+    bind to the data model so they stay in step with the view they describe.
+    """
     return [
         {
             "id": "root",
             "component": "Column",
             "children": ["banking_view", FINANCIAL_ACTION_COMPONENT_ID],
+            "accessibility": {"label": {"path": "/viewLabel"}},
         },
-        {"id": "banking_view", "component": "BankingView", "view": {"path": "/view"}},
+        {
+            "id": "banking_view",
+            "component": "BankingView",
+            "view": {"path": "/view"},
+            "accessibility": {"label": {"path": "/viewLabel"}},
+        },
         {
             "id": "request_financial_view_label",
             "component": "Text",
@@ -47,6 +61,7 @@ def _components() -> list[dict[str, Any]]:
             "component": "Button",
             "child": "request_financial_view_label",
             "variant": "primary",
+            "accessibility": {"label": {"path": "/actionLabel"}},
             "action": {
                 "event": {
                     "name": FINANCIAL_ACTION_NAME,
@@ -83,6 +98,7 @@ def build_bundle(intent: FinancialIntent, view: Mapping[str, Any]) -> A2UIBundle
                 "path": "/",
                 "value": {
                     "view": validated_view,
+                    "viewLabel": TITLES[intent],
                     "actionLabel": action_label,
                     "requestIntent": request_intent,
                 },

@@ -3,9 +3,13 @@
 The topology, and nothing else:
 
     START -> validate_identity -> load_tools -> fetch_context -> agent
-    agent -> tools -> agent          (while the agent asks for tool calls)
+    agent -> tools -> agent          (while the model asks for tool calls)
+    agent -> prepare_action -> END   (the model selected an A2UI form)
     agent -> select_presentation -> build_presentation -> END
     agent -> END                     (bounded conversational answers)
+
+The model decides which of those the turn needs. The topology only makes each
+outcome reachable; it does not classify the request.
 
 What each node *does* lives in ``agent.nodes``; the model adapter in
 ``agent.gemini``; the MCP boundary in ``mcp_client``. Change behaviour there,
@@ -30,6 +34,7 @@ from .agent.nodes import (
     fetch_context_node,
     make_agent_node,
     make_load_tools_node,
+    make_prepare_action_node,
     make_tools_node,
     route_after_agent,
     select_presentation_node,
@@ -55,6 +60,7 @@ def build_graph(
     workflow.add_node("fetch_context", cast("Any", fetch_context_node))
     workflow.add_node("agent", cast("Any", make_agent_node(resolved_model)))
     workflow.add_node("tools", cast("Any", make_tools_node(tool_executor)))
+    workflow.add_node("prepare_action", cast("Any", make_prepare_action_node(tool_executor)))
     workflow.add_node("select_presentation", cast("Any", select_presentation_node))
     workflow.add_node("build_presentation", cast("Any", build_presentation_node))
     workflow.add_edge(START, "validate_identity")
@@ -64,9 +70,15 @@ def build_graph(
     workflow.add_conditional_edges(
         "agent",
         route_after_agent,
-        {"tools": "tools", "select_presentation": "select_presentation", END: END},
+        {
+            "tools": "tools",
+            "prepare_action": "prepare_action",
+            "select_presentation": "select_presentation",
+            END: END,
+        },
     )
     workflow.add_edge("tools", "agent")
+    workflow.add_edge("prepare_action", END)
     workflow.add_edge("select_presentation", "build_presentation")
     workflow.add_edge("build_presentation", END)
     return workflow.compile()

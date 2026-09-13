@@ -6,12 +6,21 @@ implement each one. For where code lives and why, see
 
 Every flow starts the same way, so it is stated once here rather than repeated:
 
-`api/__init__.py:chat` opens the turn (`observability.start_turn`), then
-`_handle_chat` verifies the bearer token through
-`auth.verify_supabase_access_token`, refuses a body `user_id` that disagrees
-with it (403), parses any action form via `api/actions.py:action_payload`, and
-opens **one** MCP session for the whole turn
-(`mcp_client/session.py:mcp_session`) before calling `_route_request`.
+`api/__init__.py` exposes the same turn twice — `POST /api/v1/agent/chat`
+(`chat`, one JSON envelope) and `POST /api/v1/agent/chat/stream`
+(`chat_stream`, NDJSON: coarse status lines then that same envelope, flow 11).
+Both open the turn (`observability.start_turn`), verify the bearer token through
+`auth.verify_supabase_access_token`, refuse a body `user_id` that disagrees with
+it (403), parse any action form via `api/actions.py:action_payload`, and open
+**one** MCP session for the whole turn (`mcp_client/session.py:mcp_session`)
+before dispatching. A structured action is dispatched identically on both routes
+(`_route_request`), so the two cannot disagree about what an action does.
+
+**No phrase matching happens anywhere.** There is exactly one query route;
+deciding what a plain query needs is the model's job. `api/query_routing.py`,
+`agent/retrieval.py`, `a2ui_actions/routing.py` and
+`intents.classify_financial_request` no longer exist, and neither does any
+"deterministic financial fast path".
 
 **Invariant for all flows:** `current_user_id` comes from the token and nothing
 else, and `mcp_client/trusted_scope.py:enforce_trusted_user_scope` overwrites
@@ -20,68 +29,157 @@ arguments.
 
 ---
 
-## 1. Normal authenticated financial query
+## 1. The graph, and the four ways a turn ends
 
-The default path for "¿Cuánto dinero tengo?".
+`graph.py:build_graph` wires exactly this topology and nothing else:
+
+```text
+START -> validate_identity -> load_tools -> fetch_context -> agent
+agent -> tools -> agent                    (model asked for 1..N tool calls)
+agent -> prepare_action -> END             (model selected an A2UI form)
+agent -> select_presentation -> build_presentation -> END
+agent -> END                               (bounded conversational answer)
+```
 
 ```mermaid
 flowchart TD
-  A[api._route_request] -->|no action, no form,<br/>not database overview| B[graph.ainvoke]
-  B --> C[nodes.validate_identity_node]
-  C --> D[nodes.make_load_tools_node<br/>mcp_client.list_remote_tools]
-  D --> E[nodes.fetch_context_node<br/>mcp_client.fetch_user_context]
-  E --> F[nodes.agent_node]
-  F -->|classified intent| G[retrieval.financial_data_turn]
-  G --> H[tool_loop.run_pending_tools]
-  H --> F
-  F -->|no more calls| I[nodes.select_presentation_node]
-  I --> J[nodes.build_presentation_node]
-  J --> K[api.responses.response_from_graph]
+  S([START]) --> V[validate_identity]
+  V --> L[load_tools]
+  L --> F[fetch_context]
+  F --> A[agent]
+  A -->|tool_calls| T[tools]
+  T --> A
+  A -->|action_form| P[prepare_action]
+  A -->|presentation_intent| SP[select_presentation]
+  SP --> B[build_presentation]
+  A -->|message only| E([END])
+  P --> E
+  B --> E
 ```
 
-Modules: `api/__init__.py`, `agent/nodes.py`, `agent/retrieval.py`,
+`nodes.route_after_agent` picks the branch in one fixed precedence — tool calls,
+then a form, then a presentation intent, then `END` — and every protocol value
+it reads was re-normalized first (`a2ui_actions/forms.py:normalize_form_name`,
+`services/financial_presentation/intents.py:normalize_action_intent`), so a
+hallucinated name becomes "no branch" rather than an unchecked call.
+
+The topology only makes each outcome reachable; it does not classify the
+request. Flows 2, 3 and 4 are the three product flows those branches compose.
+
+---
+
+## 2. Information flow
+
+`query -> agent reasoning -> search_tools when needed -> 1..N tools -> execute
+-> interpret -> A2UI`
+
+The default path for "¿Cuánto dinero tengo?" and "¿En qué gasté este mes?".
+
+```mermaid
+flowchart TD
+  A[api._route_request<br/>route.selected route=graph] --> B[graph.ainvoke]
+  B --> C[validate_identity_node<br/>require_current_user_id]
+  C --> D[make_load_tools_node<br/>mcp_client.list_remote_tools]
+  D --> E[fetch_context_node<br/>mcp_client.fetch_user_context]
+  E --> F[agent_node -> gemini.generate]
+  F -->|tool_calls| G[tools_node<br/>tool_loop.run_pending_tools]
+  G --> F
+  F -->|presentation_intent| H[select_presentation_node]
+  H --> I[build_presentation_node]
+  I --> J[api.responses.response_from_graph]
+```
+
+Modules: `api/__init__.py`, `agent/nodes.py`, `agent/gemini.py`,
 `agent/tool_loop.py`, `services/financial_presentation/`.
+
+The model decides whether data is needed at all, which capabilities provide it,
+how many, and whether the turn ends in a presentation or plain prose. It selects
+a `presentation_intent` from the 13-value vocabulary; it never renders a figure.
 
 Invariants: identity is validated before any load or read; `fetch_context_node`
 retains the scoped rows it read so a later domain read does not fetch them
-again; a failed context produces the fallback profile with **no** balances, and
-the agent answers without figures.
+again; a failed context produces `nodes.FALLBACK_PROFILE`, which carries **no**
+balances, and the agent answers without figures (flow 10). An explicitly
+requested view (`requested_intent`, set only by flow 9) outranks the model's
+own choice.
 
 ---
 
-## 2. Deterministic financial fast path
+## 3. Direct action flow
 
-The branch inside flow 1 that never reaches Gemini.
+`query -> agent reasoning -> prepare action -> A2UI form
+-> explicit user interaction -> MCP execution -> updated state -> updated A2UI`
+
+"Crea un presupuesto" needs no data first: the model answers with
+`action_form`, and MCP is asked to *prepare* — never to save.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as api
+  participant G as agent_node
+  participant PA as prepare_action_node
+  participant M as MCP
+  C->>A: POST /chat {query: "Crea un presupuesto"}
+  A->>G: graph.ainvoke
+  G-->>G: _Intent.action_form = "budget.create"<br/>decision=model_action_form
+  G->>PA: route_after_agent -> prepare_action
+  PA->>M: a2ui_form {name: "budget.create"}
+  M-->>PA: form surface (_meta.ui -> flow 9)
+  PA-->>A: final_tool_execution
+  A-->>C: response_from_graph -> response_from_tool
+  C->>C: user fills the fields, presses Guardar
+  C->>A: POST /chat {action: {…}}  (flow 10)
+  A->>M: a2ui_action, allowlisted + trustedScope + actionProof
+  M-->>A: data.actionResult {status, message, code?}
+  A-->>C: response_from_tool, relayed as-is
+```
+
+Modules: `agent/gemini.py:_Intent.action_form`, `a2ui_actions/forms.py`,
+`agent/nodes.py:make_prepare_action_node`, `api/actions.py`.
+
+The vocabulary is the four names `a2ui_form` accepts — `budget.create`,
+`budget.load`, `savings_goal.create`, `savings_goal.load`
+(`ACTION_FORM_NAMES`). It is declared to Gemini as an enum (`_ActionForm`) and
+re-validated by `normalize_form_name` both in `route_after_agent` and inside
+`prepare_action_node`, so a name outside the set can only become "no form".
+`.update` is deliberately absent: MCP derives an update form from the matching
+`.load`.
+
+Invariants: preparing a form is not performing its write — `a2ui_form` reads
+current values and returns a surface, and only a later user Button event reaches
+an action handler (flow 10). The model never receives `a2ui_action`.
+
+---
+
+## 4. Action-with-data flow
+
+`query -> agent reasoning -> search_tools -> 1..N tools -> interpret results
+-> prepare action -> A2UI form -> explicit user interaction -> MCP execution
+-> updated state -> updated A2UI`
+
+The same as flow 3, except the model reads data first — "ajusta mi presupuesto
+a lo que realmente gasto" needs `analyze_spending` (and possibly
+`get_budget_progress`) before a form is worth preparing. Mechanically it is
+flow 2's tool loop followed by flow 3's `prepare_action`, because the graph lets
+the `agent` node reach either branch from the same state:
 
 ```mermaid
 flowchart LR
-  A[nodes._agent_turn] --> B{normalize_action_intent<br/>or classify_financial_request}
-  B -->|intent| C[retrieval.financial_data_turn]
-  B -->|none| D[model.generate]
-  C --> E{tool already observed?}
-  E -->|no| F[one tool call<br/>decision=financial_retrieval]
-  E -->|yes| G[no call<br/>decision=financial_ready]
+  A[agent] -->|tool_calls| T[tools]
+  T --> A
+  A -->|action_form after observations| P[prepare_action]
+  P --> E([END])
 ```
 
-Modules: `agent/nodes.py:_agent_turn`,
-`services/financial_presentation/intents.py:classify_financial_request`,
-`agent/retrieval.py`.
-
-`retrieval.financial_data_turn` maps the intent to exactly one capability
-(`_TOOL_BY_INTENT`, refined for statements/beneficiaries/alerts), adds bilingual
-query refinements (`period`, `merchant_query`, `category`, `days_ahead`), and
-returns at most one call. `debts` + a comparison phrase reads
-`get_debt_overview` first and only then `compare_debt_scenarios`, using a debt
-id from this user's own overview.
-
-Invariants: no `search_tools` round trip, no model turn, no `model.gemini` stage
-in the log — `decision=financial_retrieval` with nothing after it *is* the fast
-path. The capability set is the scoped-execution boundary, never the set of
-schemas the model was handed.
+The prompt says so explicitly: ask for data with the tools first only if
+something is missing; if the context is already there, prepare the form
+directly. Nothing in the graph forces a tool round trip before a form, and
+nothing forbids one.
 
 ---
 
-## 3. Unclassified request using `search_tools -> call_tool`
+## 5. Tool discovery and multi-tool selection
 
 ```mermaid
 sequenceDiagram
@@ -89,19 +187,19 @@ sequenceDiagram
   participant G as gemini.GeminiToolAwareModel
   participant L as tool_loop.run_pending_tools
   participant M as MCP
-  N->>G: generate(query, profile, model_visible tools, observations)
-  G-->>N: tool_calls = [search_tools("deudas pendientes")]
+  N->>G: generate(query, model_profile, model-visible tools, observations)
+  G-->>N: tool_calls = [search_tools("outstanding debt balances")]
   N->>L: run_pending_tools
   L->>M: search_tools
-  M-->>L: tool definitions
+  M-->>L: up to five candidate tool definitions
   L->>L: tool_visibility.discovered_tool_schemas (strip scope)
   L-->>N: observation
   N->>G: generate(... + observation)
-  G-->>N: tool_calls = [call_tool{name, arguments}]
+  G-->>N: tool_calls = [call_tool{...}, call_tool{...}]
   N->>L: run_pending_tools
-  L->>M: call_tool envelope, scoped inside
-  M-->>L: domain result
-  L-->>N: observation labelled by the domain tool
+  L->>M: each call_tool envelope, scoped inside
+  M-->>L: domain results
+  L-->>N: one observation per call, labelled by the domain tool
   N->>G: generate(... + observations)
   G-->>N: bounded _Intent answer
 ```
@@ -109,17 +207,36 @@ sequenceDiagram
 Modules: `agent/nodes.py`, `agent/gemini.py`, `agent/tool_visibility.py`,
 `agent/tool_loop.py`, `mcp_client/trusted_scope.py:resolve_tool_call`.
 
+**Multi-tool selection is the model's decision.** `search_tools` returns several
+ranked candidates and the prompt tells the model to evaluate them and call as
+many as the question genuinely needs. One iteration of the loop executes all the
+calls it was handed; `gemini.MAX_CALLS_PER_TURN` (6) only stops a runaway
+fan-out. `nodes.MAX_TOOL_TURNS` (8) bounds the number of iterations.
+
+**Search queries are English.** The MCP catalog is English-only and BM25 is
+lexical, so the prompt asks the model to translate the user's Spanish intent
+into an English query (`"spending by category"`, not `"gastos por categoría"`).
+MCP additionally folds Spanish domain words onto English catalog vocabulary on
+the query side only (`hackmty2026-mcp/src/supabase_mcp/discovery.py`), so a
+Spanish query still retrieves; the prompt instruction is what makes ranking
+good rather than merely non-zero.
+
 Invariants: the model is offered only what the server declares model-visible —
-under progressive discovery, the two synthetic tools, never the 15 financial
+under progressive discovery the two synthetic tools, never the 15 financial
 schemas. Schemas returned by `search_tools` are stripped of their trusted
 `scope` fields before the model sees them. `resolve_tool_call` unwraps the
 envelope (including the re-wrapped and wrapper-dropped variants Gemini emits) so
 scoping, logging and routing all reason about the inner domain tool. Repeating
 an identical successful search is skipped (`observations.already_searched`).
 
+What the model sees of the *user* is one field: `gemini.model_profile` projects
+`UserProfile` down to `literacy_level`. Balances, overdraft risk, recurring
+expenses and appearance preferences never enter a prompt — the trusted builder
+renders every figure from MCP observations, and the client owns appearance.
+
 ---
 
-## 4. MCP tool execution loop
+## 6. MCP tool execution loop
 
 ```mermaid
 flowchart TD
@@ -143,17 +260,21 @@ flowchart TD
 Modules: `agent/tool_loop.py`, `mcp_client/execution.py`,
 `mcp_client/trusted_scope.py`, `services/a2ui_bridge.py`.
 
-Invariants: two independent permission sources — the model may only use
-model-visible advertised tools, the deterministic planner only the scoped
-financial set. Every call that runs produces an observation, success or failure,
-so a later stage can distinguish "MCP said nothing" from "MCP was never asked".
-`raise_on_error=False` keeps sanitized error results instead of turning them
-into generic transport failures. The loop is bounded by
-`nodes.MAX_TOOL_TURNS` (8).
+Invariants: `_permitted_tool_names` admits a call only if its outer name is
+either something the server advertised as model-visible or one of the 15
+`FINANCIAL_DOMAIN_TOOL_NAMES` (addressable directly on a deployment that pins
+them); that gate is independent of `SCOPED_TOOL_NAMES`, which decides whose data
+a call may touch. Every call that runs produces an observation, success or
+failure, so a later stage can distinguish "MCP said nothing" from "MCP was never
+asked". `raise_on_error=False` keeps sanitized error results instead of turning
+them into generic transport failures. `_PRESENTATION_TOOL_NAMES`
+(`visualize_allowed_data`, `database_overview`) are the tools whose own A2UI
+*is* the answer; retaining one ends the turn through flow 10's
+`decision=tool_presentation`.
 
 ---
 
-## 5. Provenance and final validation
+## 7. Provenance and final validation
 
 ```mermaid
 flowchart TD
@@ -176,6 +297,11 @@ Modules: `agent/nodes.py`, `agent/observations.py:retained_observations`,
 `services/financial_presentation/{intents,verified_rows,views,builder,surface}.py`,
 `schemas/banking_view.py`, `schemas/a2ui.py`.
 
+`select_presentation_intent` is the one remaining refinement, and it is not a
+classifier: a `transactions` request phrased as a spending question is upgraded
+to `spending-analysis` only once the rows to analyse are actually present, and
+never when `action_requested` pinned the intent.
+
 Invariants: only observations reach the views, and only through
 `verified_rows.rows_for_table`, which skips errored observations and drops rows
 that fail their contract checks. An unverifiable or mixed-currency dataset
@@ -185,7 +311,7 @@ before it can leave.
 
 ---
 
-## 6. Finance v2 presentation generation
+## 8. Finance v2 presentation generation
 
 ```mermaid
 flowchart LR
@@ -209,16 +335,22 @@ collapse onto the visual categories and are summed before the view is built,
 because the contract allows one row per visual category.
 
 Invariants: the component tree, surface id, catalog id and action name are
-constants in `surface.py` — Gemini never generates or edits raw A2UI. The one
-follow-up button dispatches `request_financial_view` with an intent from the
-finite vocabulary. `financial-summary` shows masked cards (last four only) and
-only for accounts included in that same summary.
+constants in `surface.py` — Gemini never generates or edits raw A2UI. This is
+the surface the client renders for the flow-2 path, and it is built entirely
+in-process: no `resources/read`, and MCP's `present_financial_view` /
+`a2ui://finance/view` resource is not involved. Every component carries an
+`accessibility.label` bound to `/viewLabel` or `/actionLabel`, mirroring
+MCP's own `templates/financial_view.json` so the cross-repo parity guard stays
+meaningful. The one follow-up button dispatches `request_financial_view` with an
+intent from the finite vocabulary. `financial-summary` shows masked cards (last
+four only) and only for accounts included in that same summary.
 
 ---
 
-## 7. MCP-produced A2UI bridge path
+## 9. MCP-produced A2UI bridge path
 
-Used by domain tools that own their own surface, such as `database_overview`.
+Used by anything that owns its own surface: `database_overview`,
+`visualize_allowed_data`, and the `a2ui_form` surfaces of flows 3 and 4.
 
 ```mermaid
 flowchart TD
@@ -249,7 +381,7 @@ Mobile treats each response as a self-contained replacement.
 
 ---
 
-## 8. A2UI action re-entry
+## 10. A2UI action transport and re-entry
 
 ```mermaid
 sequenceDiagram
@@ -263,7 +395,7 @@ sequenceDiagram
   M-->>A: {ok, trustedScope, request:{intent}}
   A->>A: actions.trusted_financial_intent
   alt name != request_financial_view
-    A-->>C: responses.response_from_tool (relayed as-is)
+    A-->>C: responses.response_from_tool (relayed as-is, with data.actionResult)
   else untrusted or unnormalized result
     A-->>C: invalid_action_response("untrusted_action_result")
   else trusted intent
@@ -281,18 +413,55 @@ Invariants: actions never enter the LLM. The trusted UUID travels in a separate
 an HMAC `actionProof` that a client cannot forge. Re-entry requires all of: MCP
 reported success, it echoed a trusted scope naming *this* authenticated user,
 and the intent is one of the shared contract's. `action_requested=True` also
-pins `select_presentation_intent` to the requested intent, so an explicit
-action is never silently upgraded to a different view.
-
-Two plain-text queries also bypass the graph before it is ever invoked
-(`api/query_routing.py`): a form request
-(`a2ui_actions/routing.py:requested_form` → MCP `a2ui_form`, which saves
-nothing) and a database-metadata request (`requests_database_overview` → MCP
-`database_overview`, relayed through flow 7).
+pins `select_presentation_intent` to the requested intent, so an explicit action
+is never silently upgraded to a different view. `request_financial_view` is the
+only name that re-enters the graph; the budget and savings-goal writes of flows
+3 and 4 are relayed straight back as `data.actionResult`, which is how the
+client learns that HTTP 200 did or did not mean "saved".
 
 ---
 
-## 9. Bounded conversational and unsupported requests
+## 11. Lifecycle progress events
+
+`POST /api/v1/agent/chat/stream` answers `application/x-ndjson` with one JSON
+object per line: zero or more `{"type":"agent_status","status":"<id>"}`, then
+exactly one `{"type":"result","result":{<ChatResponse>}}`. `POST
+/api/v1/agent/chat` is unchanged and returns that envelope alone.
+
+The vocabulary is exactly eight ids, declared in `agent/status.py`:
+
+| Status id | Emitted by |
+| --- | --- |
+| `interpreting` | `validate_identity_node`; `agent_node` before its first model turn |
+| `discovering_tools` | `tools_node` when a pending call is `search_tools` |
+| `selecting_tools` | `agent_node` when the last observation came from `search_tools` |
+| `executing_tools` | `tools_node` for domain calls |
+| `interpreting_results` | `agent_node` when domain observations are present |
+| `preparing_action` | `prepare_action_node`, before `a2ui_form` |
+| `building_ui` | `build_presentation_node`; `prepare_action_node` after MCP answers |
+| `validating_ui` | either of those two, once a bundle exists |
+
+Transport is LangGraph's custom stream channel
+(`langgraph.config.get_stream_writer` inside a node, consumed with
+`graph.astream(stream_mode=["custom","values"])`).
+`api/__init__.py:_status_line` is the security boundary: it allowlists the
+payload, so a node cannot widen the channel into a reasoning one — only the
+discriminator and a known id are ever forwarded. `emit_status` is a no-op when
+nobody is streaming, so `/chat` and the tests run the graph unchanged.
+
+Consecutive duplicate ids are possible and mean one state; `interpreting` is
+emitted twice on a normal turn. The status ids carry no prompt text, reasoning,
+tool names, arguments or rows. **User-facing copy is client-owned** and lives in
+one map in the mobile repo,
+`HackMTY2026_Mobile/src/features/assistant/agent-status.ts`; nothing in this
+repository should be edited to change what the user reads.
+
+A structured action turn is not streamed phase by phase — it is dispatched
+through `_route_request` like `/chat` and reported as a single `result` line.
+
+---
+
+## 12. Bounded conversational and unsupported requests
 
 ```mermaid
 flowchart TD
@@ -304,10 +473,11 @@ flowchart TD
   F -->|yes| G[decision=loop_limit<br/>'límite seguro de pasos']
   F -->|no| H[gemini.generate]
   H --> I{tool calls?}
-  I -->|yes| J[decision=model_tool_calls -> flow 4]
-  I -->|no + intent| K[decision=model_presentation -> flow 5]
-  I -->|no| L[decision=model_message<br/>bounded text, a2ui = null]
-  H -->|API failure| M["'No pude generar una respuesta<br/>personalizada en este momento.'"]
+  I -->|yes| J[decision=model_tool_calls -> flow 6]
+  I -->|no + action_form| K[decision=model_action_form -> flow 3]
+  I -->|no + intent| L[decision=model_presentation -> flow 7]
+  I -->|no| M[decision=model_message<br/>bounded text, a2ui = null]
+  H -->|API failure| N["'No pude generar una respuesta<br/>personalizada en este momento.'"]
 ```
 
 Modules: `agent/nodes.py:_agent_turn` and `_from_model_turn`,
@@ -316,10 +486,10 @@ Modules: `agent/nodes.py:_agent_turn` and `_from_model_turn`,
 Invariants: a chat answer carries no surface (`a2ui: null`) and no invented
 figures. A missing user context is reported as such rather than filled with a
 fallback balance. A Gemini failure in the tool phase still lets the answer phase
-run; a failure in the answer phase falls back to a fixed message and leaves the
-deterministic policies available. An unsupported-but-recognised financial intent
-reaches `builder.build_financial_presentation` with no view builder and renders
-an explicit empty view saying data is missing — never a fabricated one.
+run; a failure in the answer phase falls back to a fixed message. An
+unsupported-but-recognised financial intent reaches
+`builder.build_financial_presentation` with no view builder and renders an
+explicit empty view saying data is missing — never a fabricated one.
 
 ---
 
@@ -329,11 +499,22 @@ Stage names are stable and grep-friendly; the mapping to this document:
 
 | Stage / event | Flow |
 | --- | --- |
-| `http.auth`, `route.selected` | preamble, 8 |
-| `node.load_tools`, `node.fetch_context` | 1 |
-| `node.agent` + `decision=` | 2, 3, 9 |
-| `model.gemini` | 3, 9 |
-| `node.tools`, `tool.call`, `tool.rejected`, `tool.skipped` | 4 |
-| `mcp.call`, `mcp.a2ui_bridge`, `a2ui.template`, `a2ui.resource_read` | 4, 7 |
-| `node.select_presentation`, `node.build_presentation` | 5, 6 |
+| `http.auth`, `http.identity_mismatch` | preamble |
+| `route.selected` (`route=graph`, `graph_stream`, `action`, `action_graph`) | preamble, 10, 11 |
+| `graph.invoke`, `graph.stream` | preamble, 11 |
+| `node.load_tools`, `node.fetch_context` | 2 |
+| `node.agent` + `decision=` | 2, 5, 12 |
+| `model.gemini` | 2, 5, 12 |
+| `node.tools`, `tool.call`, `tool.rejected`, `tool.skipped`, `tool.failed` | 6 |
+| `mcp.connect`, `mcp.list_tools`, `mcp.user_context`, `mcp.call`, `mcp.tools_cache`, `mcp.a2ui_bridge` | 2, 6, 9 |
+| `a2ui.template`, `a2ui.resource_read` | 9 |
+| `node.prepare_action` | 3, 4 |
+| `node.select_presentation`, `node.build_presentation` | 7, 8 |
+| `route.action` | 10 |
 | `graph.route`, `graph.output`, `client.response` | all |
+
+`node.agent` `decision=` values are `no_context`, `tool_presentation`,
+`loop_limit`, `model_tool_calls`, `model_action_form`, `model_presentation` and
+`model_message`. There is no `decision=financial_retrieval` or
+`decision=financial_ready`, and no `route.selected route=database_overview` or
+`route=action_form`: those belonged to the deleted deterministic router.

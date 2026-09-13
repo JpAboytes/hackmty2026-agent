@@ -18,11 +18,30 @@ from ...state import UserProfile
 _SUPPORTED_CURRENCIES = frozenset({"MXN", "USD"})
 
 
+#: Which domain tool returns the same entity a scoped `select_rows` would, and
+#: under which payload key. The model chooses the capability, so the reader has
+#: to recognise every capability that returns a given entity - not just one.
+#: `get_financial_overview` is absent on purpose: it returns per-currency
+#: aggregates, not account rows.
+_DOMAIN_ROW_SOURCES: dict[tuple[object, str], str] = {
+    ("get_transactions", "transactions"): "transactions",
+    ("get_accounts", "accounts"): "accounts",
+    ("get_bank_statements", "bank_statements"): "statements",
+    ("get_beneficiaries", "beneficiaries"): "beneficiaries",
+    ("get_transaction_disputes", "transaction_disputes"): "disputes",
+    ("get_budget_progress", "budgets"): "budgets",
+    ("get_savings_progress", "savings_goals"): "goals",
+    ("get_debt_overview", "debts"): "debts",
+    ("get_upcoming_payments", "upcoming_payments"): "items",
+    ("get_financial_alerts", "financial_alerts"): "alerts",
+}
+
+
 def rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> list[dict[str, Any]]:
     """Every verified row for one table, deduplicated by identifier.
 
-    Both shapes count as the same table: a scoped ``select_rows`` read, and the
-    domain tool that returns the same entity (``get_transactions``).
+    Both shapes count as the same table: a scoped ``select_rows`` read, and any
+    domain tool that returns the same entity (see ``_DOMAIN_ROW_SOURCES``).
     """
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -31,13 +50,15 @@ def rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> lis
             continue
         arguments = observation.get("arguments")
         data = observation.get("data")
+        name = observation.get("name")
         raw_rows: object = None
-        if observation.get("name") == "select_rows":
+        if name == "select_rows":
             if not isinstance(arguments, Mapping) or arguments.get("table") != table:
                 continue
             raw_rows = data.get("rows") if isinstance(data, Mapping) else None
-        elif observation.get("name") == "get_transactions" and table == "transactions":
-            raw_rows = data.get("transactions") if isinstance(data, Mapping) else None
+        elif _DOMAIN_ROW_SOURCES.get((name, table)) is not None:
+            key = _DOMAIN_ROW_SOURCES[(name, table)]
+            raw_rows = data.get(key) if isinstance(data, Mapping) else None
         if not isinstance(raw_rows, list):
             continue
         for raw in raw_rows:

@@ -492,3 +492,41 @@ async def test_zero_seconds_turns_the_cache_off(
     await list_remote_tools()
 
     assert calls == [1, 1]
+
+
+def test_an_accessibility_preference_survives_and_defaults_when_absent() -> None:
+    """A stored preference must not be silently dropped, or fail the context.
+
+    `color_vision_mode` is stored and seeded, but the profile builder used to
+    drop it. A row written before the column existed must still yield a usable
+    profile, so preference columns default instead of invalidating the context.
+    """
+    from fluidbank_orchestrator.mcp_client.user_context import _DEFAULT_PREFERENCES, _profile
+
+    accounts = [
+        {
+            "id": "a1",
+            "account_type": "checking",
+            "currency": "MXN",
+            "available_balance": 10,
+        }
+    ]
+
+    stored = _profile(
+        {
+            "literacy_level": "low",
+            "font_scale": "xl",
+            "contrast": "high",
+            "color_vision_mode": "deuteranopia",
+            "hit_target": "large",
+        },
+        accounts,
+        [],
+    )
+    assert stored["color_vision_mode"] == "deuteranopia"
+    assert stored["font_scale"] == "xl"
+
+    legacy = _profile({"literacy_level": "low"}, accounts, [])
+    assert legacy["color_vision_mode"] == _DEFAULT_PREFERENCES["color_vision_mode"] == "none"
+    assert legacy["literacy_level"] == "low"
+    assert legacy["hit_target"] == _DEFAULT_PREFERENCES["hit_target"]
