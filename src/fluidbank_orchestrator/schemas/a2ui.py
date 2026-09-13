@@ -117,6 +117,35 @@ class _ButtonComponent(_ComponentBase):
     action: _ServerAction
 
 
+class _TextFieldComponent(_ComponentBase):
+    component: Literal["TextField"]
+    label: DynamicString
+    value: _Binding
+    variant: Literal["shortText", "longText", "number", "obscured"] | None = None
+
+
+class _DateInputComponent(_ComponentBase):
+    component: Literal["DateTimeInput"]
+    label: DynamicString | None = None
+    value: _Binding
+    enable_date: Literal[True] = Field(alias="enableDate")
+    enable_time: Literal[False] | None = Field(default=None, alias="enableTime")
+
+
+class _SliderComponent(_ComponentBase):
+    component: Literal["Slider"]
+    label: DynamicString | None = None
+    value: _Binding
+    min: StrictInt | StrictFloat = 0
+    max: StrictInt | StrictFloat
+
+    @model_validator(mode="after")
+    def valid_range(self) -> _SliderComponent:
+        if not isfinite(self.min) or not isfinite(self.max) or self.max <= self.min:
+            raise ValueError("invalid slider range")
+        return self
+
+
 class _CardComponent(_ComponentBase):
     component: Literal["Card"]
     child: Identifier
@@ -249,7 +278,10 @@ class _BankingViewComponent(_ComponentBase):
 
 
 Component = (
-    _TextComponent
+    _TextFieldComponent
+    | _DateInputComponent
+    | _SliderComponent
+    | _TextComponent
     | _ButtonComponent
     | _CardComponent
     | _ColumnComponent
@@ -433,7 +465,9 @@ _SDK_VALIDATORS = {
     ),
 }
 _COMPONENTS_BY_CATALOG = {
-    A2UI_BASIC_CATALOG: frozenset({"Text", "Button", "Card", "Column"}),
+    A2UI_BASIC_CATALOG: frozenset(
+        {"Text", "Button", "Card", "Column", "TextField", "DateTimeInput", "Slider"}
+    ),
     A2UI_FINANCE_CATALOG: frozenset({"Text", "Button", "Card", "Column", "Chart"}),
     A2UI_FINANCE_V2_CATALOG: frozenset(
         {"Text", "Button", "Card", "Column", "Chart", "BankingView"}
@@ -661,8 +695,7 @@ def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id
             intent_value = context.get("intent") if isinstance(context, Mapping) else None
             resolved_intent = (
                 _resolve_data_path(banking_data_model, intent_value["path"])
-                if isinstance(intent_value, Mapping)
-                and isinstance(intent_value.get("path"), str)
+                if isinstance(intent_value, Mapping) and isinstance(intent_value.get("path"), str)
                 else intent_value
             )
             if (

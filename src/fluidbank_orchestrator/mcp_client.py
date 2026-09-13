@@ -224,6 +224,7 @@ SCOPED_TOOL_NAMES = frozenset(
         "select_rows",
         "visualize_allowed_data",
         "a2ui_action",
+        "a2ui_form",
         *FINANCIAL_DOMAIN_TOOL_NAMES,
     }
 )
@@ -304,6 +305,25 @@ def enforce_trusted_user_scope(
         scoped["request"] = request
     else:
         scoped["trustedScope"] = canonical_scope
+        if tool_name == "a2ui_action":
+            # Server-to-server proof is never part of the A2UI context or model input.
+            import hashlib
+            import hmac
+
+            scoped.pop("actionProof", None)
+            secret = os.environ.get("MCP_ACTIONS_SECRET", "")
+            if len(secret) >= 32:
+                signed = {
+                    key: scoped.get(key)
+                    for key in ("name", "surfaceId", "sourceComponentId", "timestamp", "context")
+                }
+                signed["user_id"] = canonical_user_id
+                encoded = json.dumps(
+                    signed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode()
+                scoped["actionProof"] = hmac.new(
+                    secret.encode(), encoded, hashlib.sha256
+                ).hexdigest()
     return scoped
 
 

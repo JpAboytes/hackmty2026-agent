@@ -1,0 +1,31 @@
+{
+  "version": "v0.9.1",
+  "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json",
+  "inputs": [
+    {
+      "type": "text",
+      "component": "TextField",
+      "valueType": "string",
+      "variant": "shortText"
+    },
+    {
+      "type": "date",
+      "component": "DateTimeInput",
+      "valueType": "string",
+      "format": "date",
+      "enableDate": true,
+      "enableTime": false
+    },
+    {
+      "type": "slider",
+      "component": "Slider",
+      "valueType": "number"
+    },
+    {
+      "type": "button",
+      "component": "Button",
+      "role": "submit",
+      "action": "event"
+    }
+  ]
+}

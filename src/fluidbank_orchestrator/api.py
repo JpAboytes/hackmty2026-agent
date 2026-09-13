@@ -289,6 +289,17 @@ async def _route_request(
         return _logged(_response_from_tool(action_execution), route="action")
 
     assert query is not None
+    from .a2ui_actions.routing import requested_form
+
+    form_name = requested_form(query)
+    if form_name is not None:
+        try:
+            execution = await execute_remote_tool(
+                "a2ui_form", {"name": form_name}, current_user_id=current_user_id
+            )
+            return _logged(_response_from_tool(execution), route="action_form")
+        except (MCPConfigurationError, UserContextError):
+            return _unavailable_response()
     if _requests_database_overview(query):
         event("route.selected", route="database_overview")
         try:

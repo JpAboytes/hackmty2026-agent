@@ -190,3 +190,11 @@ docker build -t fluidbank-orchestrator:local .
 docker run --rm -p 8080:8080 --env-file .env fluidbank-orchestrator:local
 curl http://127.0.0.1:8080/health
 ```
+
+## A2UI input forms
+
+The Expo renderer supports a strict Basic v0.9.1 subset of TextField, DateTimeInput (date only), Slider and Button. Requests such as “Crea un presupuesto”, “Edita un presupuesto”, “Crea una meta de ahorro” and “Edita mi meta de ahorro” deterministically prepare the matching MCP `a2ui_form`; this preparation does not save anything. Editing asks for the existing name and loads its owned data. Save submits a structured `action` in the authenticated HTTP body, using the five A2UI fields and explicit resolved context. The orchestrator supplies trustedScope from the verified token; model-supplied ownership never wins. The LLM cannot call a2ui_action. The MCP returns data.actionResult and the client displays success/failure rather than interpreting HTTP 200 as successful persistence.
+
+Canonical input/action JSON is packaged under `a2ui_actions/`, synchronized from the MCP contract. The agent validates forms with the official A2UI 0.9.1 SDK. Saving requires the new MCP code, action SQL and dedicated write-role configuration; this source change does not deploy them.
+
+Set the same random `MCP_ACTIONS_SECRET` (at least 32 characters) on agent and MCP. The orchestrator signs the event plus verified user ID before forwarding it over the existing Horizon connection. This server-only signature never enters the A2UI context or the model; the MCP rejects unsigned or modified write requests.

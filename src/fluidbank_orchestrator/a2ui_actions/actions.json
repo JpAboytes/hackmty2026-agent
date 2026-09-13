@@ -1,0 +1,290 @@
+{
+  "version": 1,
+  "protocolVersion": "v0.9.1",
+  "actions": [
+    {
+      "name": "budget.create",
+      "surfaceId": "budget-create",
+      "sourceComponentId": "submit",
+      "title": "Crear presupuesto",
+      "submitLabel": "Crear",
+      "inputCount": 5,
+      "inputs": [
+        {
+          "key": "name",
+          "input": "text",
+          "label": "Nombre del presupuesto",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "category",
+          "input": "text",
+          "label": "Categoría: alimentos, restaurantes, transporte, servicios, salud o vivienda",
+          "required": true,
+          "default": "alimentos"
+        },
+        {
+          "key": "limit_amount",
+          "input": "slider",
+          "label": "Límite en MXN",
+          "required": true,
+          "default": 3000,
+          "min": 1,
+          "max": 100000
+        },
+        {
+          "key": "start_date",
+          "input": "date",
+          "label": "Fecha de inicio",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "end_date",
+          "input": "date",
+          "label": "Fecha final",
+          "required": true,
+          "default": ""
+        }
+      ],
+      "contextFields": [
+        "name",
+        "category",
+        "limit_amount",
+        "start_date",
+        "end_date"
+      ],
+      "requiresConfirmation": true,
+      "writes": true
+    },
+    {
+      "name": "budget.update",
+      "surfaceId": "budget-update",
+      "sourceComponentId": "submit",
+      "title": "Editar presupuesto",
+      "submitLabel": "Guardar cambios",
+      "inputCount": 5,
+      "inputs": [
+        {
+          "key": "name",
+          "input": "text",
+          "label": "Nombre del presupuesto",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "category",
+          "input": "text",
+          "label": "Categoría: alimentos, restaurantes, transporte, servicios, salud o vivienda",
+          "required": true,
+          "default": "alimentos"
+        },
+        {
+          "key": "limit_amount",
+          "input": "slider",
+          "label": "Límite en MXN",
+          "required": true,
+          "default": 3000,
+          "min": 1,
+          "max": 100000
+        },
+        {
+          "key": "start_date",
+          "input": "date",
+          "label": "Fecha de inicio",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "end_date",
+          "input": "date",
+          "label": "Fecha final",
+          "required": true,
+          "default": ""
+        }
+      ],
+      "contextFields": [
+        "name",
+        "category",
+        "limit_amount",
+        "start_date",
+        "end_date",
+        "id"
+      ],
+      "requiresConfirmation": true,
+      "writes": true
+    },
+    {
+      "name": "budget.load",
+      "surfaceId": "budget-load",
+      "sourceComponentId": "submit",
+      "title": "Seleccionar presupuesto",
+      "submitLabel": "Cargar datos",
+      "inputCount": 1,
+      "inputs": [
+        {
+          "key": "name",
+          "input": "text",
+          "label": "Nombre exacto del presupuesto",
+          "required": true,
+          "default": ""
+        }
+      ],
+      "contextFields": [
+        "name"
+      ],
+      "requiresConfirmation": false,
+      "writes": false
+    },
+    {
+      "name": "savings_goal.create",
+      "surfaceId": "savings_goal-create",
+      "sourceComponentId": "submit",
+      "title": "Crear meta de ahorro",
+      "submitLabel": "Crear",
+      "inputCount": 4,
+      "inputs": [
+        {
+          "key": "name",
+          "input": "text",
+          "label": "Nombre de la meta",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "target_amount",
+          "input": "slider",
+          "label": "Objetivo en MXN",
+          "required": true,
+          "default": 18000,
+          "min": 1,
+          "max": 1000000
+        },
+        {
+          "key": "target_date",
+          "input": "date",
+          "label": "Fecha objetivo",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "suggested_monthly_contribution",
+          "input": "slider",
+          "label": "Aportación mensual sugerida en MXN",
+          "required": true,
+          "default": 1500,
+          "min": 0,
+          "max": 100000
+        }
+      ],
+      "contextFields": [
+        "name",
+        "target_amount",
+        "target_date",
+        "suggested_monthly_contribution"
+      ],
+      "requiresConfirmation": true,
+      "writes": true
+    },
+    {
+      "name": "savings_goal.update",
+      "surfaceId": "savings_goal-update",
+      "sourceComponentId": "submit",
+      "title": "Editar meta de ahorro",
+      "submitLabel": "Guardar cambios",
+      "inputCount": 4,
+      "inputs": [
+        {
+          "key": "name",
+          "input": "text",
+          "label": "Nombre de la meta",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "target_amount",
+          "input": "slider",
+          "label": "Objetivo en MXN",
+          "required": true,
+          "default": 18000,
+          "min": 1,
+          "max": 1000000
+        },
+        {
+          "key": "target_date",
+          "input": "date",
+          "label": "Fecha objetivo",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "suggested_monthly_contribution",
+          "input": "slider",
+          "label": "Aportación mensual sugerida en MXN",
+          "required": true,
+          "default": 1500,
+          "min": 0,
+          "max": 100000
+        }
+      ],
+      "contextFields": [
+        "name",
+        "target_amount",
+        "target_date",
+        "suggested_monthly_contribution",
+        "id"
+      ],
+      "requiresConfirmation": true,
+      "writes": true
+    },
+    {
+      "name": "savings_goal.load",
+      "surfaceId": "savings_goal-load",
+      "sourceComponentId": "submit",
+      "title": "Seleccionar meta de ahorro",
+      "submitLabel": "Cargar datos",
+      "inputCount": 1,
+      "inputs": [
+        {
+          "key": "name",
+          "input": "text",
+          "label": "Nombre exacto de la meta",
+          "required": true,
+          "default": ""
+        }
+      ],
+      "contextFields": [
+        "name"
+      ],
+      "requiresConfirmation": false,
+      "writes": false
+    }
+  ],
+  "existingActions": [
+    {
+      "name": "refresh_database_overview",
+      "inputCount": 1,
+      "inputs": [
+        {
+          "key": "limit",
+          "input": "slider",
+          "required": true,
+          "min": 1,
+          "max": 50
+        }
+      ]
+    },
+    {
+      "name": "request_financial_view",
+      "inputCount": 1,
+      "inputs": [
+        {
+          "key": "intent",
+          "input": "text",
+          "required": true
+        }
+      ]
+    }
+  ]
+}
