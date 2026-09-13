@@ -146,6 +146,22 @@ def _gemini_safe_schema(node: Any) -> Any:
     return node
 
 
+def _api_failure_reason(exc: Exception) -> str:
+    """Bounded, non-sensitive label for a failed model call.
+
+    Only the transport code and the API's own status enum are logged. The
+    response body can echo prompt content, so it never reaches a log line.
+    """
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    parts = [type(exc).__name__]
+    if isinstance(code, int):
+        parts.append(str(code))
+    if isinstance(status, str) and status.isascii() and len(status) <= 64:
+        parts.append(status)
+    return "/".join(parts)
+
+
 class GeminiToolAwareModel:
     """Gemini adapter that receives the exact runtime MCP tool schemas."""
 
@@ -180,57 +196,109 @@ class GeminiToolAwareModel:
             observations=len(observations),
             prompt_chars=len(prompt),
         ) as step:
-            try:
-                response = await genai.Client().aio.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        tools=[types.Tool(function_declarations=declarations)]
-                        if declarations
-                        else None,
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                            disable=True
-                        ),
-                        response_mime_type="application/json",
-                        response_schema=_Intent,
-                    ),
-                )
-                usage = response.usage_metadata
-                if usage is not None:
-                    step.set(
-                        prompt_tokens=usage.prompt_token_count,
-                        output_tokens=usage.candidates_token_count,
-                    )
-                allowed = {tool.name for tool in tools}
-                calls: list[dict[str, Any]] = []
-                for function_call in response.function_calls or []:
-                    if function_call.name not in allowed:
-                        continue
-                    arguments = function_call.args
-                    if not isinstance(arguments, Mapping):
-                        continue
-                    calls.append({"name": function_call.name, "arguments": dict(arguments)})
-                if calls:
-                    step.set(decision="tool_calls", calls=",".join(call["name"] for call in calls))
-                    preview("model.gemini.calls", calls)
-                    return ModelTurn(message="", tool_calls=tuple(calls[:2]))
-                parsed = response.parsed
-                intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
-                step.set(
-                    decision="message",
-                    message_chars=len(intent.message),
-                    presentation_intent=intent.presentation_intent,
-                    months=intent.months,
-                )
-                return ModelTurn(
-                    message=intent.message,
-                    months=intent.months,
-                    presentation_intent=intent.presentation_intent,
-                )
-            except Exception as exc:  # noqa: BLE001 - deterministic policies remain available
-                step.set(decision="failed")
-                logger.warning("Gemini model turn failed (%s)", type(exc).__name__)
+            client = genai.Client()
+            calls = await self._tool_calls(client, model_name, prompt, declarations, tools, step)
+            if calls:
+                step.set(decision="tool_calls", calls=",".join(call["name"] for call in calls))
+                preview("model.gemini.calls", calls)
+                return ModelTurn(message="", tool_calls=tuple(calls[:2]))
+            turn = await self._answer(client, model_name, prompt, step)
+            if turn is not None:
+                return turn
         return ModelTurn(message="No pude generar una respuesta personalizada en este momento.")
+
+    async def _tool_calls(
+        self,
+        client: Any,
+        model_name: str,
+        prompt: str,
+        declarations: list[types.FunctionDeclaration],
+        tools: Sequence[MCPToolDefinition],
+        step: Any,
+    ) -> list[dict[str, Any]]:
+        """Ask only which tools to call.
+
+        The declarations and a structured `response_schema` cannot travel in the
+        same request: past a modest combined size Gemini answers 400
+        INVALID_ARGUMENT and the whole turn is lost. The financial domain tools
+        crossed that line, so every unclassified query fell back to the generic
+        apology with no data and no A2UI. Tool selection needs no response
+        schema, and the answer phase needs no tools.
+        """
+        if not declarations:
+            return []
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(function_declarations=declarations)],
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - the answer phase still runs
+            reason = _api_failure_reason(exc)
+            step.set(tool_phase="failed", tool_phase_reason=reason)
+            logger.warning("Gemini tool selection failed (%s)", reason)
+            return []
+        self._record_usage(response, step, prefix="tool_phase")
+        allowed = {tool.name for tool in tools}
+        calls: list[dict[str, Any]] = []
+        for function_call in response.function_calls or []:
+            if function_call.name not in allowed:
+                continue
+            arguments = function_call.args
+            if not isinstance(arguments, Mapping):
+                continue
+            calls.append({"name": function_call.name, "arguments": dict(arguments)})
+        return calls
+
+    async def _answer(
+        self, client: Any, model_name: str, prompt: str, step: Any
+    ) -> ModelTurn | None:
+        """Ask for the bounded `_Intent` answer, with no tools declared."""
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    response_mime_type="application/json",
+                    response_schema=_Intent,
+                ),
+            )
+            self._record_usage(response, step)
+            parsed = response.parsed
+            intent = parsed if isinstance(parsed, _Intent) else _Intent.model_validate(parsed)
+        except Exception as exc:  # noqa: BLE001 - deterministic policies remain available
+            reason = _api_failure_reason(exc)
+            step.set(decision="failed", reason=reason)
+            logger.warning("Gemini model turn failed (%s)", reason)
+            return None
+        step.set(
+            decision="message",
+            message_chars=len(intent.message),
+            presentation_intent=intent.presentation_intent,
+            months=intent.months,
+        )
+        return ModelTurn(
+            message=intent.message,
+            months=intent.months,
+            presentation_intent=intent.presentation_intent,
+        )
+
+    @staticmethod
+    def _record_usage(response: Any, step: Any, prefix: str = "") -> None:
+        usage = response.usage_metadata
+        if usage is None:
+            return
+        label = f"{prefix}_" if prefix else ""
+        step.set(
+            **{
+                f"{label}prompt_tokens": usage.prompt_token_count,
+                f"{label}output_tokens": usage.candidates_token_count,
+            }
+        )
 
 
 ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
@@ -334,8 +402,7 @@ def _normalized_query(value: str) -> str:
 
 def _has_tool_observation(state: GraphState, tool_name: str) -> bool:
     return any(
-        observation.get("name") == tool_name
-        for observation in state.get("tool_observations", [])
+        observation.get("name") == tool_name for observation in state.get("tool_observations", [])
     )
 
 
@@ -402,9 +469,7 @@ def _financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTur
             }
             if tool_name not in available or _has_tool_observation(state, tool_name):
                 return ModelTurn(message="")
-            return ModelTurn(
-                message="", tool_calls=({"name": tool_name, "arguments": arguments},)
-            )
+            return ModelTurn(message="", tool_calls=({"name": tool_name, "arguments": arguments},))
 
     if tool_name is None or _has_tool_observation(state, tool_name):
         return ModelTurn(message="")
@@ -414,9 +479,11 @@ def _financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTur
     if tool_name in {"get_financial_overview", "get_transactions", "analyze_spending"}:
         request["period"] = "current_month"
     elif tool_name == "get_cash_flow":
-        request["period"] = "last_6_months" if any(
-            term in text for term in ("seis", "six", "6 meses", "6 months")
-        ) else "last_12_months"
+        request["period"] = (
+            "last_6_months"
+            if any(term in text for term in ("seis", "six", "6 meses", "6 months"))
+            else "last_12_months"
+        )
     elif tool_name == "get_payment_activity":
         request["period"] = "last_90_days"
     if tool_name == "get_transactions" and "uber" in text:

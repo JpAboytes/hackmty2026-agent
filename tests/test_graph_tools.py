@@ -12,8 +12,11 @@ from mcp.types import TextContent
 
 import fluidbank_orchestrator.graph as graph_module
 from fluidbank_orchestrator.graph import (
+    GeminiToolAwareModel,
     ModelTurn,
     ToolAwareModel,
+    _api_failure_reason,
+    _Intent,
     _model_tool_schema,
     build_graph,
 )
@@ -400,3 +403,115 @@ async def test_unresolvable_user_never_receives_placeholder_money(
     assert result["user_profile"]["available_balance"] is None
     assert result["user_profile"]["owned_balances"] == {}
     assert "1,200" not in result["message"]
+
+
+class _FakeResponse:
+    def __init__(self, *, function_calls: list[Any] | None = None, parsed: Any = None) -> None:
+        self.function_calls = function_calls or []
+        self.parsed = parsed
+        self.usage_metadata = None
+
+
+class _FakeFunctionCall:
+    def __init__(self, name: str, args: Mapping[str, Any]) -> None:
+        self.name = name
+        self.args = dict(args)
+
+
+class _RecordingModels:
+    def __init__(self, outcomes: list[Any]) -> None:
+        self.outcomes = outcomes
+        self.configs: list[Any] = []
+
+    async def generate_content(self, *, model: str, contents: str, config: Any) -> _FakeResponse:
+        del model, contents
+        self.configs.append(config)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _fake_genai(monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]) -> _RecordingModels:
+    models = _RecordingModels(outcomes)
+    client = type("_Client", (), {"aio": type("_Aio", (), {"models": models})()})
+    monkeypatch.setattr(graph_module, "genai", type("_Genai", (), {"Client": lambda: client}))
+    return models
+
+
+def _declared_tools() -> list[MCPToolDefinition]:
+    return [
+        MCPToolDefinition(f"tool_{index}", "herramienta", {"type": "object", "properties": {}})
+        for index in range(25)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_declarations_and_the_response_schema_never_share_one_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gemini answers 400 when a large tool catalogue rides with a response schema.
+
+    Declaring the financial domain tools alongside `response_schema` lost every
+    unclassified turn, so the two concerns must travel in separate requests.
+    """
+    models = _fake_genai(
+        monkeypatch,
+        [_FakeResponse(), _FakeResponse(parsed=_Intent(message="listo"))],
+    )
+
+    turn = await GeminiToolAwareModel().generate(
+        query="¿Qué es el CAT?", profile=PROFILE, tools=_declared_tools(), observations=[]
+    )
+
+    assert turn.message == "listo"
+    tool_phase, answer_phase = models.configs
+    assert tool_phase.tools is not None
+    assert tool_phase.response_schema is None
+    assert tool_phase.response_mime_type is None
+    assert answer_phase.tools is None
+    assert answer_phase.response_schema is _Intent
+
+
+@pytest.mark.asyncio
+async def test_a_selected_tool_skips_the_answer_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = _fake_genai(
+        monkeypatch,
+        [_FakeResponse(function_calls=[_FakeFunctionCall("tool_3", {"limit": 5})])],
+    )
+
+    turn = await GeminiToolAwareModel().generate(
+        query="¿Cuánto debo?", profile=PROFILE, tools=_declared_tools(), observations=[]
+    )
+
+    assert turn.tool_calls == ({"name": "tool_3", "arguments": {"limit": 5}},)
+    assert len(models.configs) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_tool_phase_still_answers_the_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken tool catalogue must not cost the user their answer."""
+    models = _fake_genai(
+        monkeypatch,
+        [RuntimeError("tool declarations rejected"), _FakeResponse(parsed=_Intent(message="hola"))],
+    )
+
+    turn = await GeminiToolAwareModel().generate(
+        query="¿Qué es el CAT?", profile=PROFILE, tools=_declared_tools(), observations=[]
+    )
+
+    assert turn.message == "hola"
+    assert len(models.configs) == 2
+
+
+def test_a_failed_call_is_logged_by_bounded_code_and_status() -> None:
+    class _ClientError(Exception):
+        code = 400
+        status = "INVALID_ARGUMENT"
+
+    assert _api_failure_reason(_ClientError()) == "_ClientError/400/INVALID_ARGUMENT"
+    assert _api_failure_reason(RuntimeError("secreto")) == "RuntimeError"
