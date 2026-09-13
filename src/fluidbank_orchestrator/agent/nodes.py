@@ -395,13 +395,20 @@ async def build_presentation_node(state: GraphState) -> GraphState:
 
 
 def route_after_agent(state: GraphState) -> str:
-    """Tool calls loop back; a form prepares; an intent presents; else the turn ends."""
+    """Tool calls loop back; a form prepares; an intent presents; else the turn ends.
+
+    Presenting additionally requires that something was actually read this turn.
+    A presentation intent with an empty ledger means the model named a view
+    without any data behind it, and provenance is the one thing it does not get
+    to assert: with nothing retained there is nothing to render, so the turn
+    ends conversationally instead of publishing an empty surface.
+    """
     if state.get("tool_calls"):
         destination = "tools"
     elif normalize_form_name(state.get("action_form")) is not None:
         destination = "prepare_action"
     elif normalize_action_intent(state.get("presentation_intent")) is not None:
-        destination = "select_presentation"
+        destination = "select_presentation" if retained_observations(state) else END
     else:
         destination = END
     event("graph.route", node="agent", next=destination)

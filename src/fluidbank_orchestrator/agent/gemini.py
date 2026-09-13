@@ -77,7 +77,12 @@ Descubrimiento de herramientas / Tool discovery:
 4. Si las candidatas no sirven, vuelve a llamar search_tools con otra formulación.
 Los resultados de las herramientas vuelven a ti antes de construir cualquier respuesta.
 Cuando el usuario pide realizar una operación (crear o cambiar un presupuesto o una meta
-de ahorro), responde con action_form usando uno de estos nombres: {action_forms}.
+de ahorro, transferir dinero, pagar la tarjeta de crédito), responde con action_form
+usando uno de estos nombres: {action_forms}.
+Si el usuario menciona una cantidad o un destinatario, puedes sugerirlos en form_amount y
+form_recipient (form_recipient solo aplica a transfer.execute); son valores por omisión
+del formulario, que el usuario todavía tiene que confirmar. Si no los menciona, omítelos:
+nunca los inventes.
 Pide datos con las herramientas antes de preparar el formulario solo si te faltan; si ya
 tienes el contexto necesario, prepáralo directamente. Preparar un formulario no guarda
 nada: solo un evento del usuario guarda.
@@ -101,6 +106,13 @@ class _Intent(BaseModel):
     #: re-validated by `a2ui_actions.forms.normalize_form_name` downstream, so
     #: a value outside the enum can only become "no form".
     action_form: _ActionForm | None = None
+    #: Optional defaults for that form, taken from the user's own words. They
+    #: are deliberately unconstrained here - Gemini's structured-output schema
+    #: supports only a subset of JSON Schema, and a rejected request costs the
+    #: whole turn. `a2ui_actions.forms.normalize_form_arguments` applies the
+    #: bounds MCP accepts and drops anything outside them.
+    form_amount: float | None = None
+    form_recipient: str | None = None
 
 
 def _api_failure_reason(exc: Exception) -> str:
@@ -245,6 +257,8 @@ class GeminiToolAwareModel:
             months=intent.months,
             presentation_intent=intent.presentation_intent,
             action_form=intent.action_form,
+            form_amount=intent.form_amount,
+            form_recipient=intent.form_recipient,
         )
 
     @staticmethod
