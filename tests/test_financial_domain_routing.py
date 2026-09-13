@@ -242,3 +242,118 @@ def test_spending_categories_stay_within_the_eight_the_contract_allows() -> None
 
     assert len(view["categories"]) <= 8
     assert len({row["category"] for row in view["categories"]}) == len(view["categories"])
+
+
+def _summary_observations(card_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Context rows in the shape `fetch_user_context` retains them."""
+    return [
+        {
+            "name": "select_rows",
+            "arguments": {"schema": "public", "table": table},
+            "is_error": False,
+            "data": {"ok": True, "rows": rows},
+        }
+        for table, rows in (
+            (
+                "accounts",
+                [
+                    {
+                        "id": "checking-1",
+                        "account_type": "checking",
+                        "currency": "MXN",
+                        "available_balance": "13878.59",
+                    },
+                    {
+                        "id": "credit-1",
+                        "account_type": "credit",
+                        "currency": "MXN",
+                        "available_balance": "1500.00",
+                    },
+                ],
+            ),
+            ("cards", card_rows),
+        )
+    ]
+
+
+def test_a_balance_answer_carries_the_masked_cards_behind_the_totals() -> None:
+    """ "¿Cuál es mi saldo?" renders the plastic next to the amounts."""
+    observations = _summary_observations(
+        [
+            {
+                "id": "card-credit",
+                "account_id": "credit-1",
+                "display_name": "Oro de ejemplo",
+                "card_type": "credit",
+                "network": "mastercard",
+                "last_four": "9012",
+                "status": "active",
+                "expires_month": 12,
+                "expires_year": 2029,
+            },
+            {
+                "id": "card-debit",
+                "account_id": "checking-1",
+                "display_name": "Débito de ejemplo",
+                "card_type": "debit",
+                "network": "visa",
+                "last_four": "1234",
+                "status": "active",
+                "expires_month": 12,
+                "expires_year": 2029,
+            },
+        ]
+    )
+
+    view = build_financial_presentation("financial-summary", observations, _PROFILE).a2ui.messages[
+        2
+    ]["updateDataModel"]["value"]["view"]
+
+    assert view["totalOwnedBalance"] == 13878.59
+    assert [card["cardId"] for card in view["cards"]] == ["card-credit", "card-debit"]
+    assert view["cards"][0]["lastFour"] == "9012"
+    assert view["cards"][0]["expires"] == "2029-12"
+    # Every card points at an account this summary shows, which the contract requires.
+    owned = {account["accountId"] for account in view["accounts"]}
+    assert all(card["accountId"] in owned for card in view["cards"])
+
+
+def test_a_card_is_dropped_when_it_cannot_be_verified() -> None:
+    """Nothing is invented and nothing borrowed: unusable rows leave no card."""
+    observations = _summary_observations(
+        [
+            {
+                "id": "foreign",
+                "account_id": "someone-elses-account",
+                "display_name": "Tarjeta ajena",
+                "card_type": "credit",
+                "network": "visa",
+                "last_four": "4321",
+                "status": "active",
+            },
+            {
+                "id": "malformed-tail",
+                "account_id": "checking-1",
+                "display_name": "Terminación inválida",
+                "card_type": "debit",
+                "network": "visa",
+                "last_four": "12",
+                "status": "active",
+            },
+            {
+                "id": "unknown-network",
+                "account_id": "checking-1",
+                "display_name": "Red desconocida",
+                "card_type": "debit",
+                "network": "discover",
+                "last_four": "5678",
+                "status": "active",
+            },
+        ]
+    )
+
+    view = build_financial_presentation("financial-summary", observations, _PROFILE).a2ui.messages[
+        2
+    ]["updateDataModel"]["value"]["view"]
+
+    assert "cards" not in view

@@ -216,6 +216,17 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
                 },
             ],
             "subscriptions": [{"amount": "19.99", "status": "active"}],
+            "cards": [
+                {
+                    "id": "card-1",
+                    "account_id": "account-1",
+                    "display_name": "Tarjeta Oro",
+                    "card_type": "credit",
+                    "network": "mastercard",
+                    "last_four": "9012",
+                    "status": "active",
+                }
+            ],
         }
         return rows[table]
 
@@ -230,6 +241,7 @@ async def test_fetch_user_context_scopes_every_selection_to_user_id(
         ("accessibility_preferences", user_id),
         ("accounts", user_id),
         ("subscriptions", user_id),
+        ("cards", user_id),
     ]
     assert profile["available_balance"] == 1250.50
     assert profile["owned_balances"] == {"MXN": 1250.50}
@@ -268,6 +280,7 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
                 }
             ],
             "subscriptions": [],
+            "cards": [],
         }
         return rows[table]
 

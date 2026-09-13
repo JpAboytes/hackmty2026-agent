@@ -720,12 +720,23 @@ async def fetch_user_context(current_user_id: UUID) -> UserContext:
             # trip instead of four. Membership is still enforced: an id that
             # belongs to nobody returns no user row and fails below, and MCP
             # scopes every one of these selects server-side regardless.
-            async with stage("mcp.user_context", selects=4, concurrent=True):
-                user_rows, prefs_rows, account_rows, subscription_rows = await asyncio.gather(
+            async with stage("mcp.user_context", selects=5, concurrent=True):
+                (
+                    user_rows,
+                    prefs_rows,
+                    account_rows,
+                    subscription_rows,
+                    card_rows,
+                ) = await asyncio.gather(
                     _select(client, identity, "users", current_user_id),
                     _select(client, identity, "accessibility_preferences", current_user_id),
                     _select(client, identity, "accounts", current_user_id),
                     _select(client, identity, "subscriptions", current_user_id),
+                    # A balance answer shows the plastic beside the totals. The read
+                    # joins the concurrent context gather rather than costing the
+                    # summary a second turn, and `select_rows` is pinned precisely
+                    # because the orchestrator builds this context by name.
+                    _select(client, identity, "cards", current_user_id),
                 )
             if not user_rows:
                 raise UserContextError("no user found for the supplied user id")
@@ -767,5 +778,9 @@ async def fetch_user_context(current_user_id: UUID) -> UserContext:
     # identity fields that have no business travelling through graph state.
     return UserContext(
         profile=profile,
-        rows={"accounts": account_rows, "subscriptions": subscription_rows},
+        rows={
+            "accounts": account_rows,
+            "subscriptions": subscription_rows,
+            "cards": card_rows,
+        },
     )

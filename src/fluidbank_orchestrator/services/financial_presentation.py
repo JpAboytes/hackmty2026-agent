@@ -255,6 +255,70 @@ def _empty_view(intent: FinancialIntent, description: str, currency: str = "MXN"
     }
 
 
+_CARD_NETWORKS = {"visa", "mastercard", "amex", "other"}
+_CARD_STATUSES = {"active", "blocked", "inactive"}
+
+
+def _expiry(row: Mapping[str, Any]) -> str | None:
+    """`YYYY-MM` from the two stored integers, or nothing. Never a full date."""
+    month = row.get("expires_month")
+    year = row.get("expires_year")
+    if not isinstance(month, int) or not isinstance(year, int):
+        return None
+    if isinstance(month, bool) or isinstance(year, bool) or not 1 <= month <= 12:
+        return None
+    if not 1900 <= year <= 2100:
+        return None
+    return f"{year:04d}-{month:02d}"
+
+
+def _payment_cards(
+    observations: Sequence[Mapping[str, Any]], owned_account_ids: set[str]
+) -> list[dict[str, Any]]:
+    """Map `cards` rows to the masked contract, dropping anything unverifiable.
+
+    Only the four-digit tail travels. A card whose account is not part of the
+    summary is dropped rather than shown next to somebody else's balance.
+    """
+    cards: list[dict[str, Any]] = []
+    for row in _rows_for_table(observations, "cards"):
+        identifier = row.get("id")
+        account_id = row.get("account_id")
+        name = row.get("display_name")
+        card_type = row.get("card_type")
+        network = row.get("network")
+        last_four = row.get("last_four")
+        status = row.get("status")
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(name, str)
+            or not name.strip()
+            or card_type not in {"debit", "credit"}
+            or network not in _CARD_NETWORKS
+            or not isinstance(last_four, str)
+            or not last_four.isdigit()
+            or len(last_four) != 4
+            or status not in _CARD_STATUSES
+        ):
+            continue
+        if not isinstance(account_id, str) or account_id not in owned_account_ids:
+            continue
+        card = {
+            "cardId": identifier,
+            "cardName": name.strip()[:120],
+            "cardType": card_type,
+            "network": network,
+            "lastFour": last_four,
+            "status": status,
+            "accountId": account_id,
+        }
+        expires = _expiry(row)
+        if expires is not None:
+            card["expires"] = expires
+        cards.append(card)
+    return cards[:12]
+
+
 def _summary_view(
     observations: Sequence[Mapping[str, Any]], profile: UserProfile
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
@@ -316,6 +380,9 @@ def _summary_view(
         "totalOwnedBalance": owned_balance,
         "accounts": accounts,
     }
+    cards = _payment_cards(observations, {item["accountId"] for item in accounts})
+    if cards:
+        view["cards"] = cards
     data = {
         "presentation_intent": "financial-summary",
         "owned_balance": owned_balance,
