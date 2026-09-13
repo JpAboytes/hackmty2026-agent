@@ -146,6 +146,23 @@ class _SliderComponent(_ComponentBase):
         return self
 
 
+class _ChoiceOption(_StrictModel):
+    label: DynamicString
+    value: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=128)]
+
+
+class _ChoicePickerComponent(_ComponentBase):
+    component: Literal["ChoicePicker"]
+    label: DynamicString | None = None
+    value: _Binding
+    options: Annotated[list[_ChoiceOption], Field(max_length=50)]
+    variant: Literal["multipleSelection", "mutuallyExclusive"] | None = None
+    display_style: Literal["checkbox", "chips"] | None = Field(
+        default=None, alias="displayStyle"
+    )
+    filterable: StrictBool | None = None
+
+
 class _CardComponent(_ComponentBase):
     component: Literal["Card"]
     child: Identifier
@@ -281,6 +298,7 @@ Component = (
     _TextFieldComponent
     | _DateInputComponent
     | _SliderComponent
+    | _ChoicePickerComponent
     | _TextComponent
     | _ButtonComponent
     | _CardComponent
@@ -524,7 +542,16 @@ _SDK_VALIDATORS = {
 }
 _COMPONENTS_BY_CATALOG = {
     A2UI_BASIC_CATALOG: frozenset(
-        {"Text", "Button", "Card", "Column", "TextField", "DateTimeInput", "Slider"}
+        {
+            "Text",
+            "Button",
+            "Card",
+            "Column",
+            "TextField",
+            "DateTimeInput",
+            "Slider",
+            "ChoicePicker",
+        }
     ),
     A2UI_FINANCE_CATALOG: frozenset({"Text", "Button", "Card", "Column", "Chart"}),
     A2UI_FINANCE_V2_CATALOG: frozenset(
@@ -683,13 +710,61 @@ def validate_static_template(
     return surface_id, validated
 
 
+def _final_surface_sequence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse incremental component upserts for the SDK's batch integrity pass.
+
+    A2UI applies updateComponents by component ID. The v0.9.1 SDK validates a
+    batch by concatenating every update and would otherwise report a legitimate
+    replacement as a duplicate ID. Local validation still inspects every wire
+    message before this function is called.
+    """
+
+    final_components: dict[str, dict[str, Any]] = {}
+    component_message: dict[str, Any] | None = None
+    without_components: list[dict[str, Any]] = []
+    for message in messages:
+        update = message.get("updateComponents")
+        if isinstance(update, Mapping):
+            component_message = message
+            for component in update.get("components", []):
+                if isinstance(component, Mapping) and isinstance(component.get("id"), str):
+                    final_components[component["id"]] = deepcopy(dict(component))
+            continue
+        without_components.append(message)
+    if component_message is None:
+        return messages
+    body = component_message["updateComponents"]
+    collapsed = {
+        "version": component_message["version"],
+        "updateComponents": {
+            "surfaceId": body["surfaceId"],
+            "components": list(final_components.values()),
+        },
+    }
+    creation_index = next(
+        (index for index, message in enumerate(without_components) if "createSurface" in message),
+        -1,
+    )
+    without_components.insert(creation_index + 1, collapsed)
+    return without_components
+
+
 def validate_dynamic_updates(
-    messages: Sequence[Mapping[str, Any]], *, expected_surface_id: str
+    messages: Sequence[Mapping[str, Any]], *, expected_surface_id: str, catalog_id: str
 ) -> list[dict[str, Any]]:
-    """Validate embedded data-model updates for a selected surface."""
-    if not messages or any(_operation(message) != "updateDataModel" for message in messages):
-        raise A2UIValidationError("Embedded A2UI content must contain updateDataModel messages")
-    return validate_messages(messages, expected_surface_id=expected_surface_id)
+    """Validate bounded runtime component and data updates for a selected surface."""
+    operations = [_operation(message) for message in messages]
+    if (
+        not messages
+        or any(operation not in {"updateComponents", "updateDataModel"} for operation in operations)
+        or "updateDataModel" not in operations
+    ):
+        raise A2UIValidationError(
+            "Embedded A2UI content must contain data updates and optional component updates"
+        )
+    return validate_messages(
+        messages, expected_surface_id=expected_surface_id, catalog_id=catalog_id
+    )
 
 
 def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id: str) -> None:
@@ -792,7 +867,7 @@ def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id
                 or resolved_intent not in FINANCIAL_INTENTS
             ):
                 raise A2UIValidationError("Finance v2 contains an unsupported action")
-    _sdk_validate(validated, catalog_id)
+    _sdk_validate(_final_surface_sequence(validated), catalog_id)
 
 
 _MISSING = object()

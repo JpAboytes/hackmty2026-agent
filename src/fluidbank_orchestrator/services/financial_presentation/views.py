@@ -515,17 +515,36 @@ def credit_card_view(
     observations: Sequence[Mapping[str, Any]], profile: UserProfile
 ) -> ViewResult:
     """One verified credit account, its masked card and current contractual terms."""
-    domain = next(
+    observation = next(
         (
-            observation.get("data")
+            observation
             for observation in reversed(observations)
-            if observation.get("name") == "get_accounts"
+            if observation.get("name") in {"get_credit_cards", "get_accounts"}
             and observation.get("is_error") is not True
             and isinstance(observation.get("data"), Mapping)
         ),
         None,
     )
+    domain = observation.get("data") if isinstance(observation, Mapping) else None
     accounts = domain.get("accounts") if isinstance(domain, Mapping) else None
+    if (
+        isinstance(observation, Mapping)
+        and observation.get("name") == "get_credit_cards"
+        and isinstance(domain, Mapping)
+    ):
+        raw_cards = domain.get("cards")
+        accounts = [
+            {
+                "id": card.get("account_id"),
+                "account_type": "credit",
+                "currency": card.get("currency"),
+                "available_balance": card.get("available_credit"),
+                "cards": [card],
+                "credit_terms": card.get("credit_terms"),
+            }
+            for card in raw_cards
+            if isinstance(card, Mapping)
+        ] if isinstance(raw_cards, list) else None
     if not isinstance(accounts, list):
         return _empty_result(
             "credit-card",

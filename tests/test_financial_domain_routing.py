@@ -45,7 +45,7 @@ def _state(query: str) -> dict[str, object]:
         ("¿Cuánto me queda de presupuesto de comida?", "budgets", "get_budget_progress"),
         ("¿Cómo va mi meta para vacaciones?", "savings-goals", "get_savings_progress"),
         ("¿Cuánto debo y cuándo pago?", "debts", "get_debt_overview"),
-        ("Muéstrame mi tarjeta de crédito", "credit-card", "get_accounts"),
+        ("Muéstrame mi tarjeta de crédito", "credit-card", "get_credit_cards"),
         (
             "¿Qué pagos tengo en los próximos 15 días?",
             "recurring-payments",
@@ -61,9 +61,9 @@ def test_financial_intent_routes_to_one_domain_tool(query: str, intent: str, exp
     assert turn.tool_calls[0]["name"] != "select_rows"
 
 
-def test_credit_card_request_limits_the_account_read_to_credit() -> None:
+def test_credit_card_request_uses_the_dedicated_card_contract() -> None:
     turn = financial_data_turn(_state("Muéstrame mi tarjeta de crédito"), "credit-card")
-    assert turn.tool_calls[0]["arguments"] == {"request": {"account_type": "credit"}}
+    assert turn.tool_calls[0]["arguments"] == {"request": {}}
 
 
 def test_compare_scenarios_resolves_owned_debt_then_calls_comparator() -> None:
@@ -398,34 +398,27 @@ def test_a_card_is_dropped_when_it_cannot_be_verified() -> None:
     assert "cards" not in view
 
 
-def test_credit_card_query_builds_the_masked_payment_card_from_get_accounts() -> None:
+def test_credit_card_query_builds_the_masked_payment_card_from_dedicated_tool() -> None:
     observations = [
         {
-            "name": "get_accounts",
-            "arguments": {"request": {"account_type": "credit"}},
+            "name": "get_credit_cards",
+            "arguments": {"request": {}},
             "is_error": False,
             "data": {
                 "ok": True,
-                "accounts": [
+                "cards": [
                     {
-                        "id": "04803dbe-97f1-4986-ace7-54c2d6196151",
-                        "account_type": "credit",
+                        "id": "5d3ec491-64dc-500e-b357-e732850cf990",
+                        "account_id": "04803dbe-97f1-4986-ace7-54c2d6196151",
                         "currency": "MXN",
-                        "available_balance": 1500,
-                        "display_name": "Tarjeta Oro",
-                        "cards": [
-                            {
-                                "id": "5d3ec491-64dc-500e-b357-e732850cf990",
-                                "account_id": "04803dbe-97f1-4986-ace7-54c2d6196151",
-                                "display_name": "Oro de ejemplo",
-                                "card_type": "credit",
-                                "network": "mastercard",
-                                "masked_last_four": "•••• 9012",
-                                "status": "active",
-                                "expires_month": 12,
-                                "expires_year": 2029,
-                            }
-                        ],
+                        "available_credit": 1500,
+                        "display_name": "Oro de ejemplo",
+                        "card_type": "credit",
+                        "network": "mastercard",
+                        "masked_last_four": "•••• 9012",
+                        "status": "active",
+                        "expires_month": 12,
+                        "expires_year": 2029,
                         "credit_terms": {
                             "currency": "MXN",
                             "credit_limit": 10000,

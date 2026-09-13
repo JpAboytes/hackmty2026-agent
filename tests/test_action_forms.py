@@ -1,6 +1,7 @@
 """Action templates and authenticated routing, without network or an LLM."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -11,7 +12,11 @@ from mcp.types import TextContent
 from fluidbank_orchestrator import api
 from fluidbank_orchestrator.a2ui_actions.routing import requested_form, requested_form_arguments
 from fluidbank_orchestrator.mcp_client import SCOPED_TOOL_NAMES, enforce_trusted_user_scope
-from fluidbank_orchestrator.schemas.a2ui import validate_complete_sequence
+from fluidbank_orchestrator.schemas.a2ui import (
+    A2UI_BASIC_CATALOG,
+    validate_complete_sequence,
+    validate_dynamic_updates,
+)
 
 
 @pytest.mark.parametrize(
@@ -22,6 +27,7 @@ from fluidbank_orchestrator.schemas.a2ui import validate_complete_sequence
         ("Crear una meta de ahorro", "savings_goal.create"),
         ("Actualiza mi meta de ahorro", "savings_goal.load"),
         ("Transfiere $500 a Ana", "transfer.execute"),
+        ("Quiero hacer una transferencia", "transfer.execute"),
         ("Mueve dinero a mi cuenta de ahorro", "transfer.execute"),
         ("Quiero pagar mi tarjeta de crédito", "credit_card.pay"),
         ("¿Cuándo debo pagar mi tarjeta?", None),
@@ -51,15 +57,41 @@ def test_transfer_form_prefills_explicit_amount_and_recipient():
 
 def test_all_forms_pass_official_sdk_and_agent_validation():
     root = Path(__file__).resolve().parents[2]
-    registry = json.loads((root / "mcp/src/supabase_mcp/a2ui_actions/actions.json").read_text())
+    mcp_root = root / "hackmty2026-mcp"
+    registry = json.loads(
+        (mcp_root / "src/supabase_mcp/a2ui_actions/actions.json").read_text()
+    )
     for action in registry["actions"]:
         messages = json.loads(
             (
-                root / "mcp/src/supabase_mcp/a2ui_support/templates" / f"{action['surfaceId']}.json"
+                mcp_root
+                / "src/supabase_mcp/a2ui_support/templates"
+                / f"{action['surfaceId']}.json"
             ).read_text()
         )
         model = {field["key"]: field["default"] for field in action["inputs"]}
         data_model = {"form": model, "help": "Revisa y confirma"}
+        dynamic_start = len(messages)
+        if action["name"] == "transfer.execute":
+            components = deepcopy(messages[1]["updateComponents"]["components"])
+            for component in components:
+                if component["id"] == "source_account":
+                    component["options"] = [
+                        {"label": "Cuenta principal · •••• 1111", "value": "Cuenta principal"}
+                    ]
+                elif component["id"] == "recipient":
+                    component["options"] = [
+                        {"label": "Ana · Banco receptor · •••• 4321", "value": "Ana"}
+                    ]
+            messages.append(
+                {
+                    "version": "v0.9.1",
+                    "updateComponents": {
+                        "surfaceId": action["surfaceId"],
+                        "components": components,
+                    },
+                }
+            )
         if action.get("preview"):
             data_model["preview"] = {
                 "intent": "credit-card",
@@ -83,6 +115,12 @@ def test_all_forms_pass_official_sdk_and_agent_validation():
             }
         )
         validate_complete_sequence(messages, action["surfaceId"])
+        if action["name"] == "transfer.execute":
+            validate_dynamic_updates(
+                messages[dynamic_start:],
+                expected_surface_id=action["surfaceId"],
+                catalog_id=A2UI_BASIC_CATALOG,
+            )
 
 
 @pytest.mark.asyncio

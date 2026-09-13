@@ -270,17 +270,17 @@
       "inputs": [
         {
           "key": "source_account",
-          "input": "text",
+          "input": "choice",
           "label": "Cuenta de origen",
           "required": true,
-          "default": ""
+          "default": []
         },
         {
           "key": "recipient",
-          "input": "text",
-          "label": "Destinatario",
+          "input": "choice",
+          "label": "Contacto",
           "required": true,
-          "default": ""
+          "default": []
         },
         {
           "key": "amount",

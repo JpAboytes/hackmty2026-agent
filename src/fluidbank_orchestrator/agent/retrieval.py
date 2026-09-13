@@ -31,7 +31,7 @@ _TOOL_BY_INTENT: dict[str, str] = {
     "cash-flow": "get_cash_flow",
     "budgets": "get_budget_progress",
     "recurring-payments": "get_upcoming_payments",
-    "credit-card": "get_accounts",
+    "credit-card": "get_credit_cards",
     "debts": "get_debt_overview",
     "transfers": "get_payment_activity",
     "card-security": "get_transaction_disputes",
@@ -154,8 +154,6 @@ def financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTurn
     if tool_name not in available:
         return ModelTurn(message="No está disponible la consulta financiera requerida.")
     request = _request_arguments(tool_name, text)
-    if intent == "credit-card":
-        request["account_type"] = "credit"
     arguments = {"request": request}
     return ModelTurn(message="", tool_calls=({"name": tool_name, "arguments": arguments},))
 

@@ -10,7 +10,10 @@ def requested_form(query: str) -> str | None:
     )
     if re.search(r"\b(no|nunca|como|que es|cuando|cuanto|debo)\b", text):
         return None
-    if re.search(r"\b(transfiere|transferir|envia|enviar|manda|mandar|mueve|mover)\b", text):
+    if re.search(r"\b(transfiere|transferir|envia|enviar|manda|mandar|mueve|mover)\b", text) or (
+        "transferencia" in text
+        and re.search(r"\b(quiero|hacer|haz|realiza|realizar|nueva)\b", text)
+    ):
         return "transfer.execute"
     if "tarjeta" in text and re.search(
         r"\b(paga|pagar|quiero pagar|abona|abonar|liquida|liquidar)\b", text

@@ -19,6 +19,7 @@ FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
     {
         "get_financial_overview",
         "get_accounts",
+        "get_credit_cards",
         "get_transactions",
         "analyze_spending",
         "get_cash_flow",
