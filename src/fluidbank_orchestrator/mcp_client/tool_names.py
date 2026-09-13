@@ -13,6 +13,8 @@ Three sets with three different jobs, deliberately kept apart:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
     {
         "get_financial_overview",
@@ -40,6 +42,20 @@ FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
 SEARCH_TOOL_NAME = "search_tools"
 CALL_TOOL_NAME = "call_tool"
 DISCOVERY_TOOL_NAMES = frozenset({SEARCH_TOOL_NAME, CALL_TOOL_NAME})
+
+
+def addressable_financial_tool_names(advertised_names: Iterable[str]) -> frozenset[str]:
+    """Financial capabilities reachable through the current MCP catalog.
+
+    A capability is addressable when it is advertised directly, or when the
+    advertised ``call_tool`` proxy can address the hidden domain catalog. An
+    unrelated non-empty tool list proves neither condition.
+    """
+    advertised = frozenset(advertised_names)
+    if CALL_TOOL_NAME in advertised:
+        return FINANCIAL_DOMAIN_TOOL_NAMES
+    return FINANCIAL_DOMAIN_TOOL_NAMES & advertised
+
 
 # Security boundary, kept deliberately separate from discovery: every tool here
 # reads user-owned rows, so its identity fields are overwritten with the UUID

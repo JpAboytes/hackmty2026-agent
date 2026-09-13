@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import UUID
+
+from .schemas.banking_view import FinancialIntent
+
+if TYPE_CHECKING:
+    from .mcp_client import MCPToolExecution
+    from .services.financial_presentation import FinancialPresentation
+else:
+    # LangGraph resolves TypedDict annotations at runtime. Static checking sees
+    # the concrete boundary types, while runtime resolution only needs channel
+    # placeholders and retains no dependency back into MCP or services.
+    MCPToolExecution = object
+    FinancialPresentation = object
 
 
 class UserProfile(TypedDict):
@@ -20,23 +32,54 @@ class UserProfile(TypedDict):
     owned_balances: dict[str, float]
 
 
+class ToolDefinitionState(TypedDict):
+    """Detached advertised MCP definition retained in graph state."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    model_visible: bool
+
+
+class ToolCall(TypedDict):
+    """One pending MCP call. The tools node consumes the whole list."""
+
+    name: str
+    arguments: dict[str, Any]
+
+
+class ToolObservation(TypedDict):
+    """One completed MCP attempt, including structured failures."""
+
+    name: str
+    arguments: dict[str, Any]
+    is_error: bool
+    data: dict[str, Any]
+    text: str
+
+
 class GraphState(TypedDict, total=False):
     """Data passed between graph nodes."""
 
     user_query: str
     current_user_id: UUID
-    requested_intent: str
+    # Input-only action intent. It is ignored unless action_requested is true.
+    requested_intent: FinancialIntent | None
     action_requested: bool
-    financial_request_intent: str
-    presentation_intent: str
+    # Effective classified/model-selected intent, then the post-data selection.
+    financial_request_intent: FinancialIntent | None
+    presentation_intent: FinancialIntent | None
     user_profile: UserProfile
     context_available: bool
     message: str
-    months: int
-    available_tools: list[dict[str, Any]]
-    tool_calls: list[dict[str, Any]]
-    tool_observations: list[dict[str, Any]]
-    context_observations: list[dict[str, Any]]
-    final_tool_execution: object
-    financial_presentation: object
+    months: int | None
+    # These lists intentionally use LangGraph's default overwrite channel.
+    # Nodes return the complete current value; no implicit accumulation occurs.
+    available_tools: list[ToolDefinitionState]
+    tool_calls: list[ToolCall]
+    tool_observations: list[ToolObservation]
+    context_observations: list[ToolObservation]
+    # The two presentation owners are mutually exclusive terminal outputs.
+    final_tool_execution: MCPToolExecution | None
+    financial_presentation: FinancialPresentation | None
     tool_loop_count: int

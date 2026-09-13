@@ -31,6 +31,7 @@ from .tool_names import (
     FINANCIAL_DOMAIN_TOOL_NAMES,
     SCOPED_TOOL_NAMES,
     SEARCH_TOOL_NAME,
+    addressable_financial_tool_names,
 )
 from .trusted_scope import (
     enforce_trusted_user_scope,
@@ -54,6 +55,7 @@ __all__ = [
     "TrustedUserScopeError",
     "UserContext",
     "UserContextError",
+    "addressable_financial_tool_names",
     "call_mcp_tool",
     "clear_tools_cache",
     "create_mcp_client",

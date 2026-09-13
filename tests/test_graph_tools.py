@@ -8,11 +8,14 @@ from uuid import UUID
 
 import pytest
 from fastmcp.client.client import CallToolResult
+from langgraph.graph import END
 from mcp.types import TextContent
 
 import fluidbank_orchestrator.agent.gemini as gemini_module
 import fluidbank_orchestrator.agent.nodes as nodes_module
 from fluidbank_orchestrator.agent.gemini import GeminiToolAwareModel, _api_failure_reason, _Intent
+from fluidbank_orchestrator.agent.nodes import route_after_agent
+from fluidbank_orchestrator.agent.tool_loop import run_pending_tools
 from fluidbank_orchestrator.agent.tool_visibility import model_tool_schema
 from fluidbank_orchestrator.graph import ModelTurn, ToolAwareModel, build_graph
 from fluidbank_orchestrator.mcp_client import (
@@ -20,8 +23,10 @@ from fluidbank_orchestrator.mcp_client import (
     MCPToolExecution,
     TrustedUserScopeError,
     UserContext,
+    UserContextError,
     enforce_trusted_user_scope,
 )
+from fluidbank_orchestrator.schemas.a2ui import A2UIBundle
 from fluidbank_orchestrator.services.financial_presentation import build_financial_presentation
 from fluidbank_orchestrator.state import UserProfile
 
@@ -138,10 +143,14 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
             "available_balance": 900,
         },
     ]
-    result, calls = await _run_graph(monkeypatch, "¿Cuánto dinero tengo?", rows)
+    result, calls = await _run_graph(
+        monkeypatch,
+        "¿Cuánto dinero tengo?",
+        [],
+        context_rows={"accounts": rows, "cards": []},
+    )
 
-    assert [name for name, _ in calls] == ["get_financial_overview"]
-    assert calls[0][1]["request"]["scope"] == {"user_id": str(USER_A)}
+    assert calls == []
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
     assert presentation.data["owned_balance"] == 150
@@ -156,7 +165,6 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
     view = presentation.a2ui.messages[-1]["updateDataModel"]["value"]["view"]
     assert view["totalOwnedBalance"] == 150
     assert all(account["accountType"] != "credit" for account in view["accounts"])
-    assert calls[0][0] != "chat_message"
 
 
 @pytest.mark.asyncio
@@ -179,10 +187,7 @@ async def test_context_rows_answer_a_balance_without_a_second_read(
         context_rows={"accounts": accounts},
     )
 
-    # Known gap, unchanged by discovery: the deterministic financial router
-    # does not consult the prefetched context rows, so the overview read runs
-    # even though `accounts` was already loaded.
-    assert [name for name, _ in calls] == ["get_financial_overview"]
+    assert calls == []
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
     assert presentation.data["owned_balance"] == 150
@@ -395,7 +400,243 @@ async def test_plain_conversation_can_finish_without_chat_message(
         {"user_query": "Hola", "current_user_id": USER_A}
     )
     assert result["message"] == "Hola, ¿en qué te ayudo?"
-    assert "final_tool_execution" not in result
+    assert result["final_tool_execution"] is None
+
+
+@pytest.mark.asyncio
+async def test_classified_financial_request_never_invokes_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingModel(ToolAwareModel):
+        async def generate(self, **_kwargs: Any) -> ModelTurn:
+            raise AssertionError("classified requests must not invoke Gemini")
+
+    async def fake_profile(_current_user_id: UUID) -> UserContext:
+        return UserContext(
+            profile=PROFILE.copy(),
+            rows={
+                "accounts": [
+                    {
+                        "id": "checking",
+                        "account_type": "checking",
+                        "currency": "MXN",
+                        "available_balance": 150,
+                    }
+                ],
+                "cards": [],
+                "subscriptions": [],
+            },
+        )
+
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
+    result = await build_graph(model=FailingModel(), tool_loader=_discovery_tools).ainvoke(
+        {"user_query": "¿Cuánto dinero tengo?", "current_user_id": USER_A}
+    )
+
+    assert result["financial_presentation"].intent == "financial-summary"
+
+
+@pytest.mark.asyncio
+async def test_classified_request_calls_domain_tool_without_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingModel(ToolAwareModel):
+        async def generate(self, **_kwargs: Any) -> ModelTurn:
+            raise AssertionError("classified requests must not invoke Gemini")
+
+    calls: list[str] = []
+
+    async def fake_profile(_current_user_id: UUID) -> UserContext:
+        return UserContext(profile=PROFILE.copy(), rows={"accounts": [], "cards": []})
+
+    async def execute(
+        name: str,
+        _arguments: Mapping[str, Any] | None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        calls.append(name)
+        return MCPToolExecution(
+            result=CallToolResult(
+                content=[TextContent(text="Rows loaded.")],
+                structured_content={"ok": True, "transactions": []},
+                meta=None,
+                data=None,
+            ),
+            a2ui=None,
+        )
+
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
+    await build_graph(
+        model=FailingModel(), tool_loader=_discovery_tools, tool_executor=execute
+    ).ainvoke({"user_query": "Muéstrame mis movimientos", "current_user_id": USER_A})
+
+    assert calls == ["get_transactions"]
+
+
+def test_finance_route_requires_a_retained_retrieval_observation() -> None:
+    state: Any = {
+        "user_query": "Muéstrame mis movimientos",
+        "financial_request_intent": "transactions",
+        "tool_calls": [],
+        "tool_observations": [],
+        "context_observations": [],
+    }
+
+    assert route_after_agent(state) == END
+
+
+@pytest.mark.asyncio
+async def test_failed_proxied_tool_is_recorded_as_attempted_domain_tool() -> None:
+    async def fail(
+        _name: str,
+        _arguments: Mapping[str, Any] | None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        raise UserContextError("offline")
+
+    state: Any = {
+        "current_user_id": USER_A,
+        "available_tools": [tool.as_dict() for tool in await _discovery_tools()],
+        "tool_observations": [],
+        "tool_loop_count": 0,
+    }
+    update = await run_pending_tools(
+        state,
+        [
+            {
+                "name": "call_tool",
+                "arguments": {"name": "get_transactions", "arguments": {"request": {}}},
+            }
+        ],
+        fail,
+    )
+
+    assert update["tool_observations"] == [
+        {
+            "name": "get_transactions",
+            "arguments": {"request": {}},
+            "is_error": True,
+            "data": {},
+            "text": "No pude consultar el servicio de datos en este momento.",
+        }
+    ]
+    failed_state = {
+        **state,
+        **update,
+        "user_query": "Muéstrame mis movimientos",
+        "financial_request_intent": "transactions",
+    }
+    assert route_after_agent(failed_state) == "select_presentation"
+
+
+@pytest.mark.asyncio
+async def test_mcp_owned_a2ui_bypasses_finance_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Model(ToolAwareModel):
+        calls = 0
+
+        async def generate(self, **_kwargs: Any) -> ModelTurn:
+            self.calls += 1
+            return ModelTurn(
+                message="",
+                tool_calls=(
+                    {
+                        "name": "call_tool",
+                        "arguments": {
+                            "name": "get_debt_overview",
+                            "arguments": {"request": {}},
+                        },
+                    },
+                ),
+            )
+
+    async def fake_profile(_current_user_id: UUID) -> UserContext:
+        return UserContext(profile=PROFILE.copy(), rows={})
+
+    bundle = A2UIBundle(
+        resource_uri="a2ui://mcp/owned",
+        messages=[{"version": "v0.9.1", "createSurface": {}}],
+    )
+
+    async def execute(
+        _name: str,
+        _arguments: Mapping[str, Any] | None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return MCPToolExecution(
+            result=CallToolResult(
+                content=[TextContent(text="MCP surface")],
+                structured_content={"ok": True, "debts": []},
+                meta={"ui": {"resourceUri": bundle.resource_uri}},
+                data=None,
+            ),
+            a2ui=bundle,
+        )
+
+    model = Model()
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
+    result = await build_graph(
+        model=model, tool_loader=_discovery_tools, tool_executor=execute
+    ).ainvoke({"user_query": "Ayúdame con esto", "current_user_id": USER_A})
+
+    assert model.calls == 1
+    assert result["final_tool_execution"].a2ui == bundle
+    assert result["financial_presentation"] is None
+    assert result["presentation_intent"] is None
+
+
+@pytest.mark.asyncio
+async def test_turn_initialization_clears_stale_calls_and_presentations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_profile(_current_user_id: UUID) -> UserContext:
+        return UserContext(profile=PROFILE.copy(), rows={})
+
+    stale_bundle = A2UIBundle(
+        resource_uri="a2ui://stale",
+        messages=[{"version": "v0.9.1", "createSurface": {}}],
+    )
+    stale_execution = MCPToolExecution(result=_execution([]).result, a2ui=stale_bundle)
+    stale_finance = build_financial_presentation("transactions", [], PROFILE)
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
+
+    result = await build_graph(model=FakeModel(), tool_loader=_discovery_tools).ainvoke(
+        {
+            "user_query": "Hola",
+            "current_user_id": USER_A,
+            "requested_intent": "transactions",
+            "action_requested": False,
+            "tool_calls": [{"name": "stale", "arguments": {}}],
+            "tool_observations": [
+                {
+                    "name": "get_transactions",
+                    "arguments": {},
+                    "is_error": False,
+                    "data": {},
+                    "text": "stale",
+                }
+            ],
+            "final_tool_execution": stale_execution,
+            "financial_presentation": stale_finance,
+            "financial_request_intent": "transactions",
+            "presentation_intent": "transactions",
+        }
+    )
+
+    assert result["message"] == "Hola, ¿en qué te ayudo?"
+    assert result["tool_calls"] == []
+    assert result["tool_observations"] == []
+    assert result["final_tool_execution"] is None
+    assert result["financial_presentation"] is None
+    assert result["financial_request_intent"] is None
+    assert result["presentation_intent"] is None
 
 
 @pytest.mark.asyncio

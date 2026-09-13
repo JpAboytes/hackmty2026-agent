@@ -197,7 +197,12 @@ async def _route_request(
     event("route.selected", route="graph")
     async with stage("graph.invoke", entry="query"):
         result = await graph.ainvoke(
-            {"user_query": query, "current_user_id": current_user_id},
+            {
+                "user_query": query,
+                "current_user_id": current_user_id,
+                "requested_intent": None,
+                "action_requested": False,
+            },
             config={"configurable": {"thread_id": f"user:{current_user_id}"}},
         )
     return log_client_response("graph", response_from_graph(result))

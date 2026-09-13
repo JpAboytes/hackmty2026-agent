@@ -12,7 +12,7 @@ from typing import Any
 from fastmcp.client.client import CallToolResult
 
 from ..schemas.a2ui import A2UIBundle
-from ..state import UserProfile
+from ..state import ToolDefinitionState, UserProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +21,7 @@ class MCPToolExecution:
 
     result: CallToolResult
     a2ui: A2UIBundle | None
+    mcp_ui_owned: bool = False
     presentation_error: bool = False
 
 
@@ -48,7 +49,7 @@ class MCPToolDefinition:
     #: this orchestrator is the host.
     model_visible: bool = True
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self) -> ToolDefinitionState:
         return {
             "name": self.name,
             "description": self.description,

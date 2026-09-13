@@ -15,22 +15,18 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from ..mcp_client import (
-    FINANCIAL_DOMAIN_TOOL_NAMES,
     SEARCH_TOOL_NAME,
     MCPConfigurationError,
     MCPToolExecution,
     UserContextError,
+    addressable_financial_tool_names,
     require_current_user_id,
     resolve_tool_call,
 )
 from ..observability import event, preview, stage
-from ..state import GraphState
+from ..state import GraphState, ToolCall, ToolObservation
 from .observations import already_searched, text_from_execution
-from .tool_visibility import discovered_tool_schemas, model_tool_definitions
-
-#: Tools whose execution is itself the answer: their MCP-produced A2UI is
-#: relayed through the bridge instead of a Finance v2 presentation.
-_PRESENTATION_TOOL_NAMES = frozenset({"visualize_allowed_data", "database_overview"})
+from .tool_visibility import discovered_tool_schemas, model_tool_definitions, tool_definitions
 
 
 class ToolExecutor(Protocol):
@@ -43,7 +39,7 @@ class ToolExecutor(Protocol):
     ) -> MCPToolExecution: ...
 
 
-def _rejected_observation(name: object) -> dict[str, Any]:
+def _rejected_observation(name: object) -> ToolObservation:
     return {
         "name": str(name),
         "arguments": {},
@@ -54,20 +50,26 @@ def _rejected_observation(name: object) -> dict[str, Any]:
 
 
 def _permitted_tool_names(state: GraphState) -> set[str]:
-    return {tool.name for tool in model_tool_definitions(state)} | FINANCIAL_DOMAIN_TOOL_NAMES
+    definitions = tool_definitions(state)
+    advertised_names = (tool.name for tool in definitions)
+    return {tool.name for tool in model_tool_definitions(state)} | set(
+        addressable_financial_tool_names(advertised_names)
+    )
 
 
 async def run_pending_tools(
     state: GraphState,
-    pending: list[dict[str, Any]],
+    pending: list[ToolCall],
     executor: ToolExecutor,
 ) -> GraphState:
     """Run one iteration's calls and append what each of them observed."""
     permitted = _permitted_tool_names(state)
-    observations = list(state.get("tool_observations", []))
+    observations: list[ToolObservation] = list(state.get("tool_observations", []))
     update: GraphState = {
         "tool_calls": [],
         "tool_loop_count": state.get("tool_loop_count", 0) + 1,
+        # A presentation belongs only to calls in this consumed batch.
+        "final_tool_execution": None,
     }
     for call in pending:
         name = call.get("name")
@@ -98,14 +100,17 @@ async def run_pending_tools(
                     "text": text_from_execution(execution),
                 }
             )
-            if target in _PRESENTATION_TOOL_NAMES:
+            # Ownership comes from MCP's `_meta.ui`, as interpreted by the
+            # bridge, never from a local tool-name list. A rejected MCP-owned
+            # surface still terminates on its safe text/data fallback.
+            if execution.mcp_ui_owned or execution.a2ui is not None:
                 update["final_tool_execution"] = execution
         except (MCPConfigurationError, UserContextError) as exc:
-            event("tool.failed", name=name, reason=type(exc).__name__)
+            event("tool.failed", name=target, reason=type(exc).__name__)
             observations.append(
                 {
-                    "name": name,
-                    "arguments": deepcopy(arguments),
+                    "name": target,
+                    "arguments": deepcopy(dict(target_arguments or {})),
                     "is_error": True,
                     "data": {},
                     "text": "No pude consultar el servicio de datos en este momento.",

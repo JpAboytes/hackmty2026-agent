@@ -55,8 +55,9 @@ def response_from_graph(result: dict[str, Any]) -> ChatResponse:
         return response_from_tool(final_execution)
     event("graph.output", source="model_message", turns=result.get("tool_loop_count", 0))
     data: dict[str, Any] = dict(result.get("user_profile", {}))
-    if "months" in result:
-        data["months"] = result["months"]
+    months = result.get("months")
+    if isinstance(months, int):
+        data["months"] = months
     return ChatResponse(message=result["message"], data=data, a2ui=None)
 
 

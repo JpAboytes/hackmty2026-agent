@@ -16,7 +16,9 @@ opens **one** MCP session for the whole turn
 **Invariant for all flows:** `current_user_id` comes from the token and nothing
 else, and `mcp_client/trusted_scope.py:enforce_trusted_user_scope` overwrites
 every identity field on every scoped call regardless of what produced the
-arguments.
+arguments. The first graph node also overwrites every turn-scoped call,
+observation, intent, and presentation channel so checkpointed state from an
+earlier request cannot route the new turn.
 
 ---
 
@@ -135,7 +137,7 @@ flowchart TD
   J --> K[client.call_tool raise_on_error=False]
   K --> L[a2ui_bridge.build_bundle]
   L --> M[observation appended]
-  M --> N{target is a presentation tool?}
+  M --> N{execution came from<br/>MCP _meta.ui?}
   N -->|yes| O[state.final_tool_execution]
   B --> P[tool_loop_count += 1] --> Q[back to agent]
 ```
@@ -144,8 +146,9 @@ Modules: `agent/tool_loop.py`, `mcp_client/execution.py`,
 `mcp_client/trusted_scope.py`, `services/a2ui_bridge.py`.
 
 Invariants: two independent permission sources — the model may only use
-model-visible advertised tools, the deterministic planner only the scoped
-financial set. Every call that runs produces an observation, success or failure,
+model-visible advertised tools, the deterministic planner only scoped financial
+capabilities that are directly advertised or addressable through the advertised
+`call_tool` proxy. Every call that runs produces an observation, success or failure,
 so a later stage can distinguish "MCP said nothing" from "MCP was never asked".
 `raise_on_error=False` keeps sanitized error results instead of turning them
 into generic transport failures. The loop is bounded by
@@ -298,7 +301,7 @@ nothing) and a database-metadata request (`requests_database_overview` → MCP
 flowchart TD
   A[nodes._agent_turn] --> B{context_available is False?}
   B -->|yes| C["decision=no_context<br/>'no puedo mostrarte cifras'"]
-  B -->|no| D{final_tool_execution has a2ui?}
+  B -->|no| D{current execution<br/>came from _meta.ui?}
   D -->|yes| E[decision=tool_presentation<br/>relay MCP text]
   D -->|no| F{tool_loop_count >= 8?}
   F -->|yes| G[decision=loop_limit<br/>'límite seguro de pasos']
@@ -317,9 +320,10 @@ Invariants: a chat answer carries no surface (`a2ui: null`) and no invented
 figures. A missing user context is reported as such rather than filled with a
 fallback balance. A Gemini failure in the tool phase still lets the answer phase
 run; a failure in the answer phase falls back to a fixed message and leaves the
-deterministic policies available. An unsupported-but-recognised financial intent
-reaches `builder.build_financial_presentation` with no view builder and renders
-an explicit empty view saying data is missing — never a fabricated one.
+deterministic policies available. A recognised financial intent reaches the
+trusted Finance v2 builder only after its required MCP attempt is retained; an
+unavailable capability ends with a bounded message and no surface rather than a
+view without provenance.
 
 ---
 

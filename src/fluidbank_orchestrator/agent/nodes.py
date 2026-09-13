@@ -6,9 +6,9 @@ and injectable; ``graph`` wires them into the topology and nothing else.
 The policy that matters lives in ``agent_node``, in this order:
 
 1. no verified user context - answer without figures, never invent them;
-2. a classified or action-requested financial intent - plan deterministically
+2. an MCP-owned presentation from the current tool batch - relay it;
+3. a classified or action-requested financial intent - plan deterministically
    through ``retrieval`` and never consult the model;
-3. an MCP-produced presentation already retained - relay it;
 4. the loop limit - stop rather than keep calling tools;
 5. otherwise the model turn, which may only choose tools or a bounded answer.
 """
@@ -34,14 +34,14 @@ from ..services.financial_presentation import (
     normalize_action_intent,
     select_presentation_intent,
 )
-from ..state import GraphState, UserProfile
+from ..state import GraphState, ToolCall, UserProfile
 from .model import ModelTurn, ToolAwareModel
 from .observations import (
     context_observations,
     retained_observations,
     text_from_execution,
 )
-from .retrieval import financial_data_turn
+from .retrieval import financial_data_observed, financial_data_turn
 from .tool_loop import ToolExecutor, run_pending_tools
 from .tool_visibility import model_tool_definitions
 
@@ -64,9 +64,31 @@ Node = Callable[[GraphState], Awaitable[GraphState]]
 ToolLoader = Callable[[], Awaitable[list[MCPToolDefinition]]]
 
 
+def _copy_tool_calls(calls: tuple[ToolCall, ...]) -> list[ToolCall]:
+    return [{"name": call["name"], "arguments": dict(call["arguments"])} for call in calls]
+
+
 async def validate_identity_node(state: GraphState) -> GraphState:
-    """Fail the turn before any load or read unless identity is authenticated."""
-    return {"current_user_id": require_current_user_id(state.get("current_user_id"))}
+    """Validate identity and reset every turn-scoped workflow channel."""
+    action_requested = state.get("action_requested") is True
+    requested_intent = (
+        normalize_action_intent(state.get("requested_intent")) if action_requested else None
+    )
+    return {
+        "current_user_id": require_current_user_id(state.get("current_user_id")),
+        "requested_intent": requested_intent,
+        "action_requested": action_requested,
+        "financial_request_intent": None,
+        "presentation_intent": None,
+        "message": "",
+        "months": None,
+        "tool_calls": [],
+        "tool_observations": [],
+        "context_observations": [],
+        "final_tool_execution": None,
+        "financial_presentation": None,
+        "tool_loop_count": 0,
+    }
 
 
 def make_load_tools_node(tool_loader: ToolLoader) -> Node:
@@ -131,7 +153,33 @@ async def _agent_turn(state: GraphState, step: stage, model: ToolAwareModel) -> 
             "tool_calls": [],
         }
     observations = state.get("tool_observations", [])
-    explicit_intent = normalize_action_intent(state.get("requested_intent"))
+    final_execution = state.get("final_tool_execution")
+    if isinstance(final_execution, MCPToolExecution) and (
+        final_execution.mcp_ui_owned or final_execution.a2ui is not None
+    ):
+        step.set(decision="tool_presentation")
+        return {
+            "financial_request_intent": None,
+            "presentation_intent": None,
+            "financial_presentation": None,
+            "message": text_from_execution(final_execution),
+            "tool_calls": [],
+        }
+
+    explicit_intent = (
+        normalize_action_intent(state.get("requested_intent"))
+        if state.get("action_requested") is True
+        else None
+    )
+    if state.get("action_requested") is True and explicit_intent is None:
+        step.set(decision="invalid_action_intent")
+        return {
+            "financial_request_intent": None,
+            "presentation_intent": None,
+            "financial_presentation": None,
+            "message": "La presentación financiera solicitada no es válida.",
+            "tool_calls": [],
+        }
     financial_intent = explicit_intent or classify_financial_request(state["user_query"])
     if financial_intent is not None:
         candidate = financial_data_turn(state, financial_intent)
@@ -145,17 +193,17 @@ async def _agent_turn(state: GraphState, step: stage, model: ToolAwareModel) -> 
         )
         return {
             "financial_request_intent": financial_intent,
+            "presentation_intent": None,
+            "financial_presentation": None,
             "message": candidate.message,
-            "tool_calls": [dict(call) for call in candidate.tool_calls],
+            "tool_calls": _copy_tool_calls(candidate.tool_calls),
         }
-
-    final_execution = state.get("final_tool_execution")
-    if isinstance(final_execution, MCPToolExecution) and final_execution.a2ui is not None:
-        step.set(decision="tool_presentation")
-        return {"message": text_from_execution(final_execution), "tool_calls": []}
     if state.get("tool_loop_count", 0) >= MAX_TOOL_TURNS:
         step.set(decision="loop_limit", limit=MAX_TOOL_TURNS)
         return {
+            "financial_request_intent": None,
+            "presentation_intent": None,
+            "financial_presentation": None,
             "message": "No pude completar la consulta dentro del límite seguro de pasos.",
             "tool_calls": [],
         }
@@ -181,8 +229,11 @@ def _from_model_turn(candidate: ModelTurn, step: stage) -> GraphState:
             calls=",".join(call["name"] for call in candidate.tool_calls),
         )
         result: GraphState = {
+            "financial_request_intent": None,
+            "presentation_intent": None,
+            "financial_presentation": None,
             "message": "",
-            "tool_calls": [dict(call) for call in candidate.tool_calls],
+            "tool_calls": _copy_tool_calls(candidate.tool_calls),
         }
     elif candidate.presentation_intent is not None:
         step.set(decision="model_presentation", intent=candidate.presentation_intent)
@@ -190,13 +241,21 @@ def _from_model_turn(candidate: ModelTurn, step: stage) -> GraphState:
             "message": candidate.message,
             "tool_calls": [],
             "financial_request_intent": candidate.presentation_intent,
+            "presentation_intent": None,
+            "financial_presentation": None,
         }
     else:
         step.set(decision="model_message", message_chars=len(candidate.message.strip()))
         message_text = candidate.message.strip() or (
             "No tengo una respuesta para mostrar en este momento."
         )
-        result = {"message": message_text, "tool_calls": []}
+        result = {
+            "financial_request_intent": None,
+            "presentation_intent": None,
+            "financial_presentation": None,
+            "message": message_text,
+            "tool_calls": [],
+        }
     if candidate.months is not None:
         result["months"] = candidate.months
     return result
@@ -215,9 +274,13 @@ async def select_presentation_node(state: GraphState) -> GraphState:
     """Choose the presentation semantics, only once retrieval has happened."""
     async with stage("node.select_presentation") as step:
         requested = normalize_action_intent(state.get("financial_request_intent"))
-        if requested is None:
+        if requested is None or not financial_data_observed(state, requested):
             step.set(outcome="invalid")
-            return {"message": "La presentación financiera solicitada no es válida."}
+            return {
+                "presentation_intent": None,
+                "financial_presentation": None,
+                "message": "No hay datos financieros verificados para construir esta vista.",
+            }
         selected = select_presentation_intent(
             requested,
             retained_observations(state),
@@ -232,9 +295,13 @@ async def build_presentation_node(state: GraphState) -> GraphState:
     """Build the trusted Finance v2 surface from retained observations only."""
     async with stage("node.build_presentation") as step:
         intent = normalize_action_intent(state.get("presentation_intent"))
-        if intent is None:
+        requested = normalize_action_intent(state.get("financial_request_intent"))
+        if intent is None or requested is None or not financial_data_observed(state, requested):
             step.set(outcome="invalid")
-            return {"message": "La presentación financiera solicitada no es válida."}
+            return {
+                "financial_presentation": None,
+                "message": "No hay datos financieros verificados para construir esta vista.",
+            }
         presentation = build_financial_presentation(
             intent,
             retained_observations(state),
@@ -252,9 +319,12 @@ def route_after_agent(state: GraphState) -> str:
     """Tool calls loop back; a financial intent presents; anything else ends."""
     if state.get("tool_calls"):
         destination = "tools"
-    elif normalize_action_intent(state.get("financial_request_intent")) is not None:
-        destination = "select_presentation"
     else:
-        destination = END
+        financial_intent = normalize_action_intent(state.get("financial_request_intent"))
+        destination = (
+            "select_presentation"
+            if financial_intent is not None and financial_data_observed(state, financial_intent)
+            else END
+        )
     event("graph.route", node="agent", next=destination)
     return destination

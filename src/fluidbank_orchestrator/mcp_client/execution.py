@@ -47,6 +47,7 @@ async def call_mcp_tool(
             raise_on_error=False,
         )
         step.set(is_error=bool(result.is_error), contents=len(result.content))
+    mcp_ui_owned = isinstance(result.meta, Mapping) and "ui" in result.meta
     preview(f"mcp.call.{name}.result", result.structured_content)
     async with stage("mcp.a2ui_bridge", name=name) as step:
         try:
@@ -54,16 +55,26 @@ async def call_mcp_tool(
         except A2UIBridgeError as exc:
             step.set(outcome="rejected", code=exc.code)
             logger.warning("MCP A2UI presentation rejected code=%s", exc.code)
-            return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+            return MCPToolExecution(
+                result=result,
+                a2ui=None,
+                mcp_ui_owned=mcp_ui_owned,
+                presentation_error=True,
+            )
         except Exception as exc:  # noqa: BLE001 - retain the safe MCP fallback on bridge defects
             step.set(outcome="failed", reason=type(exc).__name__)
             logger.warning("MCP A2UI presentation failed (%s)", type(exc).__name__)
-            return MCPToolExecution(result=result, a2ui=None, presentation_error=True)
+            return MCPToolExecution(
+                result=result,
+                a2ui=None,
+                mcp_ui_owned=mcp_ui_owned,
+                presentation_error=True,
+            )
         step.set(
             outcome="bundled" if a2ui is not None else "no_presentation",
             messages=len(a2ui.messages) if a2ui is not None else None,
         )
-    return MCPToolExecution(result=result, a2ui=a2ui)
+    return MCPToolExecution(result=result, a2ui=a2ui, mcp_ui_owned=mcp_ui_owned)
 
 
 async def _wire_call(

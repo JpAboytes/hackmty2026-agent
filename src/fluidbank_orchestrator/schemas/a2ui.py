@@ -417,8 +417,7 @@ def _add_form_components(schema: dict[str, Any]) -> None:
     )
     refs = schema["$defs"]["anyComponent"]["oneOf"]
     refs.extend(
-        {"$ref": f"#/components/{name}"}
-        for name in ("TextField", "DateTimeInput", "Slider")
+        {"$ref": f"#/components/{name}"} for name in ("TextField", "DateTimeInput", "Slider")
     )
 
 
@@ -762,11 +761,7 @@ def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id
             .read_text(encoding="utf-8")
         )
         form_spec = next(
-            (
-                item
-                for item in action_contract["actions"]
-                if item["surfaceId"] == surface_id
-            ),
+            (item for item in action_contract["actions"] if item["surfaceId"] == surface_id),
             None,
         )
         for component in finance_components:

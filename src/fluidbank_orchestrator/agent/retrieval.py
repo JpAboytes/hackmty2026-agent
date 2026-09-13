@@ -16,11 +16,11 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from ..mcp_client import FINANCIAL_DOMAIN_TOOL_NAMES
+from ..mcp_client import addressable_financial_tool_names
 from ..schemas.banking_view import FinancialIntent
 from ..state import GraphState
 from .model import ModelTurn
-from .observations import has_tool_observation, normalized_query
+from .observations import has_table_observation, has_tool_observation, normalized_query
 from .tool_visibility import tool_definitions
 
 #: The single capability each intent reads from, before per-query refinements.
@@ -108,7 +108,8 @@ def _debt_scenario_turn(state: GraphState, available: frozenset[str]) -> ModelTu
         return None
     data = overview.get("data")
     debts = data.get("debts") if isinstance(data, Mapping) else None
-    debt_id = debts[0].get("id") if isinstance(debts, list) and debts else None
+    first_debt = debts[0] if isinstance(debts, list) and debts else None
+    debt_id = first_debt.get("id") if isinstance(first_debt, Mapping) else None
     if not isinstance(debt_id, str):
         return ModelTurn(message="No encontré una deuda guardada para comparar.")
     tool_name = "compare_debt_scenarios"
@@ -127,11 +128,15 @@ def _debt_scenario_turn(state: GraphState, available: frozenset[str]) -> ModelTu
 
 def financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTurn:
     """Plan the smallest bilingual financial-domain read for the request."""
-    available: frozenset[str] = (
-        FINANCIAL_DOMAIN_TOOL_NAMES if tool_definitions(state) else frozenset()
-    )
+    available = addressable_financial_tool_names(tool.name for tool in tool_definitions(state))
     text = normalized_query(state["user_query"])
     tool_name = _tool_for_intent(intent, text)
+
+    # User context already made and retained the scoped accounts read. That is
+    # the complete verified source used by the summary view, so asking the MCP
+    # for a broader overview would be a duplicate deterministic read.
+    if tool_name == "get_financial_overview" and has_table_observation(state, "accounts"):
+        return ModelTurn(message="")
 
     compare_requested = intent == "debts" and any(
         term in text for term in ("compara", "comparar", "escenario", "compare", "scenario")
@@ -142,9 +147,49 @@ def financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTurn
             return scenario_turn
         tool_name = "get_debt_overview"
 
-    if tool_name is None or has_tool_observation(state, tool_name):
+    if tool_name is None:
+        return ModelTurn(message="No está disponible la consulta financiera requerida.")
+    if has_tool_observation(state, tool_name):
         return ModelTurn(message="")
     if tool_name not in available:
         return ModelTurn(message="No está disponible la consulta financiera requerida.")
     arguments = {"request": _request_arguments(tool_name, text)}
     return ModelTurn(message="", tool_calls=({"name": tool_name, "arguments": arguments},))
+
+
+def financial_data_observed(state: GraphState, intent: FinancialIntent) -> bool:
+    """Whether retrieval reached a terminal observation for this request.
+
+    Errors count as completed attempts, which lets the builder render an
+    explicit verified failure without confusing it with a tool never called.
+    """
+    text = normalized_query(state["user_query"])
+    tool_name = _tool_for_intent(intent, text)
+    if tool_name == "get_financial_overview" and has_table_observation(state, "accounts"):
+        return True
+    if tool_name is None:
+        return False
+    compare_requested = intent == "debts" and any(
+        term in text for term in ("compara", "comparar", "escenario", "compare", "scenario")
+    )
+    if not compare_requested:
+        return has_tool_observation(state, tool_name)
+    if has_tool_observation(state, "compare_debt_scenarios"):
+        return True
+    overview = next(
+        (
+            observation
+            for observation in state.get("tool_observations", [])
+            if observation.get("name") == "get_debt_overview"
+        ),
+        None,
+    )
+    if overview is None:
+        return False
+    if overview.get("is_error") is True:
+        return True
+    data = overview.get("data")
+    debts = data.get("debts") if isinstance(data, Mapping) else None
+    first_debt = debts[0] if isinstance(debts, list) and debts else None
+    debt_id = first_debt.get("id") if isinstance(first_debt, Mapping) else None
+    return not isinstance(debt_id, str)

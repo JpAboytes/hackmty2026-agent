@@ -51,15 +51,11 @@ def test_transfer_form_prefills_explicit_amount_and_recipient():
 
 def test_all_forms_pass_official_sdk_and_agent_validation():
     root = Path(__file__).resolve().parents[2]
-    registry = json.loads(
-        (root / "hackmty2026-mcp/src/supabase_mcp/a2ui_actions/actions.json").read_text()
-    )
+    registry = json.loads((root / "mcp/src/supabase_mcp/a2ui_actions/actions.json").read_text())
     for action in registry["actions"]:
         messages = json.loads(
             (
-                root
-                / "hackmty2026-mcp/src/supabase_mcp/a2ui_support/templates"
-                / f"{action['surfaceId']}.json"
+                root / "mcp/src/supabase_mcp/a2ui_support/templates" / f"{action['surfaceId']}.json"
             ).read_text()
         )
         model = {field["key"]: field["default"] for field in action["inputs"]}

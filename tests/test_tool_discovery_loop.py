@@ -117,7 +117,7 @@ def _result(structured: dict[str, Any], text: str = "ok") -> MCPToolExecution:
 
 
 async def _run(
-    monkeypatch: pytest.MonkeyPatch, query: str, model: ScriptedModel
+    monkeypatch: pytest.MonkeyPatch, query: str, model: ToolAwareModel
 ) -> tuple[dict[str, Any], list[tuple[str, Mapping[str, Any] | None]]]:
     calls: list[tuple[str, Mapping[str, Any] | None]] = []
 
@@ -244,6 +244,42 @@ async def test_the_same_intent_is_not_searched_twice(
     _result, calls = await _run(monkeypatch, "cuéntame un chiste", model)
 
     assert [name for name, _ in calls] == [SEARCH_TOOL_NAME]
+
+
+async def test_eight_tool_iterations_terminate_before_a_ninth_model_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LoopingModel(ToolAwareModel):
+        calls = 0
+
+        async def generate(
+            self,
+            *,
+            query: str,
+            profile: UserProfile,
+            tools: Sequence[MCPToolDefinition],
+            observations: Sequence[Mapping[str, Any]],
+        ) -> ModelTurn:
+            del query, profile, tools, observations
+            self.calls += 1
+            return ModelTurn(
+                message="",
+                tool_calls=(
+                    {
+                        "name": SEARCH_TOOL_NAME,
+                        "arguments": {"query": f"unknown capability {self.calls}"},
+                    },
+                ),
+            )
+
+    model = LoopingModel()
+    result, calls = await _run(monkeypatch, "ayúdame con algo", model)
+
+    assert model.calls == 8
+    assert len(calls) == 8
+    assert result["tool_loop_count"] == 8
+    assert "límite seguro" in result["message"]
+    assert result["tool_calls"] == []
 
 
 # Envelope shapes gemini-3.6-flash actually produced for one discovered tool,

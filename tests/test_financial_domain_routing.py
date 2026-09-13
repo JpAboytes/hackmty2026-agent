@@ -62,6 +62,9 @@ def test_financial_intent_routes_to_one_domain_tool(query: str, intent: str, exp
 
 def test_compare_scenarios_resolves_owned_debt_then_calls_comparator() -> None:
     state = _state("Compara mis escenarios para liquidar esta deuda")
+    first = financial_data_turn(state, "debts")  # type: ignore[arg-type]
+    assert [call["name"] for call in first.tool_calls] == ["get_debt_overview"]
+
     state["tool_observations"] = [
         {
             "name": "get_debt_overview",
@@ -69,8 +72,8 @@ def test_compare_scenarios_resolves_owned_debt_then_calls_comparator() -> None:
             "data": {"debts": [{"id": "33333333-3333-3333-3333-333333333333"}]},
         }
     ]
-    turn = financial_data_turn(state, "debts")  # type: ignore[arg-type]
-    assert [call["name"] for call in turn.tool_calls] == ["compare_debt_scenarios"]
+    second = financial_data_turn(state, "debts")  # type: ignore[arg-type]
+    assert [call["name"] for call in second.tool_calls] == ["compare_debt_scenarios"]
 
 
 def test_authenticated_uuid_overwrites_model_identity_for_every_financial_tool() -> None:
@@ -121,6 +124,35 @@ def test_an_unreachable_mcp_server_does_not_invent_a_financial_answer() -> None:
 
     assert turn.tool_calls == ()
     assert "No está disponible" in turn.message
+
+
+def test_an_unrelated_advertised_tool_does_not_imply_financial_execution() -> None:
+    state = _state("¿Cuánto debo y cuándo pago?")
+    state["available_tools"] = [
+        MCPToolDefinition("unrelated", "Unrelated.", {"type": "object"}).as_dict()
+    ]
+
+    turn = financial_data_turn(state, "debts")  # type: ignore[arg-type]
+
+    assert turn.tool_calls == ()
+    assert "No está disponible" in turn.message
+
+
+def test_successful_observation_prevents_duplicate_deterministic_read() -> None:
+    state = _state("Muéstrame mis movimientos")
+    state["tool_observations"] = [
+        {
+            "name": "get_transactions",
+            "arguments": {"request": {"period": "current_month"}},
+            "is_error": False,
+            "data": {"ok": True, "transactions": []},
+            "text": "No transactions.",
+        }
+    ]
+
+    turn = financial_data_turn(state, "transactions")  # type: ignore[arg-type]
+
+    assert turn.tool_calls == ()
 
 
 def test_financial_model_schema_hides_nested_scope() -> None:

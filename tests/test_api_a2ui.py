@@ -113,7 +113,12 @@ async def test_valid_token_subject_reaches_graph_as_canonical_uuid(
     response = await api.chat(ChatRequest(query="Hola"), AUTH)
 
     state, config = invocations[0]
-    assert state == {"user_query": "Hola", "current_user_id": USER_A}
+    assert state == {
+        "user_query": "Hola",
+        "current_user_id": USER_A,
+        "requested_intent": None,
+        "action_requested": False,
+    }
     assert isinstance(state["current_user_id"], UUID)
     assert config == {"configurable": {"thread_id": f"user:{USER_A}"}}
     assert response.message == "Hola."
