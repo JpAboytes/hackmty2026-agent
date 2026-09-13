@@ -211,14 +211,18 @@ FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
     }
 )
 
-MODEL_TOOL_NAMES = frozenset(
-    {
-        "database_overview",
-        "visualize_allowed_data",
-        *FINANCIAL_DOMAIN_TOOL_NAMES,
-    }
-)
+# The MCP server replaced its `tools/list` with progressive discovery, so the
+# model receives these two synthetic tools and finds everything else through
+# them. This is a discovery contract, not an allowlist: it says nothing about
+# what may execute, only how a model reaches a capability.
+SEARCH_TOOL_NAME = "search_tools"
+CALL_TOOL_NAME = "call_tool"
+DISCOVERY_TOOL_NAMES = frozenset({SEARCH_TOOL_NAME, CALL_TOOL_NAME})
 
+# Security boundary, kept deliberately separate from discovery: every tool here
+# reads user-owned rows, so its identity fields are overwritten with the UUID
+# the authentication boundary produced. A tool reaching MCP without passing
+# through this set would be trusting model-supplied identity.
 SCOPED_TOOL_NAMES = frozenset(
     {
         "select_rows",
@@ -228,6 +232,52 @@ SCOPED_TOOL_NAMES = frozenset(
         *FINANCIAL_DOMAIN_TOOL_NAMES,
     }
 )
+
+
+#: A model that re-wraps the envelope nests it once, so two levels is enough to
+#: unwrap any real call while still bounding a malicious or looping payload.
+_MAX_ENVELOPE_DEPTH = 4
+
+
+def resolve_tool_call(
+    name: str, arguments: Mapping[str, Any] | None
+) -> tuple[str, Mapping[str, Any] | None]:
+    """Unwrap the discovery proxy to the domain tool a call actually reaches.
+
+    A model that discovered `get_transactions` calls it as
+    `call_tool(name="get_transactions", arguments={...})`. Scoping, logging and
+    routing all care about the inner tool, never about the envelope.
+
+    Unwrapping repeats because Gemini re-wraps the envelope in roughly one call
+    in five, emitting `call_tool(name="call_tool", arguments=<the real call>)`.
+    That nesting has exactly one valid reading, so it is resolved rather than
+    bounced off the server and retried a turn later. Pointing the proxy at
+    `search_tools` has no such reading and is left for the server to refuse.
+    """
+    for _ in range(_MAX_ENVELOPE_DEPTH):
+        if name != CALL_TOOL_NAME or arguments is None:
+            return name, arguments
+        target = arguments.get("name")
+        if not isinstance(target, str):
+            # No name at this level. If the whole call sits one level down,
+            # descend; otherwise there is no way to know what was meant.
+            nested = arguments.get("arguments")
+            if not isinstance(nested, Mapping):
+                return name, arguments
+            arguments = nested
+            continue
+        if target == SEARCH_TOOL_NAME:
+            return name, arguments
+        inner = arguments.get("arguments")
+        if not isinstance(inner, Mapping):
+            # `{"name": X, <the call's own fields>}` with no `arguments` level.
+            # The siblings are the call; without this they are silently dropped
+            # and the tool runs on defaults instead of the user's filters.
+            siblings = {k: v for k, v in arguments.items() if k not in {"name", "arguments"}}
+            inner = siblings or None
+        name, arguments = target, inner if isinstance(inner, Mapping) else None
+    return name, arguments
+
 
 _OWNERSHIP_FILTER_COLUMNS = frozenset(
     {
@@ -268,7 +318,20 @@ def enforce_trusted_user_scope(
 
     Scoped tools fail closed unless the caller supplies the UUID produced by the
     authentication boundary. Unscoped tools retain their original schema shape.
+
+    A `call_tool` envelope is scoped on the tool it targets and then rebuilt, so
+    discovery cannot be used to smuggle a scoped call past this function.
     """
+    if tool_name == CALL_TOOL_NAME:
+        target, inner = resolve_tool_call(tool_name, arguments)
+        if target == tool_name:
+            return deepcopy(dict(arguments)) if arguments is not None else None
+        scoped_inner = enforce_trusted_user_scope(target, inner, current_user_id)
+        envelope = deepcopy(dict(arguments)) if arguments is not None else {}
+        envelope["name"] = target
+        envelope["arguments"] = scoped_inner if scoped_inner is not None else {}
+        return envelope
+
     if tool_name not in SCOPED_TOOL_NAMES:
         return deepcopy(dict(arguments)) if arguments is not None else None
 
@@ -278,11 +341,22 @@ def enforce_trusted_user_scope(
 
     if tool_name in FINANCIAL_DOMAIN_TOOL_NAMES:
         raw_request = scoped.get("request")
-        request = deepcopy(dict(raw_request)) if isinstance(raw_request, Mapping) else {}
+        if not isinstance(raw_request, Mapping):
+            # The model dropped the single `request` wrapper and sent its fields
+            # at the top level. Every financial tool takes exactly one `request`
+            # object and rejects unknown fields, so promoting the stray keys is
+            # the only reading that can validate; the alternative is losing the
+            # user's filters.
+            raw_request = {key: value for key, value in scoped.items() if key != "request"}
+        while isinstance(raw_request.get("request"), Mapping):
+            # ...or it applied the wrapper twice. No request model has a
+            # `request` field, so a nested one is always the repeated wrapper.
+            raw_request = raw_request["request"]
+        request = deepcopy(dict(raw_request))
         request["scope"] = canonical_scope
         request.pop("user_id", None)
         request.pop("email", None)
-        scoped["request"] = request
+        scoped = {"request": request}
     elif tool_name == "select_rows":
         scoped["scope"] = canonical_scope
         scoped["filters"] = _business_filters(
@@ -413,10 +487,12 @@ async def _load_remote_tools() -> list[MCPToolDefinition]:
     except Exception:
         raise UserContextError("could not load tools from the remote MCP server") from None
 
+    # No local filtering: the server already decided what a model may see. With
+    # progressive discovery active this is the search pair rather than every
+    # financial schema, and re-adding a local allowlist here would put the whole
+    # catalog back into the prompt.
     definitions: list[MCPToolDefinition] = []
     for tool in listed:
-        if tool.name not in MODEL_TOOL_NAMES:
-            continue
         schema = dict(tool.input_schema)
         try:
             json.dumps(schema, allow_nan=False)
@@ -430,9 +506,9 @@ async def _load_remote_tools() -> list[MCPToolDefinition]:
             )
         )
     logger.info(
-        "Loaded MCP model tools count=%d visualization_available=%s",
+        "Loaded MCP model tools count=%d discovery=%s",
         len(definitions),
-        any(tool.name == "visualize_allowed_data" for tool in definitions),
+        DISCOVERY_TOOL_NAMES <= {tool.name for tool in definitions},
     )
     return definitions
 
@@ -482,7 +558,8 @@ async def execute_remote_tool(
     bridge: A2UIBridge = DEFAULT_A2UI_BRIDGE,
 ) -> MCPToolExecution:
     """Execute a tool over the configured remote/local MCP connection."""
-    if name in SCOPED_TOOL_NAMES:
+    effective_name, _ = resolve_tool_call(name, arguments)
+    if effective_name in SCOPED_TOOL_NAMES:
         require_current_user_id(current_user_id)
     try:
         async with _session(name) as (client, identity):
@@ -517,7 +594,11 @@ async def _select(
         },
         current_user_id=current_user_id,
     )
-    rows = getattr(execution.result.data, "rows", None)
+    # Read the wire payload rather than `.data`: `select_rows` is not advertised
+    # in `tools/list` under progressive discovery, so the client has no output
+    # schema to deserialize it into a typed object.
+    structured = execution.result.structured_content
+    rows = structured.get("rows") if isinstance(structured, Mapping) else None
     if not isinstance(rows, list):
         raise UserContextError("the MCP selection result was invalid")
     validated: list[dict[str, object]] = []

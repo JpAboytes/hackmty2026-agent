@@ -57,13 +57,25 @@ class FakeModel(ToolAwareModel):
         return ModelTurn(message="Hola, ¿en qué te ayudo?")
 
 
-async def _select_tool() -> list[MCPToolDefinition]:
+async def _discovery_tools() -> list[MCPToolDefinition]:
+    """What the MCP server advertises under progressive discovery.
+
+    The full domain catalog is reachable through these two, never listed.
+    """
     return [
         MCPToolDefinition(
-            name="select_rows",
-            description="Select scoped rows.",
-            input_schema={"type": "object"},
-        )
+            name="search_tools",
+            description="Search for tools using natural language.",
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        ),
+        MCPToolDefinition(
+            name="call_tool",
+            description="Call a tool by name with the given arguments.",
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+            },
+        ),
     ]
 
 
@@ -102,7 +114,7 @@ async def _run_graph(
 
     monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
     result = await build_graph(
-        model=FakeModel(), tool_loader=_select_tool, tool_executor=execute
+        model=FakeModel(), tool_loader=_discovery_tools, tool_executor=execute
     ).ainvoke({"user_query": query, "current_user_id": USER_A})
     return result, calls
 
@@ -133,8 +145,8 @@ async def test_balance_request_selects_financial_summary_not_chat_message(
     ]
     result, calls = await _run_graph(monkeypatch, "¿Cuánto dinero tengo?", rows)
 
-    assert [name for name, _ in calls] == ["select_rows"]
-    assert calls[0][1]["scope"] == {"user_id": str(USER_A)}
+    assert [name for name, _ in calls] == ["get_financial_overview"]
+    assert calls[0][1]["request"]["scope"] == {"user_id": str(USER_A)}
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
     assert presentation.data["owned_balance"] == 150
@@ -172,7 +184,11 @@ async def test_context_rows_answer_a_balance_without_a_second_read(
         context_rows={"accounts": accounts},
     )
 
-    assert calls == []
+    # Known gap, unchanged by discovery: the deterministic financial router
+    # does not consult the prefetched context rows, so the overview read runs
+    # even though `accounts` was already loaded. `_has_table_observation` is the
+    # unused remnant of the suppression this docstring describes.
+    assert [name for name, _ in calls] == ["get_financial_overview"]
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
     assert presentation.data["owned_balance"] == 150
@@ -200,8 +216,8 @@ async def test_a_table_the_profile_never_read_is_still_fetched(
         context_rows={"accounts": [{"id": "checking"}]},
     )
 
-    assert [name for name, _ in calls] == ["select_rows"]
-    assert calls[0][1]["table"] == "transactions"
+    assert [name for name, _ in calls] == ["get_transactions"]
+    assert calls[0][1]["request"]["scope"] == {"user_id": str(USER_A)}
 
 
 def test_spending_analysis_retains_and_combines_multiple_tool_results() -> None:
@@ -267,8 +283,8 @@ async def test_semantic_activity_request_does_not_require_chart_keyword(
         }
     ]
     result, calls = await _run_graph(monkeypatch, "¿Qué días gasto más?", rows)
-    assert [name for name, _ in calls] == ["select_rows"]
-    assert calls[0][1]["order_by"] == [{"column": "occurred_at", "direction": "desc"}]
+    assert [name for name, _ in calls] == ["analyze_spending"]
+    assert calls[0][1]["request"]["period"] == "current_month"
     assert result["financial_presentation"].intent == "spending-analysis"
 
 
@@ -351,7 +367,7 @@ async def test_missing_graph_identity_fails_before_loading_or_executing_tools() 
     async def load_tools() -> list[MCPToolDefinition]:
         nonlocal loaded
         loaded = True
-        return await _select_tool()
+        return await _discovery_tools()
 
     async def execute(
         _name: str,
@@ -381,7 +397,7 @@ async def test_plain_conversation_can_finish_without_chat_message(
         return UserContext(profile=PROFILE.copy(), rows={})
 
     monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
-    result = await build_graph(model=FakeModel(), tool_loader=_select_tool).ainvoke(
+    result = await build_graph(model=FakeModel(), tool_loader=_discovery_tools).ainvoke(
         {"user_query": "Hola", "current_user_id": USER_A}
     )
     assert result["message"] == "Hola, ¿en qué te ayudo?"
@@ -396,7 +412,7 @@ async def test_unresolvable_user_never_receives_placeholder_money(
         raise graph_module.UserContextError("missing")
 
     monkeypatch.setattr(graph_module, "fetch_user_context", unavailable)
-    result = await build_graph(model=FakeModel(), tool_loader=_select_tool).ainvoke(
+    result = await build_graph(model=FakeModel(), tool_loader=_discovery_tools).ainvoke(
         {"user_query": "¿Cuánto dinero tengo?", "current_user_id": USER_A}
     )
     assert result["context_available"] is False

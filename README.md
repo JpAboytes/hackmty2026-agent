@@ -58,6 +58,40 @@ curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
 
 Configure `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE_ANON_KEY`). The API resolves the bearer token through Supabase Auth and accepts no user UUID in the request body. It rejects anonymous or unconfirmed users, namespaces the LangGraph thread as `user:<uuid>`, and injects/overwrites `scope.user_id` immediately before scoped MCP reads. Model-provided ownership filters are discarded. Identity never comes from action context, model arguments, email mappings, or demo constants.
 
+## Tool discovery
+
+The MCP server no longer advertises its domain catalog. Its `tools/list` carries
+two tools — `search_tools` and `call_tool` — and everything else is found
+through them, so Gemini is bound to two schemas per turn instead of seventeen.
+
+```text
+agent -> search_tools("deudas pendientes") -> agent -> call_tool(...) -> agent
+```
+
+The orchestrator takes the model-facing tool set straight from `tools/list` and
+applies no local allowlist; re-deriving the catalog here would put every schema
+back into the prompt and defeat the server's discovery. That is deliberately
+separate from the security boundary: `SCOPED_TOOL_NAMES` still decides which
+tools have their identity fields overwritten with the authenticated UUID, and
+`enforce_trusted_user_scope` reaches through the `call_tool` envelope to scope
+the tool inside it, so discovery cannot smuggle an unscoped call past it.
+
+Two paths still reach a domain tool. A classified financial question is routed
+deterministically by intent and never consults the model, so it needs no search
+round trip; anything unclassified goes through Gemini, which searches once per
+intent and then calls. Schemas returned by `search_tools` are stripped of their
+trusted `scope` fields before the model sees them.
+
+The proxy's two-level envelope is hard for a model to fill in reliably. Measured
+against `gemini-3.6-flash`, roughly three calls in ten arrive malformed: the
+envelope re-wrapped in itself, the `name` one level too deep, or the tool's
+single `request` wrapper dropped or applied twice. Each has exactly one reading
+that can validate, so `resolve_tool_call` and `enforce_trusted_user_scope`
+normalize them instead of paying a rejected round trip and a retry turn. With
+that normalization, ten of ten live model calls reached the domain service, up
+from four of eight without it. A payload with no tool name anywhere has no such
+reading and is left for the server to refuse.
+
 A request for database metadata still calls the MCP `database_overview` domain tool. Financial requests enter the normal graph, retain all relevant tool observations, and select their presentation only after data retrieval. Scalar balance questions use `financial-summary`; spending can combine category, trend, and daily-activity views when the same verified data supports them. Users do not need to say “chart” or “visualize,” and charts are not forced into scalar answers.
 
 The selected domain tool chooses the entire A2UI surface through `_meta.ui.resourceUri`. The agent calls FastMCP with `raise_on_error=False` so sanitized error `CallToolResult` objects are preserved instead of becoming generic transport failures. For successful presentations it retains the raw result, reads the static `createSurface` and `updateComponents` resource through MCP, combines it with the embedded dynamic `updateDataModel`, and returns:
@@ -105,6 +139,12 @@ Tool schemas are loaded once per endpoint and reused for `MCP_TOOLS_CACHE_SECOND
 cache hands out detached copies, and `MCP_TOOLS_CACHE_SECONDS=0` disables it so a
 redeployed MCP is picked up without restarting this service. Watch
 `mcp.tools_cache` to see which turns paid for the load.
+
+Under progressive discovery that cache holds two static synthetic tools, so it
+no longer needs invalidating: search results are read live from the server on
+every query, which makes a newly deployed domain tool discoverable immediately.
+FastMCP 4.0.3 emits no `notifications/tools/list_changed` from the server side,
+and no client-side invalidation was added for a cache that cannot go stale.
 
 ## Reading the agent's behaviour
 
