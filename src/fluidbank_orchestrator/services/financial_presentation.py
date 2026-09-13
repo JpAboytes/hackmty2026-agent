@@ -330,7 +330,9 @@ def _transaction_rows(
     currency = _currency(profile)
     mapped: list[dict[str, Any]] = []
     source_rows = _rows_for_table(observations, "transactions")
-    row_currencies = {row.get("currency") for row in source_rows if row.get("currency") in {"MXN", "USD"}}
+    row_currencies = {
+        row.get("currency") for row in source_rows if row.get("currency") in {"MXN", "USD"}
+    }
     if len(row_currencies) == 1:
         currency = cast("str", next(iter(row_currencies)))
     elif len(row_currencies) > 1:
@@ -434,15 +436,33 @@ def _spending_view(
             and isinstance(daily, list)
         ):
             currency = summaries[0].get("currency") if isinstance(summaries[0], Mapping) else None
-            total = _number(summaries[0].get("expenses")) if isinstance(summaries[0], Mapping) else None
+            total = (
+                _number(summaries[0].get("expenses")) if isinstance(summaries[0], Mapping) else None
+            )
             if currency in {"MXN", "USD"} and total is not None:
+                # Several database categories collapse onto one visual category:
+                # `groceries` and `dining` are both food, and `subscription`,
+                # `credit_card` and `housing` are all other. The amounts have to be
+                # summed before the view is built, because the contract allows one
+                # row per visual category and rejects a repeated one - mapping the
+                # rows one by one made every spending answer fail validation.
+                category_totals: defaultdict[str, float] = defaultdict(float)
+                for item in categories:
+                    if not isinstance(item, Mapping) or item.get("currency") != currency:
+                        continue
+                    amount = _number(item.get("amount"))
+                    if amount is None or amount < 0:
+                        continue
+                    name = _CATEGORY_MAP.get(str(item.get("category")), "other")
+                    # Spending views describe expenses; an income bucket is not one.
+                    if name == "income":
+                        continue
+                    category_totals[name] += amount
                 category_data = [
-                    {
-                        "category": _CATEGORY_MAP.get(str(item.get("category")), "other"),
-                        "amount": _number(item.get("amount")) or 0,
-                    }
-                    for item in categories[:8]
-                    if isinstance(item, Mapping) and item.get("currency") == currency
+                    {"category": name, "amount": amount}
+                    for name, amount in sorted(
+                        category_totals.items(), key=lambda entry: (-entry[1], entry[0])
+                    )[:8]
                 ]
                 daily_data = [
                     {"date": str(item.get("date")), "value": _number(item.get("amount")) or 0}
@@ -462,9 +482,7 @@ def _spending_view(
                                 {"label": item["date"], "values": [item["value"]]}
                                 for item in daily_data[:240]
                             ],
-                            "series": [
-                                {"id": "expenses", "label": "Gastos", "tone": "orange"}
-                            ],
+                            "series": [{"id": "expenses", "label": "Gastos", "tone": "orange"}],
                         },
                         "activity": {
                             "title": "Tus días de mayor gasto",
