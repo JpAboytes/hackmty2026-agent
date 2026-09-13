@@ -67,9 +67,10 @@ Configure `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE
 
 ## Tool discovery
 
-The MCP server no longer advertises its domain catalog. Its `tools/list` carries
-two tools — `search_tools` and `call_tool` — and everything else is found
-through them, so Gemini is bound to two schemas per turn instead of seventeen.
+The MCP server no longer advertises its domain catalog. The model-facing part of
+`tools/list` carries `search_tools` and `call_tool`; three pinned app-only tools
+remain available only to the trusted host. Everything else is found through
+discovery, so Gemini is bound to two schemas per turn instead of seventeen.
 
 ```text
 agent -> search_tools("deudas pendientes") -> agent -> call_tool(...) -> agent
@@ -79,7 +80,7 @@ A hosted MCP resolves `tools/call` against its advertised catalog, so a tool
 hidden by discovery is not callable by name there — it has to be addressed
 through `call_tool`. `_wire_call` makes that decision from the live catalog, so
 pinning or unpinning a tool server-side needs no change here. The tools the
-server does advertise purely so a host can address them (`select_rows`,
+server does advertise purely so a host can address them (`get_user_context`,
 `a2ui_action`, `a2ui_form`) are called directly and are kept out of the prompt
 by their own `_meta.ui.visibility` declaration, which this orchestrator honours
 as the host the MCP Apps spec expects.
@@ -170,13 +171,13 @@ timeline that aggregates the stages, which is where latency work starts:
 
 ```text
 17:03:28 INFO [t0001] agent: turn start input=query query_chars=21 user=68dc4d66
-17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=1 status=ok duration_ms=20.6
+17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=5 status=ok duration_ms=20.6
 17:03:28 INFO [t0001] agent: node.fetch_context outcome=resolved accounts=1 has_balance=true status=ok duration_ms=41.1
-17:03:28 INFO [t0001] agent: node.agent turn=0 observations=0 decision=financial_retrieval intent=financial-summary source=classifier calls=select_rows status=ok duration_ms=0.0
-17:03:28 INFO [t0001] agent: graph.route node=agent next=tools
-17:03:28 INFO [t0001] agent: tool.call name=select_rows table=accounts is_error=false rows=1 a2ui=false status=ok duration_ms=30.3
+17:03:28 INFO [t0001] agent: mcp.call name=get_user_context is_error=false contents=1 status=ok duration_ms=30.3
+17:03:28 INFO [t0001] agent: node.agent turn=0 observations=0 decision=financial_ready intent=financial-summary source=classifier status=ok duration_ms=0.0
+17:03:28 INFO [t0001] agent: graph.route node=agent next=select_presentation
 17:03:28 INFO [t0001] agent: client.response route=graph message_chars=64 data_keys=currency,owned_balance a2ui=true resource_uri=a2ui://financial/view a2ui_messages=3 a2ui_bytes=2104
-17:03:28 INFO [t0001] agent: turn done status=ok total_ms=104.7 | node.load_tools=21ms node.fetch_context=41ms node.agent=0msx2 tool.call=30ms node.tools=30ms node.build_presentation=6ms
+17:03:28 INFO [t0001] agent: turn done status=ok total_ms=104.7 | node.load_tools=21ms node.fetch_context=41ms node.agent=0ms node.build_presentation=6ms
 ```
 
 Stage names are stable, so `grep` answers specific questions:

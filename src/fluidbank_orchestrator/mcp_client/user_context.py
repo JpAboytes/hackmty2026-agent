@@ -9,13 +9,10 @@ invented number.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from math import isfinite
-from typing import Any, cast
+from typing import cast
 from uuid import UUID
-
-from fastmcp import Client
 
 from ..observability import stage
 from ..state import UserProfile
@@ -23,6 +20,7 @@ from .errors import MCPConfigurationError, UserContextError
 from .execution import call_mcp_tool
 from .models import UserContext
 from .session import session
+from .tool_names import USER_CONTEXT_TOOL_NAME
 from .trusted_scope import require_current_user_id
 
 # Accessible defaults for an account that has not chosen presentation settings
@@ -35,33 +33,14 @@ _DEFAULT_PREFERENCES: dict[str, str] = {
 }
 
 
-async def _select(
-    client: Client[Any],
-    server_identity: str,
-    table: str,
-    current_user_id: UUID,
-) -> list[dict[str, object]]:
-    execution = await call_mcp_tool(
-        client,
-        server_identity,
-        "select_rows",
-        {
-            "schema": "public",
-            "table": table,
-        },
-        current_user_id=current_user_id,
-    )
-    # Read the wire payload rather than `.data`: `select_rows` is not advertised
-    # in `tools/list` under progressive discovery, so the client has no output
-    # schema to deserialize it into a typed object.
-    structured = execution.result.structured_content
-    rows = structured.get("rows") if isinstance(structured, Mapping) else None
+def _context_rows(structured: Mapping[str, object], key: str) -> list[dict[str, object]]:
+    rows = structured.get(key)
     if not isinstance(rows, list):
-        raise UserContextError("the MCP selection result was invalid")
+        raise UserContextError("the MCP user context result was invalid")
     validated: list[dict[str, object]] = []
     for row in rows:
         if not isinstance(row, dict) or any(not isinstance(key, str) for key in row):
-            raise UserContextError("the MCP selection result was invalid")
+            raise UserContextError("the MCP user context result was invalid")
         validated.append(cast("dict[str, object]", dict(row)))
     return validated
 
@@ -144,30 +123,28 @@ async def fetch_user_context(current_user_id: UUID) -> UserContext:
     current_user_id = require_current_user_id(current_user_id)
     try:
         async with session("user_context") as (client, identity):
-            # The four reads are independent, so the profile costs one round
-            # trip instead of four. Membership is still enforced: an id that
-            # belongs to nobody returns no user row and fails below, and MCP
-            # scopes every one of these selects server-side regardless.
-            async with stage("mcp.user_context", selects=5, concurrent=True):
-                (
-                    user_rows,
-                    prefs_rows,
-                    account_rows,
-                    subscription_rows,
-                    card_rows,
-                ) = await asyncio.gather(
-                    _select(client, identity, "users", current_user_id),
-                    _select(client, identity, "accessibility_preferences", current_user_id),
-                    _select(client, identity, "accounts", current_user_id),
-                    _select(client, identity, "subscriptions", current_user_id),
-                    # A balance answer shows the plastic beside the totals. The read
-                    # joins the concurrent context gather rather than costing the
-                    # summary a second turn, and `select_rows` is pinned precisely
-                    # because the orchestrator builds this context by name.
-                    _select(client, identity, "cards", current_user_id),
+            # MCP owns the fixed table set and performs its independent reads
+            # concurrently. The agent receives no caller-selected query surface.
+            async with stage("mcp.user_context", calls=1):
+                execution = await call_mcp_tool(
+                    client,
+                    identity,
+                    USER_CONTEXT_TOOL_NAME,
+                    {},
+                    current_user_id=current_user_id,
                 )
-            if not user_rows:
+            structured = execution.result.structured_content
+            if not isinstance(structured, Mapping) or structured.get("ok") is not True:
+                raise UserContextError("the MCP user context result was invalid")
+            if structured.get("user_found") is not True:
                 raise UserContextError("no user found for the supplied user id")
+            raw_preferences = structured.get("preferences")
+            if raw_preferences is not None and not isinstance(raw_preferences, Mapping):
+                raise UserContextError("the MCP user context result was invalid")
+            prefs = dict(raw_preferences) if isinstance(raw_preferences, Mapping) else None
+            account_rows = _context_rows(structured, "accounts")
+            subscription_rows = _context_rows(structured, "subscriptions")
+            card_rows = _context_rows(structured, "cards")
     except MCPConfigurationError:
         raise
     except UserContextError:
@@ -177,7 +154,7 @@ async def fetch_user_context(current_user_id: UUID) -> UserContext:
 
     # An account with no stored preferences reads with the accessible defaults
     # rather than losing its real balances to the generic fallback profile.
-    prefs = prefs_rows[0] if prefs_rows else _DEFAULT_PREFERENCES
+    prefs = prefs or _DEFAULT_PREFERENCES
     # Only the domain tables a later financial read would ask for again. The
     # user and preference rows stay out: nothing re-reads them, and they carry
     # identity fields that have no business travelling through graph state.

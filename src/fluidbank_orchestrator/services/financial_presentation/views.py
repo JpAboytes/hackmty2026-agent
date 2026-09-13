@@ -446,11 +446,7 @@ def _spending_from_transactions(
             "expense_total": total,
             "currency": currency,
             "source_result_count": sum(
-                1
-                for observation in observations
-                if observation.get("name") == "select_rows"
-                and isinstance(observation.get("arguments"), Mapping)
-                and observation["arguments"].get("table") == "transactions"
+                1 for observation in observations if observation.get("name") == "get_transactions"
             ),
         },
         f"Analicé {total:,.2f} {currency} de gastos.",
@@ -511,9 +507,7 @@ def recurring_view(observations: Sequence[Mapping[str, Any]], profile: UserProfi
     return view, {"presentation_intent": "recurring-payments"}, "Estos son tus próximos cobros."
 
 
-def credit_card_view(
-    observations: Sequence[Mapping[str, Any]], profile: UserProfile
-) -> ViewResult:
+def credit_card_view(observations: Sequence[Mapping[str, Any]], profile: UserProfile) -> ViewResult:
     """One verified credit account, its masked card and current contractual terms."""
     observation = next(
         (
@@ -533,18 +527,22 @@ def credit_card_view(
         and isinstance(domain, Mapping)
     ):
         raw_cards = domain.get("cards")
-        accounts = [
-            {
-                "id": card.get("account_id"),
-                "account_type": "credit",
-                "currency": card.get("currency"),
-                "available_balance": card.get("available_credit"),
-                "cards": [card],
-                "credit_terms": card.get("credit_terms"),
-            }
-            for card in raw_cards
-            if isinstance(card, Mapping)
-        ] if isinstance(raw_cards, list) else None
+        accounts = (
+            [
+                {
+                    "id": card.get("account_id"),
+                    "account_type": "credit",
+                    "currency": card.get("currency"),
+                    "available_balance": card.get("available_credit"),
+                    "cards": [card],
+                    "credit_terms": card.get("credit_terms"),
+                }
+                for card in raw_cards
+                if isinstance(card, Mapping)
+            ]
+            if isinstance(raw_cards, list)
+            else None
+        )
     if not isinstance(accounts, list):
         return _empty_result(
             "credit-card",

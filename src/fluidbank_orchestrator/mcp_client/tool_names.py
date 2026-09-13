@@ -42,6 +42,7 @@ FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
 # what may execute, only how a model reaches a capability.
 SEARCH_TOOL_NAME = "search_tools"
 CALL_TOOL_NAME = "call_tool"
+USER_CONTEXT_TOOL_NAME = "get_user_context"
 DISCOVERY_TOOL_NAMES = frozenset({SEARCH_TOOL_NAME, CALL_TOOL_NAME})
 
 
@@ -64,7 +65,7 @@ def addressable_financial_tool_names(advertised_names: Iterable[str]) -> frozens
 # through this set would be trusting model-supplied identity.
 SCOPED_TOOL_NAMES = frozenset(
     {
-        "select_rows",
+        USER_CONTEXT_TOOL_NAME,
         "visualize_allowed_data",
         "a2ui_action",
         "a2ui_form",

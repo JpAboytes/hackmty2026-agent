@@ -31,6 +31,7 @@ from .tool_names import (
     FINANCIAL_DOMAIN_TOOL_NAMES,
     SCOPED_TOOL_NAMES,
     SEARCH_TOOL_NAME,
+    USER_CONTEXT_TOOL_NAME,
     addressable_financial_tool_names,
 )
 from .trusted_scope import (
@@ -47,6 +48,7 @@ __all__ = [
     "FINANCIAL_DOMAIN_TOOL_NAMES",
     "SCOPED_TOOL_NAMES",
     "SEARCH_TOOL_NAME",
+    "USER_CONTEXT_TOOL_NAME",
     "MCPAuthMode",
     "MCPConfig",
     "MCPConfigurationError",

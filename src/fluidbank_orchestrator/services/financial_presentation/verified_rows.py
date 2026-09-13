@@ -21,7 +21,7 @@ _SUPPORTED_CURRENCIES = frozenset({"MXN", "USD"})
 def rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> list[dict[str, Any]]:
     """Every verified row for one table, deduplicated by identifier.
 
-    Both shapes count as the same table: a scoped ``select_rows`` read, and the
+    Both shapes count as the same table: the fixed application context and the
     domain tool that returns the same entity (``get_transactions``).
     """
     rows: list[dict[str, Any]] = []
@@ -32,7 +32,7 @@ def rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> lis
         arguments = observation.get("arguments")
         data = observation.get("data")
         raw_rows: object = None
-        if observation.get("name") == "select_rows":
+        if observation.get("name") == "get_user_context":
             if not isinstance(arguments, Mapping) or arguments.get("table") != table:
                 continue
             raw_rows = data.get("rows") if isinstance(data, Mapping) else None

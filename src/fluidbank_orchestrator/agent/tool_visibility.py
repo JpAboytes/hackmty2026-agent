@@ -17,13 +17,13 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, cast
 
-from ..mcp_client import FINANCIAL_DOMAIN_TOOL_NAMES, MCPToolDefinition
+from ..mcp_client import FINANCIAL_DOMAIN_TOOL_NAMES, USER_CONTEXT_TOOL_NAME, MCPToolDefinition
 from ..state import GraphState
 
 #: Tools whose schemas legitimately declare trusted fields the orchestrator
 #: fills in. Showing them would invite a fabricated user id.
 _IDENTITY_BEARING_TOOL_NAMES = FINANCIAL_DOMAIN_TOOL_NAMES | {
-    "select_rows",
+    USER_CONTEXT_TOOL_NAME,
     "visualize_allowed_data",
 }
 

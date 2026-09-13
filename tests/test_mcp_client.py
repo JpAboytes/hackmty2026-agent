@@ -17,9 +17,11 @@ from fluidbank_orchestrator.mcp_client import (
     CALL_TOOL_NAME,
     DISCOVERY_TOOL_NAMES,
     SEARCH_TOOL_NAME,
+    USER_CONTEXT_TOOL_NAME,
     MCPConfig,
     MCPConfigurationError,
     MCPToolDefinition,
+    MCPToolExecution,
     TrustedUserScopeError,
     UserContextError,
     call_mcp_tool,
@@ -180,72 +182,74 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_context_scopes_every_selection_to_user_id(
+async def test_fetch_user_context_uses_one_fixed_scoped_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
     user_id = UUID("11111111-1111-1111-1111-111111111111")
-    calls: list[tuple[str, UUID]] = []
+    calls: list[tuple[str, dict[str, object], UUID]] = []
 
-    async def fake_select(
+    async def fake_context(
         client: _FakeClient,
         server_identity: str,
-        table: str,
+        name: str,
+        arguments: dict[str, object],
+        *,
         current_user_id: UUID,
-    ) -> list[dict[str, object]]:
+    ) -> MCPToolExecution:
         del client
         assert server_identity == _URL
-        calls.append((table, current_user_id))
-        rows: dict[str, list[dict[str, object]]] = {
-            "users": [{"id": str(user_id)}],
-            "accessibility_preferences": [
-                {
-                    "literacy_level": "standard",
-                    "font_scale": "1.0",
-                    "contrast": "standard",
-                    "hit_target": "standard",
-                }
-            ],
-            "accounts": [
-                {
-                    "account_type": "checking",
-                    "currency": "MXN",
-                    "available_balance": "1250.50",
+        calls.append((name, arguments, current_user_id))
+        return MCPToolExecution(
+            result=CallToolResult(
+                content=[TextContent(text="Context loaded.")],
+                structured_content={
+                    "ok": True,
+                    "user_found": True,
+                    "preferences": {
+                        "literacy_level": "standard",
+                        "font_scale": "1.0",
+                        "contrast": "standard",
+                        "hit_target": "standard",
+                    },
+                    "accounts": [
+                        {
+                            "account_type": "checking",
+                            "currency": "MXN",
+                            "available_balance": "1250.50",
+                        },
+                        {
+                            "account_type": "credit",
+                            "currency": "MXN",
+                            "available_balance": "9000.00",
+                        },
+                    ],
+                    "subscriptions": [{"amount": "19.99", "status": "active"}],
+                    "cards": [
+                        {
+                            "id": "card-1",
+                            "account_id": "account-1",
+                            "display_name": "Tarjeta Oro",
+                            "card_type": "credit",
+                            "network": "mastercard",
+                            "last_four": "9012",
+                            "status": "active",
+                        }
+                    ],
                 },
-                {
-                    "account_type": "credit",
-                    "currency": "MXN",
-                    "available_balance": "9000.00",
-                },
-            ],
-            "subscriptions": [{"amount": "19.99", "status": "active"}],
-            "cards": [
-                {
-                    "id": "card-1",
-                    "account_id": "account-1",
-                    "display_name": "Tarjeta Oro",
-                    "card_type": "credit",
-                    "network": "mastercard",
-                    "last_four": "9012",
-                    "status": "active",
-                }
-            ],
-        }
-        return rows[table]
+                meta=None,
+                data=None,
+            ),
+            a2ui=None,
+        )
 
     monkeypatch.setattr(mcp_session_module, "load_mcp_config", lambda: config)
     monkeypatch.setattr(mcp_session_module, "create_mcp_client", lambda _config: _FakeClient())
-    monkeypatch.setattr(mcp_user_context, "_select", fake_select)
+    monkeypatch.setattr(mcp_user_context, "call_mcp_tool", fake_context)
 
     profile = (await fetch_user_context(user_id)).profile
 
-    assert calls == [
-        ("users", user_id),
-        ("accessibility_preferences", user_id),
-        ("accounts", user_id),
-        ("subscriptions", user_id),
-        ("cards", user_id),
-    ]
+    assert calls == [(USER_CONTEXT_TOOL_NAME, {}, user_id)]
     assert profile["available_balance"] == 1250.50
     assert profile["owned_balances"] == {"MXN": 1250.50}
     assert profile["recurring_expenses"] == 19.99
@@ -265,31 +269,41 @@ async def test_a_new_user_without_preferences_keeps_its_own_balances(
     config = MCPConfig(url=_URL, auth_mode="horizon", _horizon_api_key=_TOKEN)
     user_id = UUID("c72428ad-ebaf-4709-b832-2c0f5094d685")
 
-    async def fake_select(
+    async def fake_context(
         client: _FakeClient,
         server_identity: str,
-        table: str,
+        name: str,
+        arguments: dict[str, object],
+        *,
         current_user_id: UUID,
-    ) -> list[dict[str, object]]:
-        del client, server_identity, current_user_id
-        rows: dict[str, list[dict[str, object]]] = {
-            "users": [{"id": str(user_id)}],
-            "accessibility_preferences": [],
-            "accounts": [
-                {
-                    "account_type": "savings",
-                    "currency": "MXN",
-                    "available_balance": "42.00",
-                }
-            ],
-            "subscriptions": [],
-            "cards": [],
-        }
-        return rows[table]
+    ) -> MCPToolExecution:
+        del client, server_identity, name, arguments, current_user_id
+        return MCPToolExecution(
+            result=CallToolResult(
+                content=[TextContent(text="Context loaded.")],
+                structured_content={
+                    "ok": True,
+                    "user_found": True,
+                    "preferences": None,
+                    "accounts": [
+                        {
+                            "account_type": "savings",
+                            "currency": "MXN",
+                            "available_balance": "42.00",
+                        }
+                    ],
+                    "subscriptions": [],
+                    "cards": [],
+                },
+                meta=None,
+                data=None,
+            ),
+            a2ui=None,
+        )
 
     monkeypatch.setattr(mcp_session_module, "load_mcp_config", lambda: config)
     monkeypatch.setattr(mcp_session_module, "create_mcp_client", lambda _config: _FakeClient())
-    monkeypatch.setattr(mcp_user_context, "_select", fake_select)
+    monkeypatch.setattr(mcp_user_context, "call_mcp_tool", fake_context)
 
     profile = (await fetch_user_context(user_id)).profile
 
@@ -335,12 +349,8 @@ class _RecordingClient:
     ("tool_name", "model_arguments", "scope_path"),
     [
         (
-            "select_rows",
-            {
-                "schema": "public",
-                "table": "transactions",
-                "scope": {"user_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
-            },
+            USER_CONTEXT_TOOL_NAME,
+            {"scope": {"user_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}},
             ("scope",),
         ),
         (
@@ -391,8 +401,8 @@ async def test_scoped_mcp_call_without_identity_fails_closed_before_calling_clie
         await call_mcp_tool(  # type: ignore[arg-type]
             client,
             _URL,
-            "select_rows",
-            {"schema": "public", "table": "transactions"},
+            USER_CONTEXT_TOOL_NAME,
+            {},
         )
 
     assert client.calls == []
@@ -408,7 +418,7 @@ def _empty_tools_cache() -> Iterator[None]:
 def _tool_loader(calls: list[int]) -> Any:
     async def load() -> list[MCPToolDefinition]:
         calls.append(1)
-        return [MCPToolDefinition("select_rows", "Select scoped rows.", {"type": "object"})]
+        return [MCPToolDefinition(SEARCH_TOOL_NAME, "Search tools.", {"type": "object"})]
 
     return load
 
@@ -426,7 +436,7 @@ async def test_tool_schemas_are_loaded_once_and_reused(
     second = await list_remote_tools()
 
     assert calls == [1]
-    assert [tool.name for tool in first] == [tool.name for tool in second] == ["select_rows"]
+    assert [tool.name for tool in first] == [tool.name for tool in second] == [SEARCH_TOOL_NAME]
 
 
 @pytest.mark.asyncio
@@ -438,7 +448,7 @@ async def test_concurrent_misses_load_the_collection_only_once(
     async def slow() -> list[MCPToolDefinition]:
         calls.append(1)
         await asyncio.sleep(0.01)
-        return [MCPToolDefinition("select_rows", "Select scoped rows.", {"type": "object"})]
+        return [MCPToolDefinition(SEARCH_TOOL_NAME, "Search tools.", {"type": "object"})]
 
     monkeypatch.setattr(mcp_catalog, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
     monkeypatch.setattr(mcp_catalog, "_load_remote_tools", slow)

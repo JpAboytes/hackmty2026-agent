@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from ..mcp_client import SEARCH_TOOL_NAME, MCPToolExecution
+from ..mcp_client import SEARCH_TOOL_NAME, USER_CONTEXT_TOOL_NAME, MCPToolExecution
 from ..state import GraphState, ToolObservation
 
 
@@ -50,7 +50,7 @@ def context_observations(rows: Mapping[str, list[dict[str, object]]]) -> list[To
     """Record the profile's scoped reads in the shape a domain read produces."""
     return [
         {
-            "name": "select_rows",
+            "name": USER_CONTEXT_TOOL_NAME,
             "arguments": {"schema": "public", "table": table},
             "is_error": False,
             "data": {"ok": True, "rows": deepcopy(table_rows)},
@@ -70,7 +70,7 @@ def has_tool_observation(state: GraphState, tool_name: str) -> bool:
 def has_table_observation(state: GraphState, table: str) -> bool:
     """Whether a successful retained context read verified this table."""
     return any(
-        observation.get("name") == "select_rows"
+        observation.get("name") == USER_CONTEXT_TOOL_NAME
         and observation.get("is_error") is not True
         and observation.get("arguments", {}).get("table") == table
         for observation in retained_observations(state)

@@ -58,7 +58,6 @@ def _state(query: str) -> dict[str, object]:
 def test_financial_intent_routes_to_one_domain_tool(query: str, intent: str, expected: str) -> None:
     turn = financial_data_turn(_state(query), intent)  # type: ignore[arg-type]
     assert [call["name"] for call in turn.tool_calls] == [expected]
-    assert turn.tool_calls[0]["name"] != "select_rows"
 
 
 def test_credit_card_request_uses_the_dedicated_card_contract() -> None:
@@ -287,7 +286,7 @@ def _summary_observations(card_rows: list[dict[str, object]]) -> list[dict[str, 
     """Context rows in the shape `fetch_user_context` retains them."""
     return [
         {
-            "name": "select_rows",
+            "name": "get_user_context",
             "arguments": {"schema": "public", "table": table},
             "is_error": False,
             "data": {"ok": True, "rows": rows},

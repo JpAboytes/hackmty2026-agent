@@ -224,7 +224,7 @@ def test_finance_v2_banking_view_accepts_valid_summary_and_rejects_unknown_props
     }
     observations = [
         {
-            "name": "select_rows",
+            "name": "get_user_context",
             "arguments": {"table": "accounts"},
             "is_error": False,
             "data": {

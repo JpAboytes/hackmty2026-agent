@@ -24,6 +24,7 @@ from .tool_names import (
     FINANCIAL_DOMAIN_TOOL_NAMES,
     SCOPED_TOOL_NAMES,
     SEARCH_TOOL_NAME,
+    USER_CONTEXT_TOOL_NAME,
 )
 
 #: A model that re-wraps the envelope nests it once, so two levels is enough to
@@ -174,12 +175,8 @@ def enforce_trusted_user_scope(
         request.pop("user_id", None)
         request.pop("email", None)
         scoped = {"request": request}
-    elif tool_name == "select_rows":
-        scoped["scope"] = canonical_scope
-        scoped["filters"] = _business_filters(
-            scoped.get("filters"),
-            users_table=scoped.get("schema") == "public" and scoped.get("table") == "users",
-        )
+    elif tool_name == USER_CONTEXT_TOOL_NAME:
+        scoped = {"scope": canonical_scope}
     elif tool_name == "visualize_allowed_data":
         raw_request = scoped.get("request")
         request = deepcopy(dict(raw_request)) if isinstance(raw_request, Mapping) else {}

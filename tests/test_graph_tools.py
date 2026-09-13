@@ -222,11 +222,11 @@ async def test_a_table_the_profile_never_read_is_still_fetched(
 def test_spending_analysis_retains_and_combines_multiple_tool_results() -> None:
     observations = [
         {
-            "name": "select_rows",
+            "name": "get_transactions",
             "arguments": {"table": "transactions"},
             "is_error": False,
             "data": {
-                "rows": [
+                "transactions": [
                     {
                         "id": "food-1",
                         "amount": 75,
@@ -239,11 +239,11 @@ def test_spending_analysis_retains_and_combines_multiple_tool_results() -> None:
             },
         },
         {
-            "name": "select_rows",
+            "name": "get_transactions",
             "arguments": {"table": "transactions", "offset": 1},
             "is_error": False,
             "data": {
-                "rows": [
+                "transactions": [
                     {
                         "id": "transport-1",
                         "amount": 25,
@@ -285,25 +285,6 @@ async def test_semantic_activity_request_does_not_require_chart_keyword(
     assert [name for name, _ in calls] == ["analyze_spending"]
     assert calls[0][1]["request"]["period"] == "current_month"
     assert result["financial_presentation"].intent == "spending-analysis"
-
-
-def test_scope_overwrites_model_ownership_and_keeps_business_filters() -> None:
-    scoped = enforce_trusted_user_scope(
-        "select_rows",
-        {
-            "schema": "public",
-            "table": "transactions",
-            "scope": {"user_id": USER_B},
-            "filters": [
-                {"column": "account_id", "operator": "eq", "value": "other"},
-                {"column": "category", "operator": "eq", "value": "groceries"},
-            ],
-        },
-        USER_A,
-    )
-    assert scoped is not None
-    assert scoped["scope"] == {"user_id": str(USER_A)}
-    assert scoped["filters"] == [{"column": "category", "operator": "eq", "value": "groceries"}]
 
 
 def test_visualization_scope_is_overwritten_without_mutating_model_arguments() -> None:
