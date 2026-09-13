@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from .mcp_client import (
+    FINANCIAL_DOMAIN_TOOL_NAMES,
     MCPConfigurationError,
     MCPToolDefinition,
     MCPToolExecution,
@@ -80,11 +83,25 @@ class ToolAwareModel(Protocol):
 _MODEL_PROMPT = """Eres un asistente bancario accesible y conciso. Responde en español.
 Usa exclusivamente los datos proporcionados y las herramientas MCP disponibles.
 Después de consultar datos financieros, elige como máximo una semántica de presentación
-de la lista permitida. Puedes usar visualize_allowed_data cuando una tendencia o actividad
-se beneficie de una gráfica aunque el usuario no diga "gráfica"; no la uses para un saldo escalar.
-Nunca inventes esquemas, tablas o columnas: descubre primero con list_allowed_tables y
-describe_table. Usa area para tendencias ordenadas y comparaciones; usa heatmap para
-actividad o intensidad por fecha. No fuerces gráficas para preguntas de valores o texto.
+de la lista permitida. Las tools financieras ya devuelven contratos semánticos y chart-ready;
+no consultes ni interpretes el esquema PostgreSQL y no uses select_rows para finanzas.
+Selección rápida / Quick selection:
+Resumen general / General overview -> get_financial_overview
+Cuentas o tarjetas / Accounts or cards -> get_accounts
+Movimientos específicos / Specific transactions -> get_transactions
+Patrones, categorías o comercios / Patterns, categories, merchants -> analyze_spending
+Ingresos contra gastos / Income versus expenses -> get_cash_flow
+Presupuestos / Budgets -> get_budget_progress
+Metas de ahorro / Savings goals -> get_savings_progress
+Deudas y crédito / Debts and credit cards -> get_debt_overview
+Próximos pagos / Upcoming payments -> get_upcoming_payments
+Alertas / Alerts -> get_financial_alerts
+Estados de cuenta / Bank statements -> get_bank_statements
+Actividad de pagos / Payment activity -> get_payment_activity
+Beneficiarios / Beneficiaries -> get_beneficiaries
+Aclaraciones / Disputes -> get_transaction_disputes
+Escenarios de deuda / Debt scenarios -> compare_debt_scenarios
+Usa la menor cantidad de tools. No llames get_transactions antes de analyze_spending.
 No generes ni copies JSON A2UI: el puente de la aplicación conserva el resultado MCP.
 El ámbito de usuario lo aplica la aplicación: nunca elijas ni cambies scope, user_id,
 customer_id, account_id, owner_id o persona_id.
@@ -250,7 +267,7 @@ def _strip_model_identity_fields(node: Any) -> Any:
 
 def _model_tool_schema(tool: MCPToolDefinition) -> dict[str, Any]:
     schema = _gemini_safe_schema(deepcopy(tool.input_schema))
-    if tool.name in {"select_rows", "visualize_allowed_data"}:
+    if tool.name in FINANCIAL_DOMAIN_TOOL_NAMES | {"select_rows", "visualize_allowed_data"}:
         schema = _strip_model_identity_fields(schema)
     return cast("dict[str, Any]", schema)
 
@@ -307,58 +324,113 @@ def _has_table_observation(state: GraphState, table: str) -> bool:
     )
 
 
-def _financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTurn:
-    """Plan only bounded domain reads; presentation is selected in a later node."""
-    available = {tool.name for tool in _tool_definitions(state)}
-    table_by_intent = {
-        "financial-summary": "accounts",
-        "transactions": "transactions",
-        "spending-analysis": "transactions",
-        "recurring-payments": "subscriptions",
-    }
-    table = table_by_intent.get(intent)
-    if table is None or _has_table_observation(state, table):
-        return ModelTurn(message="")
-    if "select_rows" not in available:
-        return ModelTurn(message="No está disponible la consulta financiera requerida.")
+def _normalized_query(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
 
-    columns_by_table = {
-        "accounts": ["id", "account_type", "currency", "available_balance"],
-        "transactions": ["id", "amount", "direction", "category", "merchant", "occurred_at"],
-        "subscriptions": [
-            "id",
-            "name",
-            "amount",
-            "billing_cycle",
-            "next_charge_date",
-            "status",
-        ],
+
+def _has_tool_observation(state: GraphState, tool_name: str) -> bool:
+    return any(
+        observation.get("name") == tool_name
+        for observation in state.get("tool_observations", [])
+    )
+
+
+def _financial_data_turn(state: GraphState, intent: FinancialIntent) -> ModelTurn:
+    """Plan the smallest bilingual financial-domain read for the request."""
+    available = {tool.name for tool in _tool_definitions(state)}
+    text = _normalized_query(state["user_query"])
+    tool_by_intent = {
+        "financial-summary": "get_financial_overview",
+        "transactions": "get_transactions",
+        "spending-analysis": "analyze_spending",
+        "cash-flow": "get_cash_flow",
+        "budgets": "get_budget_progress",
+        "recurring-payments": "get_upcoming_payments",
+        "credit-card": "get_debt_overview",
+        "debts": "get_debt_overview",
+        "transfers": "get_payment_activity",
+        "card-security": "get_transaction_disputes",
+        "savings-goals": "get_savings_progress",
+        "banking-information": "get_accounts",
     }
-    arguments: dict[str, Any] = {
-        "schema": "public",
-        "table": table,
-        "columns": columns_by_table[table],
-        "limit": 100 if table == "transactions" else 50,
-    }
-    if table == "transactions":
-        arguments["order_by"] = [{"column": "occurred_at", "direction": "desc"}]
-        period_end = datetime.now(UTC)
-        period_start = period_end - timedelta(days=30)
-        arguments["filters"] = [
-            {
-                "column": "occurred_at",
-                "operator": "gte",
-                "value": period_start.isoformat(),
-            },
-            {
-                "column": "occurred_at",
-                "operator": "lte",
-                "value": period_end.isoformat(),
-            },
-        ]
+
+    if intent == "banking-information":
+        if any(term in text for term in ("estado de cuenta", "bank statement", "statement")):
+            tool_name = "get_bank_statements"
+        elif any(term in text for term in ("beneficiario", "beneficiary", "destinatario")):
+            tool_name = "get_beneficiaries"
+        else:
+            tool_name = "get_accounts"
+    elif intent == "financial-summary" and any(
+        term in text for term in ("alerta", "alert", "aviso", "warning")
+    ):
+        tool_name = "get_financial_alerts"
+    else:
+        tool_name = tool_by_intent.get(intent)
+
+    compare_requested = intent == "debts" and any(
+        term in text for term in ("compara", "comparar", "escenario", "compare", "scenario")
+    )
+    if compare_requested:
+        overview = next(
+            (
+                observation
+                for observation in state.get("tool_observations", [])
+                if observation.get("name") == "get_debt_overview"
+                and observation.get("is_error") is not True
+            ),
+            None,
+        )
+        if overview is None:
+            tool_name = "get_debt_overview"
+        else:
+            data = overview.get("data")
+            debts = data.get("debts") if isinstance(data, Mapping) else None
+            debt_id = debts[0].get("id") if isinstance(debts, list) and debts else None
+            if not isinstance(debt_id, str):
+                return ModelTurn(message="No encontré una deuda guardada para comparar.")
+            tool_name = "compare_debt_scenarios"
+            arguments = {
+                "request": {
+                    "debt_id": debt_id,
+                    "order_by": "lowest_total_interest",
+                }
+            }
+            if tool_name not in available or _has_tool_observation(state, tool_name):
+                return ModelTurn(message="")
+            return ModelTurn(
+                message="", tool_calls=({"name": tool_name, "arguments": arguments},)
+            )
+
+    if tool_name is None or _has_tool_observation(state, tool_name):
+        return ModelTurn(message="")
+    if tool_name not in available:
+        return ModelTurn(message="No está disponible la consulta financiera requerida.")
+    request: dict[str, Any] = {}
+    if tool_name in {"get_financial_overview", "get_transactions", "analyze_spending"}:
+        request["period"] = "current_month"
+    elif tool_name == "get_cash_flow":
+        request["period"] = "last_6_months" if any(
+            term in text for term in ("seis", "six", "6 meses", "6 months")
+        ) else "last_12_months"
+    elif tool_name == "get_payment_activity":
+        request["period"] = "last_90_days"
+    if tool_name == "get_transactions" and "uber" in text:
+        request["merchant_query"] = "Uber"
+    if tool_name == "get_budget_progress" and any(
+        term in text for term in ("comida", "alimentos", "food")
+    ):
+        request["category"] = "food"
+    if tool_name == "get_upcoming_payments":
+        match = re.search(r"\b(\d{1,3})\s+(?:dias|days)\b", text)
+        request["days_ahead"] = min(int(match.group(1)), 365) if match else 30
     return ModelTurn(
         message="",
-        tool_calls=({"name": "select_rows", "arguments": arguments},),
+        tool_calls=({"name": tool_name, "arguments": {"request": request}},),
     )
 
 

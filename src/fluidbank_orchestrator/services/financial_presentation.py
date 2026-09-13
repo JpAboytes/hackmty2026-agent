@@ -100,11 +100,16 @@ def classify_financial_request(query: str) -> FinancialIntent | None:
         (
             "financial-summary",
             (
+                "como van mis finanzas",
+                "como estan mis finanzas",
+                "resumen financiero",
                 "cuanto dinero tengo",
                 "cual es mi saldo",
                 "mi saldo disponible",
                 "how much money do i have",
                 "account balance",
+                "how are my finances",
+                "financial overview",
             ),
         ),
         (
@@ -118,21 +123,53 @@ def classify_financial_request(query: str) -> FinancialIntent | None:
                 "my spending",
             ),
         ),
-        ("transactions", ("movimientos", "transacciones", "transactions", "gaste ayer")),
-        ("cash-flow", ("flujo de efectivo", "me alcanzara", "cash flow")),
+        (
+            "transactions",
+            ("movimientos", "transacciones", "transactions", "gaste ayer", "compras de"),
+        ),
+        (
+            "cash-flow",
+            (
+                "flujo de efectivo",
+                "me alcanzara",
+                "cash flow",
+                "ingresos y gastos",
+                "income and expenses",
+            ),
+        ),
         ("budgets", ("presupuesto", "limite semanal", "budget")),
         (
             "recurring-payments",
-            ("pagos recurrentes", "suscripciones", "proximos cobros", "recurring payments"),
+            (
+                "pagos recurrentes",
+                "suscripciones",
+                "proximos cobros",
+                "proximos pagos",
+                "upcoming payments",
+                "recurring payments",
+            ),
         ),
         ("credit-card", ("tarjeta de credito", "pago minimo", "credit card")),
         ("debts", ("deuda", "liquidar", "debts")),
         ("transfers", ("transferir", "transferencia", "transfer")),
-        ("card-security", ("no reconozco", "bloquear tarjeta", "card security")),
-        ("savings-goals", ("meta de ahorro", "quiero ahorrar", "savings goal")),
+        (
+            "card-security",
+            ("no reconozco", "aclaracion", "disputa", "bloquear tarjeta", "card security"),
+        ),
+        (
+            "savings-goals",
+            ("meta de ahorro", "meta para", "quiero ahorrar", "savings goal"),
+        ),
         (
             "banking-information",
-            ("estado de cuenta", "clabe", "informacion bancaria", "bank statement"),
+            (
+                "estado de cuenta",
+                "clabe",
+                "informacion bancaria",
+                "bank statement",
+                "beneficiario",
+                "beneficiary",
+            ),
         ),
         (
             "financial-education",
@@ -166,15 +203,20 @@ def _rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> li
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for observation in observations:
-        if observation.get("name") != "select_rows" or observation.get("is_error") is True:
+        if observation.get("is_error") is True:
             continue
         arguments = observation.get("arguments")
         data = observation.get("data")
-        if not isinstance(arguments, Mapping) or arguments.get("table") != table:
+        raw_rows: object = None
+        if observation.get("name") == "select_rows":
+            if not isinstance(arguments, Mapping) or arguments.get("table") != table:
+                continue
+            raw_rows = data.get("rows") if isinstance(data, Mapping) else None
+        elif observation.get("name") == "get_transactions" and table == "transactions":
+            raw_rows = data.get("transactions") if isinstance(data, Mapping) else None
+        if not isinstance(raw_rows, list):
             continue
-        if not isinstance(data, Mapping) or not isinstance(data.get("rows"), list):
-            continue
-        for raw in data["rows"]:
+        for raw in raw_rows:
             if not isinstance(raw, Mapping):
                 continue
             row = deepcopy(dict(raw))
@@ -287,19 +329,28 @@ def _transaction_rows(
 ) -> tuple[list[dict[str, Any]], str | None]:
     currency = _currency(profile)
     mapped: list[dict[str, Any]] = []
-    for row in _rows_for_table(observations, "transactions"):
+    source_rows = _rows_for_table(observations, "transactions")
+    row_currencies = {row.get("currency") for row in source_rows if row.get("currency") in {"MXN", "USD"}}
+    if len(row_currencies) == 1:
+        currency = cast("str", next(iter(row_currencies)))
+    elif len(row_currencies) > 1:
+        currency = None
+    for row in source_rows:
         identifier = row.get("id")
         merchant = row.get("merchant")
         occurred_at = row.get("occurred_at")
         amount = _number(row.get("amount"))
         direction = row.get("direction")
+        normalized_direction = (
+            "credit" if direction == "income" else "debit" if direction == "expense" else direction
+        )
         if (
             not isinstance(identifier, str)
             or not isinstance(merchant, str)
             or not merchant.strip()
             or not isinstance(occurred_at, str)
             or amount is None
-            or direction not in {"credit", "debit"}
+            or normalized_direction not in {"credit", "debit"}
         ):
             continue
         try:
@@ -313,7 +364,7 @@ def _transaction_rows(
             {
                 "transactionId": identifier,
                 "title": merchant.strip()[:120],
-                "amount": abs(amount) if direction == "credit" else -abs(amount),
+                "amount": abs(amount) if normalized_direction == "credit" else -abs(amount),
                 "occurredAt": occurred_at,
                 "category": category,
                 "status": "completed",
@@ -362,6 +413,72 @@ def _transactions_view(
 def _spending_view(
     observations: Sequence[Mapping[str, Any]], profile: UserProfile
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
+    domain = next(
+        (
+            observation.get("data")
+            for observation in reversed(observations)
+            if observation.get("name") == "analyze_spending"
+            and observation.get("is_error") is not True
+            and isinstance(observation.get("data"), Mapping)
+        ),
+        None,
+    )
+    if isinstance(domain, Mapping):
+        summaries = domain.get("summary_by_currency")
+        categories = domain.get("by_category")
+        daily = domain.get("daily_series")
+        if (
+            isinstance(summaries, list)
+            and len(summaries) == 1
+            and isinstance(categories, list)
+            and isinstance(daily, list)
+        ):
+            currency = summaries[0].get("currency") if isinstance(summaries[0], Mapping) else None
+            total = _number(summaries[0].get("expenses")) if isinstance(summaries[0], Mapping) else None
+            if currency in {"MXN", "USD"} and total is not None:
+                category_data = [
+                    {
+                        "category": _CATEGORY_MAP.get(str(item.get("category")), "other"),
+                        "amount": _number(item.get("amount")) or 0,
+                    }
+                    for item in categories[:8]
+                    if isinstance(item, Mapping) and item.get("currency") == currency
+                ]
+                daily_data = [
+                    {"date": str(item.get("date")), "value": _number(item.get("amount")) or 0}
+                    for item in daily[-366:]
+                    if isinstance(item, Mapping) and item.get("currency") == currency
+                ]
+                if daily_data:
+                    view = {
+                        "intent": "spending-analysis",
+                        "title": _TITLES["spending-analysis"],
+                        "currency": currency,
+                        "totalSpent": total,
+                        "categories": category_data,
+                        "trend": {
+                            "title": "Evolución de gastos",
+                            "data": [
+                                {"label": item["date"], "values": [item["value"]]}
+                                for item in daily_data[:240]
+                            ],
+                            "series": [
+                                {"id": "expenses", "label": "Gastos", "tone": "orange"}
+                            ],
+                        },
+                        "activity": {
+                            "title": "Tus días de mayor gasto",
+                            "data": daily_data,
+                            "initialDate": daily_data[-1]["date"],
+                            "initialView": "month",
+                            "tone": "orange",
+                        },
+                    }
+                    return (
+                        view,
+                        {"presentation_intent": "spending-analysis", "domain_result": dict(domain)},
+                        f"Analicé {total:,.2f} {currency} de gastos.",
+                    )
     transactions, currency = _transaction_rows(observations, profile)
     expenses = [item for item in transactions if item["amount"] < 0]
     if currency is None or not expenses:
@@ -542,7 +659,40 @@ def build_financial_presentation(
     profile: UserProfile,
 ) -> FinancialPresentation:
     """Interpret retained data and construct one validated Finance v2 response."""
-    if intent == "financial-summary":
+    domain_observations = [
+        observation
+        for observation in observations
+        if observation.get("name")
+        in {
+            "get_financial_overview",
+            "get_accounts",
+            "get_transactions",
+            "analyze_spending",
+            "get_cash_flow",
+            "get_budget_progress",
+            "get_savings_progress",
+            "get_debt_overview",
+            "get_upcoming_payments",
+            "get_financial_alerts",
+            "get_bank_statements",
+            "get_payment_activity",
+            "get_beneficiaries",
+            "get_transaction_disputes",
+            "compare_debt_scenarios",
+        }
+    ]
+    if domain_observations and domain_observations[-1].get("is_error") is True:
+        view = _empty_view(
+            intent,
+            "No pude verificar los datos financieros solicitados; no mostraré cifras estimadas.",
+            _currency(profile) or "MXN",
+        )
+        data = {
+            "presentation_intent": intent,
+            "tool_error": deepcopy(domain_observations[-1].get("data", {})),
+        }
+        message = view["description"]
+    elif intent == "financial-summary":
         view, data, message = _summary_view(observations, profile)
     elif intent == "transactions":
         view, data, message = _transactions_view(observations, profile)
@@ -559,6 +709,10 @@ def build_financial_presentation(
         )
         data = {"presentation_intent": intent}
         message = view["description"]
+    if domain_observations and domain_observations[-1].get("is_error") is not True:
+        domain_data = domain_observations[-1].get("data")
+        if isinstance(domain_data, Mapping):
+            data.setdefault("domain_result", deepcopy(dict(domain_data)))
     return FinancialPresentation(
         intent=intent,
         message=message,

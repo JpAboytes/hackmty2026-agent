@@ -191,14 +191,31 @@ async def _session(purpose: str) -> AsyncIterator[tuple[Client[Any], str]]:
 
 DEFAULT_A2UI_BRIDGE = A2UIBridge()
 
+FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
+    {
+        "get_financial_overview",
+        "get_accounts",
+        "get_transactions",
+        "analyze_spending",
+        "get_cash_flow",
+        "get_budget_progress",
+        "get_savings_progress",
+        "get_debt_overview",
+        "get_upcoming_payments",
+        "get_financial_alerts",
+        "get_bank_statements",
+        "get_payment_activity",
+        "get_beneficiaries",
+        "get_transaction_disputes",
+        "compare_debt_scenarios",
+    }
+)
+
 MODEL_TOOL_NAMES = frozenset(
     {
-        "health_check",
-        "list_allowed_tables",
-        "describe_table",
-        "select_rows",
         "database_overview",
         "visualize_allowed_data",
+        *FINANCIAL_DOMAIN_TOOL_NAMES,
     }
 )
 
@@ -207,6 +224,7 @@ SCOPED_TOOL_NAMES = frozenset(
         "select_rows",
         "visualize_allowed_data",
         "a2ui_action",
+        *FINANCIAL_DOMAIN_TOOL_NAMES,
     }
 )
 
@@ -257,7 +275,14 @@ def enforce_trusted_user_scope(
     scoped = deepcopy(dict(arguments)) if arguments is not None else {}
     canonical_scope = {"user_id": canonical_user_id}
 
-    if tool_name == "select_rows":
+    if tool_name in FINANCIAL_DOMAIN_TOOL_NAMES:
+        raw_request = scoped.get("request")
+        request = deepcopy(dict(raw_request)) if isinstance(raw_request, Mapping) else {}
+        request["scope"] = canonical_scope
+        request.pop("user_id", None)
+        request.pop("email", None)
+        scoped["request"] = request
+    elif tool_name == "select_rows":
         scoped["scope"] = canonical_scope
         scoped["filters"] = _business_filters(
             scoped.get("filters"),
