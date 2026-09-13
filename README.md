@@ -114,9 +114,10 @@ Configure `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE
 
 ## Tool discovery
 
-The MCP server no longer advertises its domain catalog. Its `tools/list` carries
-two tools — `search_tools` and `call_tool` — and everything else is found
-through them, so Gemini is bound to two schemas per turn instead of seventeen.
+The MCP server no longer advertises its domain catalog. The model-facing part of
+`tools/list` carries `search_tools` and `call_tool`; three pinned app-only tools
+remain available only to the trusted host. Everything else is found through
+discovery, so Gemini is bound to two schemas per turn instead of seventeen.
 
 ```text
 agent -> search_tools("deudas pendientes") -> agent -> call_tool(...) -> agent
@@ -126,7 +127,7 @@ A hosted MCP resolves `tools/call` against its advertised catalog, so a tool
 hidden by discovery is not callable by name there — it has to be addressed
 through `call_tool`. `_wire_call` makes that decision from the live catalog, so
 pinning or unpinning a tool server-side needs no change here. The tools the
-server does advertise purely so a host can address them (`select_rows`,
+server does advertise purely so a host can address them (`get_user_context`,
 `a2ui_action`, `a2ui_form`) are called directly and are kept out of the prompt
 by their own `_meta.ui.visibility` declaration, which this orchestrator honours
 as the host the MCP Apps spec expects.
@@ -228,6 +229,13 @@ timeline that aggregates the stages, which is where latency work starts:
 
 ```text
 17:03:28 INFO [t0001] agent: turn start input=query query_chars=21 user=68dc4d66
+17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=5 status=ok duration_ms=20.6
+17:03:28 INFO [t0001] agent: node.fetch_context outcome=resolved accounts=1 has_balance=true status=ok duration_ms=41.1
+17:03:28 INFO [t0001] agent: mcp.call name=get_user_context is_error=false contents=1 status=ok duration_ms=30.3
+17:03:28 INFO [t0001] agent: node.agent turn=0 observations=0 decision=financial_ready intent=financial-summary source=classifier status=ok duration_ms=0.0
+17:03:28 INFO [t0001] agent: graph.route node=agent next=select_presentation
+17:03:28 INFO [t0001] agent: client.response route=graph message_chars=64 data_keys=currency,owned_balance a2ui=true resource_uri=a2ui://financial/view a2ui_messages=3 a2ui_bytes=2104
+17:03:28 INFO [t0001] agent: turn done status=ok total_ms=104.7 | node.load_tools=21ms node.fetch_context=41ms node.agent=0ms node.build_presentation=6ms
 17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=2 status=ok duration_ms=20.6
 17:03:28 INFO [t0001] agent: node.fetch_context outcome=resolved accounts=1 has_balance=true retained=accounts status=ok duration_ms=41.1
 17:03:29 INFO [t0001] agent: model.gemini model=gemini-3.6-flash declared_tools=2 observations=0 prompt_chars=2184 decision=tool_calls calls=search_tools status=ok duration_ms=812.4
@@ -337,6 +345,13 @@ curl http://127.0.0.1:8080/health
 
 ## A2UI input forms
 
+The Expo renderer supports a strict v0.9.1 subset of TextField, DateTimeInput (date only), Slider, ChoicePicker and Button. Requests such as “Crea un presupuesto”, “Edita un presupuesto”, “Crea una meta de ahorro”, “Quiero hacer una transferencia”, “Transfiere $500 a Ana” and “Quiero pagar mi tarjeta” deterministically prepare the matching MCP `a2ui_form`; this preparation does not save anything. The transfer form loads selectable accounts and contacts from the authenticated user's current MCP data, and an explicit amount or valid recipient can prefill it. The card-payment form uses Finance v2 to show the masked payment card and current terms. “Muéstrame mi tarjeta de crédito” uses the dedicated `get_credit_cards` tool and builds the same verified `PaymentCard` view; legacy `get_accounts` observations remain readable. Save submits a structured `action` in the authenticated HTTP body, using the five A2UI fields and explicit resolved context. The orchestrator supplies trustedScope from the verified token; model-supplied ownership never wins. The LLM cannot call a2ui_action. The MCP returns data.actionResult and the client displays success/failure rather than interpreting HTTP 200 as successful persistence.
+
+After a successful `transfer.execute`, the API re-enters the authenticated graph
+with the `financial-summary` intent so the response carries the newly committed
+account balance. A successful `credit_card.pay` similarly refreshes the
+`credit-card` view. A refresh failure preserves the confirmed write result and
+does not invite a duplicate retry.
 The Expo renderer supports a strict Basic v0.9.1 subset of TextField, DateTimeInput (date only), Slider and Button. Requests such as “Crea un presupuesto”, “Edita un presupuesto”, “Crea una meta de ahorro” and “Edita mi meta de ahorro” make the model answer with an `action_form`, which `prepare_action` turns into the matching MCP `a2ui_form` call; this preparation does not save anything. No phrase table is involved — the model picks one of the four enumerated names and `normalize_form_name` re-validates it. Editing asks for the existing name and loads its owned data. Save submits a structured `action` in the authenticated HTTP body, using the five A2UI fields and explicit resolved context. The orchestrator supplies trustedScope from the verified token; model-supplied ownership never wins. The LLM cannot call a2ui_action. The MCP returns data.actionResult and the client displays success/failure rather than interpreting HTTP 200 as successful persistence.
 
 Canonical input/action JSON is packaged under `a2ui_actions/`, synchronized from the MCP contract. The agent validates forms with the official A2UI 0.9.1 SDK. Saving requires the new MCP code, action SQL and dedicated write-role configuration; this source change does not deploy them.

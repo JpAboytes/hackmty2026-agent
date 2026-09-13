@@ -117,7 +117,7 @@ def _result(structured: dict[str, Any], text: str = "ok") -> MCPToolExecution:
 
 
 async def _run(
-    monkeypatch: pytest.MonkeyPatch, query: str, model: ScriptedModel
+    monkeypatch: pytest.MonkeyPatch, query: str, model: ToolAwareModel
 ) -> tuple[dict[str, Any], list[tuple[str, Mapping[str, Any] | None]]]:
     calls: list[tuple[str, Mapping[str, Any] | None]] = []
 
@@ -246,6 +246,42 @@ async def test_the_same_intent_is_not_searched_twice(
     assert [name for name, _ in calls] == [SEARCH_TOOL_NAME]
 
 
+async def test_eight_tool_iterations_terminate_before_a_ninth_model_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LoopingModel(ToolAwareModel):
+        calls = 0
+
+        async def generate(
+            self,
+            *,
+            query: str,
+            profile: UserProfile,
+            tools: Sequence[MCPToolDefinition],
+            observations: Sequence[Mapping[str, Any]],
+        ) -> ModelTurn:
+            del query, profile, tools, observations
+            self.calls += 1
+            return ModelTurn(
+                message="",
+                tool_calls=(
+                    {
+                        "name": SEARCH_TOOL_NAME,
+                        "arguments": {"query": f"unknown capability {self.calls}"},
+                    },
+                ),
+            )
+
+    model = LoopingModel()
+    result, calls = await _run(monkeypatch, "ayúdame con algo", model)
+
+    assert model.calls == 8
+    assert len(calls) == 8
+    assert result["tool_loop_count"] == 8
+    assert "límite seguro" in result["message"]
+    assert result["tool_calls"] == []
+
+
 # Envelope shapes gemini-3.6-flash actually produced for one discovered tool,
 # captured live. Roughly three calls in ten are malformed, in these ways; each
 # has exactly one valid reading, so the client normalizes rather than paying a
@@ -314,8 +350,8 @@ def test_an_envelope_nested_beyond_reason_is_not_followed_forever() -> None:
 
 # --- reachability on a proxied deployment -------------------------------------
 # A hosted MCP resolves `tools/call` against the advertised catalog, so a tool
-# hidden by discovery answers `Unknown tool` by name. This is what broke user
-# context in production: `select_rows` was hidden, addressed by name, and lost.
+# hidden by discovery answers `Unknown tool` by name. Application-only tools
+# therefore stay pinned for direct host addressing.
 
 
 async def _advertise(names: dict[str, bool]) -> list[MCPToolDefinition]:
@@ -346,15 +382,15 @@ async def test_an_advertised_tool_is_still_addressed_by_name(
 
     async def listed() -> list[MCPToolDefinition]:
         return await _advertise(
-            {SEARCH_TOOL_NAME: True, CALL_TOOL_NAME: True, "select_rows": False}
+            {SEARCH_TOOL_NAME: True, CALL_TOOL_NAME: True, "get_user_context": False}
         )
 
     monkeypatch.setattr(mcp_execution, "list_remote_tools", listed)
 
-    name, arguments = await mcp_execution._wire_call("select_rows", {"table": "users"})
+    name, arguments = await mcp_execution._wire_call("get_user_context", {})
 
-    assert name == "select_rows"
-    assert arguments == {"table": "users"}
+    assert name == "get_user_context"
+    assert arguments == {}
 
 
 async def test_an_unreadable_catalog_keeps_the_direct_call(
@@ -379,7 +415,7 @@ def test_a_pinned_app_only_tool_never_reaches_the_prompt() -> None:
             for tool in [
                 MCPToolDefinition(SEARCH_TOOL_NAME, "search", {}, model_visible=True),
                 MCPToolDefinition(CALL_TOOL_NAME, "call", {}, model_visible=True),
-                MCPToolDefinition("select_rows", "rows", {}, model_visible=False),
+                MCPToolDefinition("get_user_context", "context", {}, model_visible=False),
                 MCPToolDefinition("a2ui_action", "action", {}, model_visible=False),
             ]
         ]
@@ -388,5 +424,5 @@ def test_a_pinned_app_only_tool_never_reaches_the_prompt() -> None:
     advertised = {tool.name for tool in tool_visibility.tool_definitions(state)}
     offered = {tool.name for tool in tool_visibility.model_tool_definitions(state)}
 
-    assert advertised == {SEARCH_TOOL_NAME, CALL_TOOL_NAME, "select_rows", "a2ui_action"}
+    assert advertised == {SEARCH_TOOL_NAME, CALL_TOOL_NAME, "get_user_context", "a2ui_action"}
     assert offered == {SEARCH_TOOL_NAME, CALL_TOOL_NAME}

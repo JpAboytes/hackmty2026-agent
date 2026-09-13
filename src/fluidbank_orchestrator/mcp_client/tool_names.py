@@ -13,10 +13,13 @@ Three sets with three different jobs, deliberately kept apart:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
     {
         "get_financial_overview",
         "get_accounts",
+        "get_credit_cards",
         "get_transactions",
         "analyze_spending",
         "get_cash_flow",
@@ -39,7 +42,22 @@ FINANCIAL_DOMAIN_TOOL_NAMES = frozenset(
 # what may execute, only how a model reaches a capability.
 SEARCH_TOOL_NAME = "search_tools"
 CALL_TOOL_NAME = "call_tool"
+USER_CONTEXT_TOOL_NAME = "get_user_context"
 DISCOVERY_TOOL_NAMES = frozenset({SEARCH_TOOL_NAME, CALL_TOOL_NAME})
+
+
+def addressable_financial_tool_names(advertised_names: Iterable[str]) -> frozenset[str]:
+    """Financial capabilities reachable through the current MCP catalog.
+
+    A capability is addressable when it is advertised directly, or when the
+    advertised ``call_tool`` proxy can address the hidden domain catalog. An
+    unrelated non-empty tool list proves neither condition.
+    """
+    advertised = frozenset(advertised_names)
+    if CALL_TOOL_NAME in advertised:
+        return FINANCIAL_DOMAIN_TOOL_NAMES
+    return FINANCIAL_DOMAIN_TOOL_NAMES & advertised
+
 
 # Security boundary, kept deliberately separate from discovery: every tool here
 # reads user-owned rows, so its identity fields are overwritten with the UUID
@@ -47,7 +65,7 @@ DISCOVERY_TOOL_NAMES = frozenset({SEARCH_TOOL_NAME, CALL_TOOL_NAME})
 # through this set would be trusting model-supplied identity.
 SCOPED_TOOL_NAMES = frozenset(
     {
-        "select_rows",
+        USER_CONTEXT_TOOL_NAME,
         "visualize_allowed_data",
         "a2ui_action",
         "a2ui_form",

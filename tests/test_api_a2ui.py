@@ -43,6 +43,56 @@ def test_chat_request_tolerates_but_never_trusts_a_client_user_id() -> None:
     assert request.user_id == USER_A
 
 
+def test_chat_request_accepts_expo_account_context() -> None:
+    account_id = UUID("04803dbe-97f1-4986-ace7-54c2d6196151")
+    request = ChatRequest(query="Hola", user_id=USER_A, account_id=account_id)
+    assert request.account_id == account_id
+
+
+@pytest.mark.asyncio
+async def test_selected_account_must_belong_to_authenticated_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = UUID("04803dbe-97f1-4986-ace7-54c2d6196151")
+    calls: list[tuple[str, dict[str, Any] | None, UUID | None]] = []
+
+    async def execute(
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        calls.append((name, arguments, current_user_id))
+        return _execution(structured_content={"ok": True, "accounts": [{"id": str(account_id)}]})
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    await api._require_owned_account(account_id, USER_A)
+    assert calls == [
+        ("get_accounts", {"request": {"account_ids": [str(account_id)]}}, USER_A)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_foreign_account_context_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = UUID("04803dbe-97f1-4986-ace7-54c2d6196151")
+
+    async def execute(
+        _name: str,
+        _arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return _execution(structured_content={"ok": True, "accounts": []})
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    with pytest.raises(HTTPException) as refused:
+        await api._require_owned_account(account_id, USER_A)
+    assert refused.value.status_code == 403
+
+
 @pytest.mark.asyncio
 async def test_a_client_user_id_that_contradicts_the_token_is_refused(
     monkeypatch: pytest.MonkeyPatch,
@@ -113,7 +163,12 @@ async def test_valid_token_subject_reaches_graph_as_canonical_uuid(
     response = await api.chat(ChatRequest(query="Hola"), AUTH)
 
     state, config = invocations[0]
-    assert state == {"user_query": "Hola", "current_user_id": USER_A}
+    assert state == {
+        "user_query": "Hola",
+        "current_user_id": USER_A,
+        "requested_intent": None,
+        "action_requested": False,
+    }
     assert isinstance(state["current_user_id"], UUID)
     assert config == {"configurable": {"thread_id": f"user:{USER_A}"}}
     assert response.message == "Hola."
@@ -210,6 +265,218 @@ async def test_rejected_financial_action_never_reaches_the_graph(
 
     assert invoked is False
     assert response.message == "La acción de interfaz no es válida."
+
+
+@pytest.mark.asyncio
+async def test_successful_card_payment_refreshes_credit_card_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    action = {
+        "name": "credit_card.pay",
+        "surfaceId": "credit-card-pay",
+        "sourceComponentId": "submit",
+        "timestamp": "2026-09-12T12:00:00.000Z",
+        "context": {
+            "source_account": "Cuenta principal",
+            "card": "Tarjeta Banorte",
+            "amount": 1000,
+        },
+    }
+
+    class FakeGraph:
+        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+            invocations.append((state, config))
+            return {"message": "Tarjeta actualizada.", "user_profile": {}}
+
+    async def execute(
+        _name: str,
+        _arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return _execution(
+            "Pago aplicado a tu tarjeta por 1,000.00 MXN.",
+            structured_content={
+                "ok": True,
+                "actionResult": {
+                    "status": "success",
+                    "message": "Pago aplicado a tu tarjeta por 1,000.00 MXN.",
+                },
+            },
+        )
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", FakeGraph())
+
+    response = await api._run_action(action, USER_A)
+
+    state, config = invocations[0]
+    assert state == {
+        "user_query": "credit_card.pay:credit-card",
+        "requested_intent": "credit-card",
+        "action_requested": True,
+        "current_user_id": USER_A,
+    }
+    assert config == {"configurable": {"thread_id": f"user:{USER_A}"}}
+    assert response.data["actionResult"]["status"] == "success"
+    assert response.message == "Tarjeta actualizada."
+
+
+@pytest.mark.asyncio
+async def test_successful_transfer_refreshes_financial_summary_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    action = {
+        "name": "transfer.execute",
+        "surfaceId": "transfer-execute",
+        "sourceComponentId": "submit",
+        "timestamp": "2026-09-13T12:00:00.000Z",
+        "context": {
+            "source_account": "Cuenta principal",
+            "recipient": "Ana",
+            "amount": 500,
+            "concept": "Comida",
+        },
+    }
+
+    class FakeGraph:
+        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+            invocations.append((state, config))
+            return {"message": "Saldo actualizado.", "user_profile": {}}
+
+    async def execute(
+        _name: str,
+        _arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return _execution(
+            "Transferencia realizada por 500.00 MXN.",
+            structured_content={
+                "ok": True,
+                "actionResult": {
+                    "status": "success",
+                    "message": "Transferencia realizada por 500.00 MXN.",
+                },
+            },
+        )
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", FakeGraph())
+
+    response = await api._run_action(action, USER_A)
+
+    state, config = invocations[0]
+    assert state == {
+        "user_query": "transfer.execute:financial-summary",
+        "requested_intent": "financial-summary",
+        "action_requested": True,
+        "current_user_id": USER_A,
+    }
+    assert config == {"configurable": {"thread_id": f"user:{USER_A}"}}
+    assert response.data["actionResult"]["status"] == "success"
+    assert response.message == "Saldo actualizado."
+
+
+@pytest.mark.asyncio
+async def test_failed_card_payment_does_not_refresh_credit_card_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invoked = False
+    action = {
+        "name": "credit_card.pay",
+        "surfaceId": "credit-card-pay",
+        "sourceComponentId": "submit",
+        "timestamp": "2026-09-12T12:00:00.000Z",
+        "context": {
+            "source_account": "Cuenta principal",
+            "card": "Tarjeta Banorte",
+            "amount": 1000,
+        },
+    }
+
+    class FakeGraph:
+        async def ainvoke(self, _state: dict[str, Any], _config: dict[str, Any]) -> dict[str, Any]:
+            nonlocal invoked
+            invoked = True
+            return {"message": "Unexpected", "user_profile": {}}
+
+    async def execute(
+        _name: str,
+        _arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return _execution(
+            "No se pudo aplicar el pago.",
+            structured_content={
+                "ok": False,
+                "actionResult": {
+                    "status": "failure",
+                    "message": "No se pudo aplicar el pago.",
+                },
+            },
+        )
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", FakeGraph())
+
+    response = await api._run_action(action, USER_A)
+
+    assert invoked is False
+    assert response.data["actionResult"]["status"] == "failure"
+
+
+@pytest.mark.asyncio
+async def test_card_payment_remains_successful_when_only_the_view_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "name": "credit_card.pay",
+        "surfaceId": "credit-card-pay",
+        "sourceComponentId": "submit",
+        "timestamp": "2026-09-12T12:00:00.000Z",
+        "context": {
+            "source_account": "Cuenta principal",
+            "card": "Tarjeta Banorte",
+            "amount": 1000,
+        },
+    }
+
+    class FailingGraph:
+        async def ainvoke(self, _state: dict[str, Any], _config: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("refresh unavailable")
+
+    async def execute(
+        _name: str,
+        _arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return _execution(
+            "Pago aplicado a tu tarjeta por 1,000.00 MXN.",
+            structured_content={
+                "ok": True,
+                "actionResult": {
+                    "status": "success",
+                    "message": "Pago aplicado a tu tarjeta por 1,000.00 MXN.",
+                },
+            },
+        )
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", FailingGraph())
+
+    response = await api._run_action(action, USER_A)
+
+    assert response.data["actionResult"]["status"] == "success"
+    assert response.a2ui is None
 
 
 def _legacy_action(action: dict[str, Any]) -> str:

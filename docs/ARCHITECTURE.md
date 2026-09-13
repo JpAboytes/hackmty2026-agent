@@ -177,7 +177,7 @@ discovery; weakening `SCOPED_TOOL_NAMES` would trust model-supplied identity.
 `agent/tool_visibility.py:model_tool_definitions`. The MCP Apps spec puts this
 filtering on the host; for the model-facing tool set, this orchestrator is the
 host. Tools the server advertises purely so the orchestrator can address them by
-name (`select_rows`, `a2ui_action`, `a2ui_form`) stay out of the prompt.
+name (`get_user_context`, `a2ui_action`, `a2ui_form`) stay out of the prompt.
 
 **Provenance.** A domain answer is only published from data that arrived through
 a successful MCP call. `agent/observations.py` is the ledger,

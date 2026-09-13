@@ -49,7 +49,13 @@ from ..mcp_client import (
 )
 from ..observability import configure_logging, end_turn, event, stage, start_turn
 from ..schemas.chat import ChatRequest, ChatResponse
-from .actions import FINANCIAL_VIEW_ACTION, action_payload, trusted_financial_intent
+from .actions import (
+    ACTION_REFRESH_INTENTS,
+    FINANCIAL_VIEW_ACTION,
+    action_payload,
+    successful_action_result,
+    trusted_financial_intent,
+)
 from .responses import (
     invalid_action_response,
     log_client_response,
@@ -165,7 +171,29 @@ async def _handle_chat(
     # One MCP session for the whole turn: the routes below make between one
     # and six calls, and each used to pay its own handshake.
     async with mcp_session():
+        if request.account_id is not None:
+            await _require_owned_account(request.account_id, current_user_id)
         return await _route_request(action, request.query, current_user_id)
+
+
+async def _require_owned_account(account_id: UUID, current_user_id: UUID) -> None:
+    """Verify Expo's account context inside the authenticated MCP scope."""
+    try:
+        execution = await execute_remote_tool(
+            "get_accounts",
+            {"request": {"account_ids": [str(account_id)]}},
+            current_user_id=current_user_id,
+        )
+    except (MCPConfigurationError, UserContextError) as exc:
+        raise HTTPException(status_code=503, detail="Account verification unavailable") from exc
+    structured = execution.result.structured_content
+    accounts = structured.get("accounts") if isinstance(structured, dict) else None
+    if not isinstance(accounts, list) or not any(
+        isinstance(account, dict) and account.get("id") == str(account_id)
+        for account in accounts
+    ):
+        event("http.account_mismatch")
+        raise HTTPException(status_code=403, detail="Account does not belong to user")
 
 
 async def _route_request(
@@ -191,7 +219,29 @@ async def _route_request(
 
 
 def _query_turn(query: str, current_user_id: UUID) -> dict[str, Any]:
-    return {"user_query": query, "current_user_id": current_user_id}
+    # The two action channels are sent explicitly so a plain query can never
+    # inherit an approved view from a checkpointed earlier turn.
+    return {
+        "user_query": query,
+        "current_user_id": current_user_id,
+        "requested_intent": None,
+        "action_requested": False,
+    }
+
+
+def _action_turn(action_name: str, intent: str, current_user_id: UUID) -> dict[str, Any]:
+    """The graph input for a view the user already approved through A2UI.
+
+    `requested_intent` is trusted because MCP produced it, never the model, and
+    it pins the presentation so an approved action cannot be upgraded into a
+    different view.
+    """
+    return {
+        "user_query": f"{action_name}:{intent}",
+        "requested_intent": intent,
+        "action_requested": True,
+        "current_user_id": current_user_id,
+    }
 
 
 def _graph_config(current_user_id: UUID) -> dict[str, Any]:
@@ -211,19 +261,35 @@ async def _run_action(action: dict[str, Any], current_user_id: UUID) -> ChatResp
     except (MCPConfigurationError, UserContextError):
         return unavailable_response()
     if action["name"] != FINANCIAL_VIEW_ACTION:
-        return log_client_response("action", response_from_tool(action_execution))
+        refresh_intent = ACTION_REFRESH_INTENTS.get(action["name"])
+        action_result = successful_action_result(action_execution.result.structured_content)
+        if refresh_intent is None or action_result is None:
+            return log_client_response("action", response_from_tool(action_execution))
+        event("route.selected", route="action_refresh", intent=refresh_intent)
+        try:
+            async with stage("graph.invoke", entry="action_refresh", intent=refresh_intent):
+                result = await graph.ainvoke(
+                    _action_turn(action["name"], refresh_intent, current_user_id),
+                    config=_graph_config(current_user_id),
+                )
+        except Exception as exc:
+            # The write was already committed and explicitly confirmed by MCP.
+            # A failed refresh must not turn that success into a misleading
+            # "save failed" response that encourages a duplicate retry.
+            logger.warning("Post-action view refresh failed: %s", type(exc).__name__)
+            return log_client_response(
+                "action_refresh_failed", response_from_tool(action_execution)
+            )
+        response = response_from_graph(result)
+        response.data["actionResult"] = action_result
+        return log_client_response("action_refresh", response)
     intent = trusted_financial_intent(action_execution.result.structured_content, current_user_id)
     if intent is None:
         return invalid_action_response("untrusted_action_result")
     event("route.selected", route="action_graph", intent=intent)
     async with stage("graph.invoke", entry="action", intent=intent):
         result = await graph.ainvoke(
-            {
-                "user_query": f"{FINANCIAL_VIEW_ACTION}:{intent}",
-                "requested_intent": intent,
-                "action_requested": True,
-                "current_user_id": current_user_id,
-            },
+            _action_turn(FINANCIAL_VIEW_ACTION, intent, current_user_id),
             config=_graph_config(current_user_id),
         )
     return log_client_response("action_graph", response_from_graph(result))
@@ -272,6 +338,10 @@ async def _stream_turn(
         return
 
     async with mcp_session():
+        # The same ownership check `/chat` runs: the streaming route must not
+        # be a way to skip it.
+        if request.account_id is not None:
+            await _require_owned_account(request.account_id, current_user_id)
         if action is not None or request.query is None:
             yield _result_line(await _route_request(action, request.query, current_user_id))
             return

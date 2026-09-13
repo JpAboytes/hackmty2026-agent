@@ -121,7 +121,10 @@ class A2UIBridge:
             )
             step.set(surface=surface_id, messages=len(template_messages))
         with stage("a2ui.validate", surface=surface_id) as validation:
-            dynamic_messages = self._extract_dynamic_messages(tool_result, surface_id)
+            catalog_id = template_messages[0]["createSurface"]["catalogId"]
+            dynamic_messages = self._extract_dynamic_messages(
+                tool_result, surface_id, catalog_id
+            )
             complete = [*template_messages, *dynamic_messages]
             try:
                 validate_complete_sequence(complete, surface_id)
@@ -201,7 +204,7 @@ class A2UIBridge:
 
     @staticmethod
     def _extract_dynamic_messages(
-        tool_result: CallToolResult, surface_id: str
+        tool_result: CallToolResult, surface_id: str, catalog_id: str
     ) -> list[dict[str, Any]]:
         raw_messages: list[dict[str, Any]] = []
         found = False
@@ -224,7 +227,11 @@ class A2UIBridge:
         if not found:
             raise A2UIBridgeError("missing_dynamic_messages")
         try:
-            return validate_dynamic_updates(raw_messages, expected_surface_id=surface_id)
+            return validate_dynamic_updates(
+                raw_messages,
+                expected_surface_id=surface_id,
+                catalog_id=catalog_id,
+            )
         except A2UIValidationError as exc:
             raise A2UIBridgeError("invalid_dynamic_messages") from exc
 

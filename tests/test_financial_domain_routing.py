@@ -185,7 +185,7 @@ def _summary_observations(card_rows: list[dict[str, object]]) -> list[dict[str, 
     """Context rows in the shape `fetch_user_context` retains them."""
     return [
         {
-            "name": "select_rows",
+            "name": "get_user_context",
             "arguments": {"schema": "public", "table": table},
             "is_error": False,
             "data": {"ok": True, "rows": rows},
@@ -294,3 +294,53 @@ def test_a_card_is_dropped_when_it_cannot_be_verified() -> None:
     ]["updateDataModel"]["value"]["view"]
 
     assert "cards" not in view
+
+
+def test_credit_card_query_builds_the_masked_payment_card_from_dedicated_tool() -> None:
+    observations = [
+        {
+            "name": "get_credit_cards",
+            "arguments": {"request": {}},
+            "is_error": False,
+            "data": {
+                "ok": True,
+                "cards": [
+                    {
+                        "id": "5d3ec491-64dc-500e-b357-e732850cf990",
+                        "account_id": "04803dbe-97f1-4986-ace7-54c2d6196151",
+                        "currency": "MXN",
+                        "available_credit": 1500,
+                        "display_name": "Oro de ejemplo",
+                        "card_type": "credit",
+                        "network": "mastercard",
+                        "masked_last_four": "•••• 9012",
+                        "status": "active",
+                        "expires_month": 12,
+                        "expires_year": 2029,
+                        "credit_terms": {
+                            "currency": "MXN",
+                            "credit_limit": 10000,
+                            "current_debt": 8500,
+                            "statement_balance": 6200,
+                            "minimum_payment": 420,
+                            "interest_free_payment": 6200,
+                            "annual_interest_rate": 42,
+                            "cat_percentage": 53.2,
+                            "cutoff_date": "2026-09-06",
+                            "due_date": "2026-09-26",
+                        },
+                    }
+                ],
+            },
+        }
+    ]
+
+    presentation = build_financial_presentation("credit-card", observations, _PROFILE)
+    view = presentation.a2ui.messages[2]["updateDataModel"]["value"]["view"]
+
+    assert view["intent"] == "credit-card"
+    assert view["card"]["cardName"] == "Oro de ejemplo"
+    assert view["card"]["lastFour"] == "9012"
+    assert view["card"]["expires"] == "2029-12"
+    assert view["debt"] == 8500
+    assert view["interestFreePayment"] == 6200

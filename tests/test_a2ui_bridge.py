@@ -318,6 +318,7 @@ async def test_text_and_structured_data_survive_presentation_failure() -> None:
     )
     response = response_from_tool(execution)
     assert client.call_count == 1
+    assert execution.mcp_ui_owned is True
     assert execution.presentation_error is True
     assert response.message == "Database overview loaded."
     assert response.data == {"ok": True, "object_count": 1}

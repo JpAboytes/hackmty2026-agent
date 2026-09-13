@@ -16,8 +16,8 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from ..mcp_client import SEARCH_TOOL_NAME, MCPToolExecution
-from ..state import GraphState
+from ..mcp_client import SEARCH_TOOL_NAME, USER_CONTEXT_TOOL_NAME, MCPToolExecution
+from ..state import GraphState, ToolObservation
 
 
 def normalized_query(value: str) -> str:
@@ -37,7 +37,7 @@ def text_from_execution(execution: MCPToolExecution) -> str:
     return "La herramienta terminó sin una respuesta de texto."
 
 
-def retained_observations(state: GraphState) -> list[dict[str, Any]]:
+def retained_observations(state: GraphState) -> list[ToolObservation]:
     """Every verified row set this turn holds, prefetched context included.
 
     Context rows come first so a later, narrower domain read of the same table
@@ -46,24 +46,34 @@ def retained_observations(state: GraphState) -> list[dict[str, Any]]:
     return [*state.get("context_observations", []), *state.get("tool_observations", [])]
 
 
-def context_observations(rows: Mapping[str, list[dict[str, object]]]) -> list[dict[str, Any]]:
+def context_observations(rows: Mapping[str, list[dict[str, object]]]) -> list[ToolObservation]:
     """Record the profile's scoped reads in the shape a domain read produces."""
     return [
         {
-            "name": "select_rows",
+            "name": USER_CONTEXT_TOOL_NAME,
             "arguments": {"schema": "public", "table": table},
             "is_error": False,
             "data": {"ok": True, "rows": deepcopy(table_rows)},
             "text": f"Filas de {table} leídas con el contexto del usuario.",
         }
         for table, table_rows in rows.items()
-        if table_rows
     ]
 
 
 def has_tool_observation(state: GraphState, tool_name: str) -> bool:
+    """Whether the capability was attempted, successfully or not."""
     return any(
         observation.get("name") == tool_name for observation in state.get("tool_observations", [])
+    )
+
+
+def has_table_observation(state: GraphState, table: str) -> bool:
+    """Whether a successful retained context read verified this table."""
+    return any(
+        observation.get("name") == USER_CONTEXT_TOOL_NAME
+        and observation.get("is_error") is not True
+        and observation.get("arguments", {}).get("table") == table
+        for observation in retained_observations(state)
     )
 
 

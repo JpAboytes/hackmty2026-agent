@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from ..mcp_client import MCPToolDefinition
 from ..schemas.banking_view import FinancialIntent
-from ..state import UserProfile
+from ..state import ToolCall, UserProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +23,7 @@ class ModelTurn:
     """One model decision: some tool calls, or a message and optional intent."""
 
     message: str
-    tool_calls: tuple[dict[str, Any], ...] = ()
+    tool_calls: tuple[ToolCall, ...] = ()
     months: int | None = None
     presentation_intent: FinancialIntent | None = None
     #: A form the model wants MCP to prepare. Validated against the finite

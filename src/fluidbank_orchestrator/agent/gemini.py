@@ -28,7 +28,7 @@ from ..a2ui_actions.forms import ACTION_FORM_NAMES
 from ..mcp_client import MCPToolDefinition
 from ..observability import preview, stage
 from ..schemas.banking_view import FinancialIntent
-from ..state import UserProfile
+from ..state import ToolCall, UserProfile
 from .model import ModelTurn
 from .tool_visibility import model_tool_schema
 
@@ -173,7 +173,7 @@ class GeminiToolAwareModel:
         declarations: list[types.FunctionDeclaration],
         tools: Sequence[MCPToolDefinition],
         step: Any,
-    ) -> list[dict[str, Any]]:
+    ) -> list[ToolCall]:
         """Ask only which tools to call.
 
         The declarations and a structured `response_schema` cannot travel in the
@@ -201,7 +201,7 @@ class GeminiToolAwareModel:
             return []
         self._record_usage(response, step, prefix="tool_phase")
         allowed = {tool.name for tool in tools}
-        calls: list[dict[str, Any]] = []
+        calls: list[ToolCall] = []
         for function_call in response.function_calls or []:
             if function_call.name not in allowed:
                 continue

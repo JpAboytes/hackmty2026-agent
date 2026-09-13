@@ -13,13 +13,14 @@ from copy import deepcopy
 from math import isfinite
 from typing import Any
 
+from ...mcp_client.tool_names import USER_CONTEXT_TOOL_NAME
 from ...state import UserProfile
 
 _SUPPORTED_CURRENCIES = frozenset({"MXN", "USD"})
 
 
-#: Which domain tool returns the same entity a scoped `select_rows` would, and
-#: under which payload key. The model chooses the capability, so the reader has
+#: Which domain tool returns the same entity the fixed user-context read would,
+#: and under which payload key. The model chooses the capability, so the reader has
 #: to recognise every capability that returns a given entity - not just one.
 #: `get_financial_overview` is absent on purpose: it returns per-currency
 #: aggregates, not account rows.
@@ -40,8 +41,9 @@ _DOMAIN_ROW_SOURCES: dict[tuple[object, str], str] = {
 def rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> list[dict[str, Any]]:
     """Every verified row for one table, deduplicated by identifier.
 
-    Both shapes count as the same table: a scoped ``select_rows`` read, and any
-    domain tool that returns the same entity (see ``_DOMAIN_ROW_SOURCES``).
+    Both shapes count as the same table: the fixed application context read,
+    and any domain tool that returns the same entity (see
+    ``_DOMAIN_ROW_SOURCES``).
     """
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -52,7 +54,7 @@ def rows_for_table(observations: Sequence[Mapping[str, Any]], table: str) -> lis
         data = observation.get("data")
         name = observation.get("name")
         raw_rows: object = None
-        if name == "select_rows":
+        if name == USER_CONTEXT_TOOL_NAME:
             if not isinstance(arguments, Mapping) or arguments.get("table") != table:
                 continue
             raw_rows = data.get("rows") if isinstance(data, Mapping) else None

@@ -39,6 +39,7 @@ _VIEW_BUILDERS = {
     "transactions": views.transactions_view,
     "spending-analysis": views.spending_view,
     "recurring-payments": views.recurring_view,
+    "credit-card": views.credit_card_view,
 }
 
 
