@@ -4,6 +4,7 @@ Modules:
 
 * ``model``           - the ``ToolAwareModel`` port and its ``ModelTurn`` result.
 * ``gemini``          - the only Gemini-specific code: prompt, adapter, answer schema.
+* ``policy``          - deterministic pre-model scope and final prose guards.
 * ``tool_visibility`` - what a model may see of the tool surface.
 * ``observations``    - the turn's ledger of verified MCP results.
 * ``status``          - the coarse lifecycle phases a client may display.

@@ -2,14 +2,15 @@
 
 The topology, and nothing else:
 
-    START -> validate_identity -> load_tools -> fetch_context -> agent
+    START -> validate_identity -> query_policy -> load_tools -> fetch_context -> agent
+    query_policy -> END              (unsafe or out-of-domain request)
     agent -> tools -> agent          (while the model asks for tool calls)
     agent -> prepare_action -> END   (the model selected an A2UI form)
     agent -> select_presentation -> build_presentation -> END
     agent -> END                     (bounded conversational answers)
 
-The model decides which of those the turn needs. The topology only makes each
-outcome reachable; it does not classify the request.
+For a query that passes the safety/scope gate, the model decides which of those
+outcomes the turn needs. The topology does not classify financial intent.
 
 What each node *does* lives in ``agent.nodes``; the model adapter in
 ``agent.gemini``; the MCP boundary in ``mcp_client``. Change behaviour there,
@@ -31,12 +32,14 @@ from .agent.model import ModelTurn, ToolAwareModel
 from .agent.nodes import (
     ToolLoader,
     build_presentation_node,
+    enforce_query_policy_node,
     fetch_context_node,
     make_agent_node,
     make_load_tools_node,
     make_prepare_action_node,
     make_tools_node,
     route_after_agent,
+    route_after_policy,
     select_presentation_node,
     validate_identity_node,
 )
@@ -56,6 +59,7 @@ def build_graph(
 
     workflow = StateGraph(GraphState)
     workflow.add_node("validate_identity", cast("Any", validate_identity_node))
+    workflow.add_node("query_policy", cast("Any", enforce_query_policy_node))
     workflow.add_node("load_tools", cast("Any", make_load_tools_node(tool_loader)))
     workflow.add_node("fetch_context", cast("Any", fetch_context_node))
     workflow.add_node("agent", cast("Any", make_agent_node(resolved_model)))
@@ -64,7 +68,12 @@ def build_graph(
     workflow.add_node("select_presentation", cast("Any", select_presentation_node))
     workflow.add_node("build_presentation", cast("Any", build_presentation_node))
     workflow.add_edge(START, "validate_identity")
-    workflow.add_edge("validate_identity", "load_tools")
+    workflow.add_edge("validate_identity", "query_policy")
+    workflow.add_conditional_edges(
+        "query_policy",
+        route_after_policy,
+        {"load_tools": "load_tools", END: END},
+    )
     workflow.add_edge("load_tools", "fetch_context")
     workflow.add_edge("fetch_context", "agent")
     workflow.add_conditional_edges(

@@ -72,7 +72,7 @@ async def test_the_same_query_takes_whichever_path_the_model_chooses(
         monkeypatch, query, ScriptedModel(answers("Te explico cómo verlo.")), chat_executor
     )
     assert chat_executor.names == []
-    assert "financial_presentation" not in chat_result
+    assert chat_result.get("financial_presentation") is None
     assert chat_result["message"] == "Te explico cómo verlo."
 
     form_executor = Recorder()
@@ -80,7 +80,7 @@ async def test_the_same_query_takes_whichever_path_the_model_chooses(
         monkeypatch, query, ScriptedModel(prepares("budget.create")), form_executor
     )
     assert form_executor.names == ["a2ui_form"]
-    assert "financial_presentation" not in form_result
+    assert form_result.get("financial_presentation") is None
 
 
 @pytest.mark.asyncio
@@ -204,9 +204,13 @@ async def test_irrelevant_candidates_do_not_become_a_tool_call(
     )
     result = await run_turn(monkeypatch, "¿Va a llover mañana?", model, executor)
 
-    assert executor.names == ["search_tools"]
-    assert "financial_presentation" not in result
-    assert result["message"] == "Eso no es algo que pueda consultar en tu banca."
+    assert executor.names == []
+    assert model.seen == []
+    assert result.get("financial_presentation") is None
+    assert result["policy_reason"] == "out_of_scope"
+    assert result["message"] == (
+        "Solo puedo ayudar con consultas y operaciones bancarias permitidas."
+    )
 
 
 @pytest.mark.asyncio
@@ -215,11 +219,11 @@ async def test_no_candidate_at_all_still_ends_the_turn_without_figures(
 ) -> None:
     executor = Recorder(results={"search_tools": candidates_result()})
     model = ScriptedModel(searches("algo inexistente"), answers("No encontré cómo consultarlo."))
-    result = await run_turn(monkeypatch, "Consulta algo inexistente", model, executor)
+    result = await run_turn(monkeypatch, "Consulta un dato bancario inexistente", model, executor)
 
     assert executor.names == ["search_tools"]
     assert result["message"] == "No encontré cómo consultarlo."
-    assert "financial_presentation" not in result
+    assert result.get("financial_presentation") is None
 
 
 @pytest.mark.asyncio
@@ -305,7 +309,7 @@ async def test_the_loop_is_bounded_even_if_the_model_keeps_asking(
 ) -> None:
     executor = Recorder(results={"search_tools": candidates_result("get_accounts")})
     model = ScriptedModel(*[searches(f"intento {index}") for index in range(MAX_TOOL_TURNS + 4)])
-    result = await run_turn(monkeypatch, "Busca sin parar", model, executor)
+    result = await run_turn(monkeypatch, "Busca datos bancarios sin parar", model, executor)
 
     assert result["tool_loop_count"] == MAX_TOOL_TURNS
     assert "límite seguro de pasos" in result["message"]
@@ -326,7 +330,7 @@ async def test_a_hallucinated_presentation_intent_produces_no_surface(
     model = ScriptedModel(ModelTurn(message="Listo.", presentation_intent="crypto-portfolio"))  # type: ignore[arg-type]
     result = await run_turn(monkeypatch, "Muéstrame mi cripto", model, executor)
 
-    assert "financial_presentation" not in result
+    assert result.get("financial_presentation") is None
     assert result["message"] == "Listo."
 
 
@@ -340,7 +344,7 @@ async def test_an_approved_action_pins_the_view_the_model_cannot_change(
 
     executor = _Recorder(results={"get_accounts": rows_result(_ACCOUNTS, "accounts")})
     model = ScriptedModel(presents("spending-analysis"))
-    graph = graph_for(monkeypatch, model, executor)
+    graph = graph_for(monkeypatch, model, executor, context_rows={"accounts": _ACCOUNTS})
     result: dict[str, Any] = await graph.ainvoke(
         {
             "user_query": "request_financial_view:financial-summary",

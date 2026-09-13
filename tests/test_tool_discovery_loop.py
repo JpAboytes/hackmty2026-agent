@@ -155,7 +155,7 @@ async def test_the_model_is_offered_only_the_discovery_pair(
     """The 15 financial schemas must not reach the prompt."""
     model = ScriptedModel([ModelTurn(message="Hola.")])
 
-    await _run(monkeypatch, "cuéntame un chiste", model)
+    await _run(monkeypatch, "¿Qué es el CAT?", model)
 
     assert model.offered == [(SEARCH_TOOL_NAME, CALL_TOOL_NAME)]
 
@@ -185,7 +185,7 @@ async def test_search_then_call_reaches_the_domain_tool(
         ]
     )
 
-    result, calls = await _run(monkeypatch, "cuéntame un chiste", model)
+    result, calls = await _run(monkeypatch, "Cuéntame sobre mis deudas", model)
 
     assert [name for name, _ in calls] == [SEARCH_TOOL_NAME, CALL_TOOL_NAME]
     # The proxy envelope is what travels; the trusted scope is injected into the
@@ -213,7 +213,7 @@ async def test_discovered_schemas_reach_the_model_without_identity_fields(
         ]
     )
 
-    result, _calls = await _run(monkeypatch, "cuéntame un chiste", model)
+    result, _calls = await _run(monkeypatch, "Cuéntame sobre mis deudas", model)
 
     search_observation = next(
         item for item in result["tool_observations"] if item["name"] == SEARCH_TOOL_NAME
@@ -241,7 +241,7 @@ async def test_the_same_intent_is_not_searched_twice(
         ]
     )
 
-    _result, calls = await _run(monkeypatch, "cuéntame un chiste", model)
+    _result, calls = await _run(monkeypatch, "Cuéntame sobre mis deudas", model)
 
     assert [name for name, _ in calls] == [SEARCH_TOOL_NAME]
 
@@ -273,7 +273,7 @@ async def test_eight_tool_iterations_terminate_before_a_ninth_model_turn(
             )
 
     model = LoopingModel()
-    result, calls = await _run(monkeypatch, "ayúdame con algo", model)
+    result, calls = await _run(monkeypatch, "Ayúdame con mis cuentas", model)
 
     assert model.calls == 8
     assert len(calls) == 8

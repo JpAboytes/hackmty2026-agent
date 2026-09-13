@@ -10,8 +10,10 @@ protocol vocabularies the model selects from, presentation selection, the
 trusted Finance v2 builders, and the MCP client integration. It does **not**
 own data access, the A2UI catalog definition, action validation, or the renderer
 — those belong to the MCP/data repository and the mobile client. It also does
-not classify requests: there is no phrase table and no pre-graph router, so
-"what does this user need" is a model decision bounded by enumerated values.
+not route financial intents: no phrase table maps requests to tools or views.
+A deterministic in-graph policy gate only decides whether plain text is safe
+and banking-scoped; for accepted requests, "what does this user need" remains
+a model decision bounded by enumerated values.
 
 ## Package layout
 
@@ -35,6 +37,7 @@ src/fluidbank_orchestrator/
     gemini.py                 the only Gemini-specific code: prompt, adapter,
                               bounded answer schema, profile projection
     status.py                 the eight lifecycle status ids and emit_status
+    policy.py                 deterministic pre-model and final prose guards
     tool_visibility.py        what a model may see of the tool surface
     observations.py           the turn's ledger of verified MCP results
     tool_loop.py              executing pending calls, recording provenance
@@ -106,6 +109,7 @@ Rules that hold today and should keep holding:
 | --- | --- |
 | the order of graph steps, or add/remove a node | `graph.py` |
 | what a node does (context, agent policy, presentation) | `agent/nodes.py` |
+| deterministic domain, injection, code, and history guards | `agent/policy.py` |
 | the prompt, model name, or Gemini request shape | `agent/gemini.py` |
 | swapping Gemini for another model | implement `agent/model.py:ToolAwareModel`, pass it to `build_graph(model=…)` |
 | the per-turn tool-call cap | `agent/gemini.py:MAX_CALLS_PER_TURN` |
@@ -158,6 +162,15 @@ protocol values. Both protocol fields are normalized again — by
 `normalize_action_intent` and `normalize_form_name` — before either can reach a
 builder or MCP.
 
+Before either choice is available, `query_policy` applies the deterministic
+gate in `agent/policy.py`. It fails closed for prompt injection, prompt/policy
+disclosure or override attempts, executable-code generation, historical
+narration, and non-banking requests. Denied text goes directly to `END`; tool
+definitions, user context, MCP, and the model are never reached. This is a
+safety/scope decision, not financial intent routing: it cannot choose a tool,
+form, presentation, or retrieval plan. A second prose guard runs on model
+output, and `api/responses.py` reapplies it to every outgoing message path.
+
 What it is *handed* is bounded too. `agent/gemini.py:model_profile` projects
 `UserProfile` down to `literacy_level`, so `available_balance`,
 `owned_balances`, `overdraft_risk` and `recurring_expenses` never enter a
@@ -185,12 +198,14 @@ a successful MCP call. `agent/observations.py` is the ledger,
 `builder.py` turns a failed domain read into an explicit empty view rather than
 an estimate.
 
-**Determinism.** Determinism here means identity, validation, protocol and
-approval — **not** request classification. Deciding what a user needs is the
-model's job and is not deterministic; everything that could let that decision
-cause harm is:
+**Determinism.** Determinism here means identity, scope/safety policy,
+validation, protocol and approval — **not** financial intent classification.
+Deciding what an accepted banking request needs is the model's job and is not
+deterministic; everything that could let that decision cause harm is:
 
 * *identity* is derived once from the token and re-imposed on every scoped call;
+* *scope/safety* is decided before model or data access and checked again on
+  outgoing prose;
 * *validation* is exhaustive and offline — every intent, form name, view payload
   and message sequence is checked against a checked-in contract, twice for a
   surface;

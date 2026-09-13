@@ -6,6 +6,7 @@ LangGraph agent for the accessibility-first banking demo. It verifies Supabase s
 Expo
   → POST /api/v1/agent/chat  (or /chat/stream for coarse progress lines)
   → verify Supabase bearer token and derive current_user_id
+  → deterministically reject unsafe or non-banking text before data/model access
   → the model reasons, discovers capabilities, and selects 1..N MCP tools
   → interpret all retained results and select a known financial semantic intent
     (or ask MCP to prepare one of the four A2UI action forms)
@@ -13,10 +14,12 @@ Expo
   → Expo receives one self-contained ordered v0.9.1 sequence
 ```
 
-The graph has five terminal shapes and no pre-graph classifier:
+The graph has a deterministic scope/safety exit and four business outcomes. It
+has no phrase-to-tool or phrase-to-view classifier:
 
 ```text
-START -> validate_identity -> load_tools -> fetch_context -> agent
+START -> validate_identity -> query_policy -> load_tools -> fetch_context -> agent
+query_policy -> END                         (fixed policy refusal)
 agent -> tools -> agent                    (model asked for 1..N tool calls)
 agent -> prepare_action -> END             (model selected an A2UI form)
 agent -> select_presentation -> build_presentation -> END
@@ -32,8 +35,8 @@ src/fluidbank_orchestrator/
   auth.py           Supabase bearer-token verification
   observability.py  Turn-scoped stage logging and per-turn timing timeline
   api/              HTTP boundary: app, CORS, dispatch, actions, responses
-  agent/            The agent: model port, Gemini adapter, tool visibility,
-                    observation ledger, lifecycle status, tool loop, nodes
+  agent/            The agent: deterministic policy, model port, Gemini adapter,
+                    tool visibility, observation ledger, status, tool loop, nodes
   mcp_client/       MCP boundary: config, session, trusted scope, catalog,
                     execution, user context
   schemas/          Strict wire contracts: A2UI, Finance v2, actions, chat
@@ -112,6 +115,26 @@ not here. A structured `action` body is dispatched through the same code path as
 
 Configure `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE_ANON_KEY`). The API resolves the bearer token through Supabase Auth and accepts no user UUID in the request body. It rejects anonymous or unconfirmed users, namespaces the LangGraph thread as `user:<uuid>`, and injects/overwrites `scope.user_id` immediately before scoped MCP reads. Model-provided ownership filters are discarded. Identity never comes from action context, model arguments, email mappings, or demo constants.
 
+## Policy guards
+
+Plain queries pass through `agent/policy.py` immediately after identity
+validation. The gate is deterministic and fail-closed: only banking-scoped
+requests and a small set of greetings/capability questions continue. Prompt
+injection, attempts to reveal or replace instructions, requests for Python or
+other executable scripts/code, historical narration, and every other
+out-of-domain request return fixed Spanish refusals. A refusal occurs before
+tool discovery, user-context loading, MCP, or Gemini, so it cannot be defeated
+by asking the model to ignore its prompt.
+
+The model prompt repeats the boundary as defense in depth, but is not trusted
+to enforce it. `safe_model_message` checks model prose after generation, and
+`api/responses.py` applies the same final guard to every response path,
+including MCP-owned messages. The policy gate chooses no financial intent,
+tool, form, or presentation; accepted banking requests still use the single
+agentic graph described below. Structured A2UI action re-entry is already
+validated by MCP and bypasses only the plain-text scope check, not identity,
+action validation, provenance, or final-output validation.
+
 ## Tool discovery
 
 The MCP server no longer advertises its domain catalog. The model-facing part of
@@ -165,7 +188,7 @@ that normalization, ten of ten live model calls reached the domain service, up
 from four of eight without it. A payload with no tool name anywhere has no such
 reading and is left for the server to refuse.
 
-Every query enters the one graph. It retains all relevant tool observations and selects its presentation only after retrieval: the model proposes one of the 13 intents, the finite vocabulary validates it, and `select_presentation_intent` upgrades a `transactions` request phrased as a spending question only once the rows to analyse are actually present. Scalar balance questions use `financial-summary`; spending can combine category, trend, and daily-activity views when the same verified data supports them. Users do not need to say “chart” or “visualize,” and charts are not forced into scalar answers. `database_overview` is still reachable as a domain tool; nothing routes to it by phrase.
+Every query enters the one graph; denied text exits at `query_policy`, while an accepted banking query continues without phrase-to-tool routing. The graph retains all relevant tool observations and selects its presentation only after retrieval: the model proposes one of the 13 intents, the finite vocabulary validates it, and `select_presentation_intent` upgrades a `transactions` request phrased as a spending question only once the rows to analyse are actually present. Scalar balance questions use `financial-summary`; spending can combine category, trend, and daily-activity views when the same verified data supports them. Users do not need to say “chart” or “visualize,” and charts are not forced into scalar answers. `database_overview` is still reachable as a domain tool; nothing routes to it by phrase.
 
 When the request is an operation rather than a question, the model answers with `action_form` instead of an intent, and `prepare_action` asks MCP's `a2ui_form` for that surface. The vocabulary is exactly four names — `budget.create`, `budget.load`, `savings_goal.create`, `savings_goal.load` — declared to Gemini as an enum and re-validated by `a2ui_actions/forms.py:normalize_form_name` before MCP is called. Preparing a form saves nothing; only a later user Button event reaches a write handler. `.update` is absent on purpose: MCP derives an update form from the matching `.load`. The model may read data first (a budget suggested from real spending needs `analyze_spending`) or prepare the form directly when it already has the context.
 
@@ -229,13 +252,7 @@ timeline that aggregates the stages, which is where latency work starts:
 
 ```text
 17:03:28 INFO [t0001] agent: turn start input=query query_chars=21 user=68dc4d66
-17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=5 status=ok duration_ms=20.6
-17:03:28 INFO [t0001] agent: node.fetch_context outcome=resolved accounts=1 has_balance=true status=ok duration_ms=41.1
-17:03:28 INFO [t0001] agent: mcp.call name=get_user_context is_error=false contents=1 status=ok duration_ms=30.3
-17:03:28 INFO [t0001] agent: node.agent turn=0 observations=0 decision=financial_ready intent=financial-summary source=classifier status=ok duration_ms=0.0
-17:03:28 INFO [t0001] agent: graph.route node=agent next=select_presentation
-17:03:28 INFO [t0001] agent: client.response route=graph message_chars=64 data_keys=currency,owned_balance a2ui=true resource_uri=a2ui://financial/view a2ui_messages=3 a2ui_bytes=2104
-17:03:28 INFO [t0001] agent: turn done status=ok total_ms=104.7 | node.load_tools=21ms node.fetch_context=41ms node.agent=0ms node.build_presentation=6ms
+17:03:28 INFO [t0001] agent: graph.route node=query_policy next=load_tools
 17:03:28 INFO [t0001] agent: node.load_tools outcome=loaded tools=2 status=ok duration_ms=20.6
 17:03:28 INFO [t0001] agent: node.fetch_context outcome=resolved accounts=1 has_balance=true retained=accounts status=ok duration_ms=41.1
 17:03:29 INFO [t0001] agent: model.gemini model=gemini-3.6-flash declared_tools=2 observations=0 prompt_chars=2184 decision=tool_calls calls=search_tools status=ok duration_ms=812.4
@@ -308,7 +325,7 @@ the path:
 PYTHONPATH=src ./.venv/bin/python -m pytest
 ```
 
-The suite is 159 tests and passes clean that way. Console scripts installed into
+Run the repository suite that way. Console scripts installed into
 a relocated venv (`.venv/bin/langgraph`, and the MCP repo's `.venv/bin/fastmcp`)
 keep an absolute shebang to the old interpreter and fail with
 `FileNotFoundError` until the same `uv sync` rewrites them.

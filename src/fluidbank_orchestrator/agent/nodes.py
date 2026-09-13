@@ -10,13 +10,15 @@ discovery round is worthwhile, and whether the turn should end in a
 presentation, an action form, or plain text. The node only enforces the
 invariants the model must not be trusted with:
 
-1. no verified user context - answer without figures, never invent them;
-2. an MCP-owned presentation from the current tool batch - relay it;
-3. an action re-entry whose approved view does not validate - refuse it;
-4. the loop limit - stop rather than keep calling tools;
-5. an explicitly requested view pins the presentation so an approved action
+1. a deterministic pre-model policy gate rejects prompt injection, executable
+   code, historical narration, and non-banking requests;
+2. no verified user context - answer without figures, never invent them;
+3. an MCP-owned presentation from the current tool batch - relay it;
+4. an action re-entry whose approved view does not validate - refuse it;
+5. the loop limit - stop rather than keep calling tools;
+6. an explicitly requested view pins the presentation so an approved action
    cannot be silently upgraded to a different one;
-6. anything the model returns as a protocol value is re-normalized before it
+7. anything the model returns as a protocol value is re-normalized before it
    can reach a builder or MCP.
 
 Coarse lifecycle phases are reported through ``status.emit_status``. They carry
@@ -54,6 +56,7 @@ from .observations import (
     retained_observations,
     text_from_execution,
 )
+from .policy import evaluate_query_policy, safe_model_message
 from .status import AgentStatus, emit_status
 from .tool_loop import ToolExecutor, run_pending_tools
 from .tool_visibility import model_tool_definitions
@@ -102,6 +105,8 @@ async def validate_identity_node(state: GraphState) -> GraphState:
         "current_user_id": require_current_user_id(state.get("current_user_id")),
         "requested_intent": requested_intent,
         "action_requested": action_requested,
+        "policy_refused": False,
+        "policy_reason": None,
         "presentation_intent": None,
         "action_form": None,
         "action_form_arguments": {},
@@ -114,6 +119,29 @@ async def validate_identity_node(state: GraphState) -> GraphState:
         "financial_presentation": None,
         "tool_loop_count": 0,
     }
+
+
+async def enforce_query_policy_node(state: GraphState) -> GraphState:
+    """Reject unsafe or out-of-domain text before any model or data access."""
+    if state.get("action_requested") is True:
+        return {"policy_refused": False, "policy_reason": None}
+    decision = evaluate_query_policy(state.get("user_query", ""))
+    if decision.allowed:
+        return {"policy_refused": False, "policy_reason": None}
+    event("policy.refused", reason=decision.reason)
+    return {
+        "policy_refused": True,
+        "policy_reason": decision.reason,
+        "message": decision.message,
+        "tool_calls": [],
+    }
+
+
+def route_after_policy(state: GraphState) -> str:
+    """A refusal ends immediately; an allowed turn may load tools/context."""
+    destination = END if state.get("policy_refused") is True else "load_tools"
+    event("graph.route", node="query_policy", next=destination)
+    return destination
 
 
 def make_load_tools_node(tool_loader: ToolLoader) -> Node:
@@ -249,6 +277,10 @@ def _from_model_turn(candidate: ModelTurn, state: GraphState, step: stage) -> Gr
         "action_form": None,
         "action_form_arguments": {},
     }
+    if (refusal := safe_model_message(candidate.message)) is not None:
+        step.set(decision="model_output_refused")
+        result["message"] = refusal
+        return result
     if candidate.tool_calls:
         step.set(
             decision="model_tool_calls",

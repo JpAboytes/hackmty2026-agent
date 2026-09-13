@@ -69,6 +69,11 @@ class GraphState(TypedDict, total=False):
     #: that outranks the model's own choice.
     requested_intent: FinancialIntent | None
     action_requested: bool
+    #: True when the deterministic pre-model safety/scope gate refused the
+    #: query. A refused turn goes directly to END without loading context,
+    #: exposing tool schemas, or invoking the model.
+    policy_refused: bool
+    policy_reason: str | None
     #: The one intent this turn presents. The model proposes it, the finite
     #: vocabulary validates it, and `requested_intent` pins it when set.
     presentation_intent: FinancialIntent | None

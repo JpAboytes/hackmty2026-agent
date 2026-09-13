@@ -2,9 +2,11 @@
 
 This module owns the ASGI app, the browser boundary, and the order in which an
 authenticated turn is dispatched: a structured action re-enters through MCP's
-allowlist, and everything else goes to the graph. No phrase matching happens
-here - deciding what a plain query needs is the model's job, so there is exactly
-one query route. It deliberately keeps ``verify_supabase_access_token``,
+allowlist, and everything else goes to the graph. No phrase-to-tool or
+phrase-to-view routing happens here - the graph's deterministic policy node
+only gates scope and safety, then the model decides what an accepted banking
+query needs. There is exactly one query route. It deliberately keeps
+``verify_supabase_access_token``,
 ``execute_remote_tool`` and ``graph`` as module-level names, so the whole
 boundary can be exercised with those three dependencies substituted.
 

@@ -67,7 +67,7 @@ The system consists of independently maintained repositories and deployable comp
 ### 5.2 Agent Orchestrator
 
 - LangGraph implemented in the backend language selected for the orchestration repository.
-- There is **no intent routing**: no phrase table, no pre-graph classifier, no deterministic retrieval planner. One graph handles every query, and the model decides whether data is needed, which capabilities provide it, how many, and whether the turn ends in a presentation, an A2UI action form, or plain prose. The topology only makes each outcome reachable.
+- There is **no financial intent routing**: no phrase table maps a request to a tool or presentation and there is no deterministic retrieval planner. One graph handles every query. A deterministic, fail-closed policy node runs before the model and before user-context/tool loading; it only accepts banking-scoped requests and rejects prompt injection, requests for executable code or scripts, historical narration, and all other out-of-domain content. It never selects a business intent. For accepted requests, the model decides whether data is needed, which capabilities provide it, how many, and whether the turn ends in a presentation, an A2UI action form, or bounded plain prose.
 - Discovers capabilities through the MCP server's `search_tools` and calls one or more of them through `call_tool`; how many is the model's decision, bounded by a per-turn call cap and an iteration limit rather than by a "use one tool" policy.
 - Interprets returned data, then selects one of the finite financial presentation semantics in the shared contract.
 - May instead select one of the four enumerated A2UI action forms and ask MCP to *prepare* it. Preparing a form performs no write; only a subsequent explicit user event does.
@@ -75,6 +75,7 @@ The system consists of independently maintained repositories and deployable comp
 - Constructs Finance v2 `BankingView` payloads through trusted typed builders. The LLM never emits component names, actions, IDs, styles, properties, or raw A2UI JSON.
 - Continues to validate and relay MCP-produced A2UI for legacy/domain tools through the generic bridge.
 - Must not directly mutate client state or generate executable client code.
+- Must not generate executable code of any kind, disclose or follow requests to alter its prompts/policies, provide historical narratives, or answer outside the banking domain. These restrictions must be enforced in deterministic pre-model and final-output guards; prompt wording alone is not a security boundary. A rejected query must not load financial context, expose tool schemas to the model, call MCP, or invoke the LLM.
 - Verifies the Supabase bearer token at the HTTP boundary, derives `current_user_id` from its authenticated subject, and preserves that identity through graph and MCP scope.
 - Must enforce confirmation boundaries for actions that could affect financial decisions or user data. Read-only `request_financial_view` actions re-enter the same intent/data/presentation graph; state-changing actions remain bounded backend operations and never become LLM decisions.
 

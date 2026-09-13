@@ -16,8 +16,10 @@ it (403), parse any action form via `api/actions.py:action_payload`, and open
 before dispatching. A structured action is dispatched identically on both routes
 (`_route_request`), so the two cannot disagree about what an action does.
 
-**No phrase matching happens anywhere.** There is exactly one query route;
-deciding what a plain query needs is the model's job. `api/query_routing.py`,
+**No phrase-to-tool or phrase-to-view routing happens anywhere.** There is
+exactly one query route. `agent/policy.py` performs only a fail-closed scope and
+safety check; deciding what an accepted banking query needs is the model's job.
+`api/query_routing.py`,
 `agent/retrieval.py`, `a2ui_actions/routing.py` and
 `intents.classify_financial_request` no longer exist, and neither does any
 "deterministic financial fast path".
@@ -36,7 +38,8 @@ earlier request cannot route the new turn.
 `graph.py:build_graph` wires exactly this topology and nothing else:
 
 ```text
-START -> validate_identity -> load_tools -> fetch_context -> agent
+START -> validate_identity -> query_policy -> load_tools -> fetch_context -> agent
+query_policy -> END                         (fixed policy refusal)
 agent -> tools -> agent                    (model asked for 1..N tool calls)
 agent -> prepare_action -> END             (model selected an A2UI form)
 agent -> select_presentation -> build_presentation -> END
@@ -46,7 +49,9 @@ agent -> END                               (bounded conversational answer)
 ```mermaid
 flowchart TD
   S([START]) --> V[validate_identity]
-  V --> L[load_tools]
+  V --> Q[query_policy]
+  Q -->|allowed| L[load_tools]
+  Q -->|refused| E([END])
   L --> F[fetch_context]
   F --> A[agent]
   A -->|tool_calls| T[tools]
@@ -54,7 +59,7 @@ flowchart TD
   A -->|action_form| P[prepare_action]
   A -->|presentation_intent| SP[select_presentation]
   SP --> B[build_presentation]
-  A -->|message only| E([END])
+  A -->|message only| E
   P --> E
   B --> E
 ```
@@ -65,8 +70,9 @@ it reads was re-normalized first (`a2ui_actions/forms.py:normalize_form_name`,
 `services/financial_presentation/intents.py:normalize_action_intent`), so a
 hallucinated name becomes "no branch" rather than an unchecked call.
 
-The topology only makes each outcome reachable; it does not classify the
-request. Flows 2, 3 and 4 are the three product flows those branches compose.
+The policy branch classifies only scope/safety, never financial intent. The
+remaining topology makes each business outcome reachable without selecting it.
+Flows 2, 3 and 4 are the three product flows those branches compose.
 
 ---
 
@@ -81,7 +87,8 @@ The default path for "¿Cuánto dinero tengo?" and "¿En qué gasté este mes?".
 flowchart TD
   A[api._route_request<br/>route.selected route=graph] --> B[graph.ainvoke]
   B --> C[validate_identity_node<br/>require_current_user_id]
-  C --> D[make_load_tools_node<br/>mcp_client.list_remote_tools]
+  C --> P[enforce_query_policy_node]
+  P --> D[make_load_tools_node<br/>mcp_client.list_remote_tools]
   D --> E[fetch_context_node<br/>mcp_client.fetch_user_context]
   E --> F[agent_node -> gemini.generate]
   F -->|tool_calls| G[tools_node<br/>tool_loop.run_pending_tools]
@@ -183,12 +190,22 @@ nothing forbids one.
 
 ## 5. Tool discovery and multi-tool selection
 
+Before this flow, every plain query passes through `nodes.query_policy`. The
+model-free gate returns a fixed refusal for prompt injection, instruction
+disclosure/override attempts, executable scripts or code, historical
+narration, and non-banking content. A denial reaches `END` before tool schemas,
+user context, MCP, or the model are loaded. It selects no financial intent, so
+accepted banking traffic still follows the discovery flow below.
+
 ```mermaid
 sequenceDiagram
+  participant P as policy.evaluate_query_policy
   participant N as nodes._agent_turn
   participant G as gemini.GeminiToolAwareModel
   participant L as tool_loop.run_pending_tools
   participant M as MCP
+  P->>P: deterministic scope and safety check
+  P-->>N: allowed banking query
   N->>G: generate(query, model_profile, model-visible tools, observations)
   G-->>N: tool_calls = [search_tools("outstanding debt balances")]
   N->>L: run_pending_tools
@@ -464,7 +481,10 @@ through `_route_request` like `/chat` and reported as a single `result` line.
 
 ```mermaid
 flowchart TD
-  A[nodes._agent_turn] --> B{context_available is False?}
+  P[nodes.enforce_query_policy_node] --> Q{allowed?}
+  Q -->|no| R[fixed refusal -> END<br/>no context, tools, MCP, or model]
+  Q -->|yes| A[nodes._agent_turn]
+  A --> B{context_available is False?}
   B -->|yes| C["decision=no_context<br/>'no puedo mostrarte cifras'"]
   B -->|no| D{current execution<br/>came from _meta.ui?}
   D -->|yes| E[decision=tool_presentation<br/>relay MCP text]
@@ -475,12 +495,15 @@ flowchart TD
   I -->|yes| J[decision=model_tool_calls -> flow 6]
   I -->|no + action_form| K[decision=model_action_form -> flow 3]
   I -->|no + intent| L[decision=model_presentation -> flow 7]
-  I -->|no| M[decision=model_message<br/>bounded text, a2ui = null]
+  I -->|no| O{safe_model_message?}
+  O -->|refused| R2[fixed refusal, a2ui = null]
+  O -->|allowed| M[decision=model_message<br/>bounded text, a2ui = null]
   H -->|API failure| N["'No pude generar una respuesta<br/>personalizada en este momento.'"]
 ```
 
-Modules: `agent/nodes.py:_agent_turn` and `_from_model_turn`,
-`agent/gemini.py`.
+Modules: `agent/policy.py`, `agent/nodes.py:enforce_query_policy_node`,
+`_agent_turn` and `_from_model_turn`, `agent/gemini.py`, and
+`api/responses.py` for the final all-path prose check.
 
 Invariants: a chat answer carries no surface (`a2ui: null`) and no invented
 figures. A missing user context is reported as such rather than filled with a
@@ -489,7 +512,8 @@ run; a failure in the answer phase falls back to a fixed message and leaves the
 deterministic policies available. A recognised financial intent reaches the
 trusted Finance v2 builder only after its required MCP attempt is retained; an
 unavailable capability ends with a bounded message and no surface rather than a
-view without provenance.
+view without provenance. Prohibited prose is replaced, never partially cleaned
+or returned alongside the original content.
 
 ---
 

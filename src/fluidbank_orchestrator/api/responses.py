@@ -13,10 +13,16 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from ..agent.policy import safe_model_message
 from ..mcp_client import MCPToolExecution
 from ..observability import event, preview
 from ..schemas.chat import ChatResponse
 from ..services.financial_presentation import FinancialPresentation
+
+
+def _policy_safe_message(message: str) -> str:
+    """Apply the final prose guard regardless of which internal path produced it."""
+    return safe_model_message(message) or message
 
 
 def response_from_tool(execution: MCPToolExecution) -> ChatResponse:
@@ -31,7 +37,7 @@ def response_from_tool(execution: MCPToolExecution) -> ChatResponse:
     )
     structured = execution.result.structured_content
     data = deepcopy(structured) if isinstance(structured, dict) else {}
-    return ChatResponse(message=message, data=data, a2ui=execution.a2ui)
+    return ChatResponse(message=_policy_safe_message(message), data=data, a2ui=execution.a2ui)
 
 
 def response_from_graph(result: dict[str, Any]) -> ChatResponse:
@@ -45,7 +51,7 @@ def response_from_graph(result: dict[str, Any]) -> ChatResponse:
     if isinstance(presentation, FinancialPresentation):
         event("graph.output", source="financial_presentation", intent=presentation.intent)
         return ChatResponse(
-            message=presentation.message,
+            message=_policy_safe_message(presentation.message),
             data=deepcopy(presentation.data),
             a2ui=presentation.a2ui,
         )
@@ -58,7 +64,7 @@ def response_from_graph(result: dict[str, Any]) -> ChatResponse:
     months = result.get("months")
     if isinstance(months, int):
         data["months"] = months
-    return ChatResponse(message=result["message"], data=data, a2ui=None)
+    return ChatResponse(message=_policy_safe_message(result["message"]), data=data, a2ui=None)
 
 
 def invalid_action_response(reason: str) -> ChatResponse:
