@@ -325,6 +325,64 @@ async def test_successful_card_payment_refreshes_credit_card_surface(
 
 
 @pytest.mark.asyncio
+async def test_successful_transfer_refreshes_financial_summary_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    action = {
+        "name": "transfer.execute",
+        "surfaceId": "transfer-execute",
+        "sourceComponentId": "submit",
+        "timestamp": "2026-09-13T12:00:00.000Z",
+        "context": {
+            "source_account": "Cuenta principal",
+            "recipient": "Ana",
+            "amount": 500,
+            "concept": "Comida",
+        },
+    }
+
+    class FakeGraph:
+        async def ainvoke(self, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+            invocations.append((state, config))
+            return {"message": "Saldo actualizado.", "user_profile": {}}
+
+    async def execute(
+        _name: str,
+        _arguments: dict[str, Any] | None = None,
+        *,
+        current_user_id: UUID | None = None,
+    ) -> MCPToolExecution:
+        assert current_user_id == USER_A
+        return _execution(
+            "Transferencia realizada por 500.00 MXN.",
+            structured_content={
+                "ok": True,
+                "actionResult": {
+                    "status": "success",
+                    "message": "Transferencia realizada por 500.00 MXN.",
+                },
+            },
+        )
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    monkeypatch.setattr(api, "graph", FakeGraph())
+
+    response = await api._run_action(action, USER_A)
+
+    state, config = invocations[0]
+    assert state == {
+        "user_query": "transfer.execute:financial-summary",
+        "requested_intent": "financial-summary",
+        "action_requested": True,
+        "current_user_id": USER_A,
+    }
+    assert config == {"configurable": {"thread_id": f"user:{USER_A}"}}
+    assert response.data["actionResult"]["status"] == "success"
+    assert response.message == "Saldo actualizado."
+
+
+@pytest.mark.asyncio
 async def test_failed_card_payment_does_not_refresh_credit_card_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -252,6 +252,12 @@ curl http://127.0.0.1:8080/health
 
 The Expo renderer supports a strict v0.9.1 subset of TextField, DateTimeInput (date only), Slider, ChoicePicker and Button. Requests such as “Crea un presupuesto”, “Edita un presupuesto”, “Crea una meta de ahorro”, “Quiero hacer una transferencia”, “Transfiere $500 a Ana” and “Quiero pagar mi tarjeta” deterministically prepare the matching MCP `a2ui_form`; this preparation does not save anything. The transfer form loads selectable accounts and contacts from the authenticated user's current MCP data, and an explicit amount or valid recipient can prefill it. The card-payment form uses Finance v2 to show the masked payment card and current terms. “Muéstrame mi tarjeta de crédito” uses the dedicated `get_credit_cards` tool and builds the same verified `PaymentCard` view; legacy `get_accounts` observations remain readable. Save submits a structured `action` in the authenticated HTTP body, using the five A2UI fields and explicit resolved context. The orchestrator supplies trustedScope from the verified token; model-supplied ownership never wins. The LLM cannot call a2ui_action. The MCP returns data.actionResult and the client displays success/failure rather than interpreting HTTP 200 as successful persistence.
 
+After a successful `transfer.execute`, the API re-enters the authenticated graph
+with the `financial-summary` intent so the response carries the newly committed
+account balance. A successful `credit_card.pay` similarly refreshes the
+`credit-card` view. A refresh failure preserves the confirmed write result and
+does not invite a duplicate retry.
+
 Canonical input/action JSON is packaged under `a2ui_actions/`, synchronized from the MCP contract. The agent validates forms with the official A2UI 0.9.1 SDK. Saving requires the new MCP code, action SQL and dedicated write-role configuration; this source change does not deploy them.
 
 Set the same random `MCP_ACTIONS_SECRET` (at least 32 characters) on agent and MCP. The orchestrator signs the event plus verified user ID before forwarding it over the existing Horizon connection. This server-only signature never enters the A2UI context or the model; the MCP rejects unsigned or modified write requests.

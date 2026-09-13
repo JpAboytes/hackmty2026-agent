@@ -25,6 +25,7 @@ FINANCIAL_VIEW_ACTION = "request_financial_view"
 # view. The agent refreshes these views before replying so the A2UI surface and
 # the committed database state remain in sync within the same interaction.
 ACTION_REFRESH_INTENTS: dict[str, FinancialIntent] = {
+    "transfer.execute": "financial-summary",
     "credit_card.pay": "credit-card",
 }
 
