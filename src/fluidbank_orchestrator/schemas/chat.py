@@ -1,8 +1,9 @@
 """The HTTP wire contract of the chat endpoint.
 
-Identity is deliberately absent from both directions: the request's ``user_id``
-is tolerated for compatibility but never trusted, and the response carries only
-a message, structured data, and an optional validated A2UI bundle.
+The request carries the UUID and selected account UUID needed by Expo. Neither
+is trusted: identity comes from the bearer token and account ownership is
+verified through MCP. The response carries only a message, structured data, and
+an optional validated A2UI bundle.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ class ChatRequest(BaseModel):
     # identity comes from the bearer token, and a value that disagrees with the
     # token is refused rather than honoured.
     user_id: UUID | None = None
+    # Financial context selected by Expo. It is only a claim until the API
+    # verifies ownership through the scoped MCP connection.
+    account_id: UUID | None = None
 
     @model_validator(mode="after")
     def exactly_one_input(self) -> ChatRequest:
