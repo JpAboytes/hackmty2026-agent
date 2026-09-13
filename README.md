@@ -93,6 +93,12 @@ export SUPABASE_ACCESS_TOKEN='<supabase-access-token>'
 ./.venv/bin/python scripts/run_local.py "¿Cuánto dinero tengo?"
 ```
 
+Tool schemas are loaded once per endpoint and reused for `MCP_TOOLS_CACHE_SECONDS`
+(default 300). Concurrent turns that miss together load the collection once, the
+cache hands out detached copies, and `MCP_TOOLS_CACHE_SECONDS=0` disables it so a
+redeployed MCP is picked up without restarting this service. Watch
+`mcp.tools_cache` to see which turns paid for the load.
+
 ## Reading the agent's behaviour
 
 Every request is one *turn* with a short id, and every step inside it is one

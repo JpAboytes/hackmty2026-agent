@@ -11,12 +11,13 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from math import isfinite
+from time import monotonic
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -24,7 +25,7 @@ from uuid import UUID
 from fastmcp import Client
 from fastmcp.client.client import CallToolResult
 
-from .observability import preview, stage
+from .observability import event, preview, stage
 from .schemas.a2ui import A2UIBundle
 from .services.a2ui_bridge import A2UIBridge, A2UIBridgeError
 from .state import UserProfile
@@ -281,7 +282,82 @@ def enforce_trusted_user_scope(
     return scoped
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedTools:
+    tools: tuple[MCPToolDefinition, ...]
+    stored_at: float
+
+
+# Tool schemas change only when the MCP server is redeployed, but loading them
+# cost between 0.9s and 4.3s of every single turn in production. They are cached
+# per endpoint for a bounded time so a redeploy is still picked up without
+# restarting this service.
+_TOOLS_CACHE: dict[str, _CachedTools] = {}
+_TOOLS_CACHE_LOCK = asyncio.Lock()
+_DEFAULT_TOOLS_CACHE_SECONDS = 300.0
+
+
+def _tools_cache_seconds() -> float:
+    """Seconds a loaded tool collection stays usable. Zero disables the cache."""
+    raw = os.environ.get("MCP_TOOLS_CACHE_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_TOOLS_CACHE_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _DEFAULT_TOOLS_CACHE_SECONDS
+    return seconds if 0 <= seconds <= 86_400 else _DEFAULT_TOOLS_CACHE_SECONDS
+
+
+def _detached(tools: Sequence[MCPToolDefinition]) -> list[MCPToolDefinition]:
+    """Copy out of the cache so a caller can never mutate the retained schemas."""
+    return [
+        MCPToolDefinition(
+            name=tool.name,
+            description=tool.description,
+            input_schema=deepcopy(tool.input_schema),
+        )
+        for tool in tools
+    ]
+
+
+def _fresh_tools(identity: str, ttl: float) -> list[MCPToolDefinition] | None:
+    cached = _TOOLS_CACHE.get(identity)
+    if cached is None or ttl <= 0 or (monotonic() - cached.stored_at) >= ttl:
+        return None
+    return _detached(cached.tools)
+
+
+def clear_tools_cache() -> None:
+    """Drop every retained tool collection. Used by tests and by redeploy hooks."""
+    _TOOLS_CACHE.clear()
+
+
 async def list_remote_tools() -> list[MCPToolDefinition]:
+    """Return the endpoint's tool collection, loading it at most once per TTL."""
+    identity = load_mcp_config().url
+    ttl = _tools_cache_seconds()
+    cached = _fresh_tools(identity, ttl)
+    if cached is not None:
+        event("mcp.tools_cache", outcome="hit", tools=len(cached))
+        return cached
+    # One loader at a time: concurrent turns that miss together would otherwise
+    # each pay the full load. The second check covers the turn that just waited.
+    async with _TOOLS_CACHE_LOCK:
+        cached = _fresh_tools(identity, ttl)
+        if cached is not None:
+            event("mcp.tools_cache", outcome="hit_after_wait", tools=len(cached))
+            return cached
+        event("mcp.tools_cache", outcome="miss")
+        definitions = await _load_remote_tools()
+        if ttl > 0:
+            # The cache keeps its own copies: the collection handed back is the
+            # caller's to mutate, and must not be the one the next turn reads.
+            _TOOLS_CACHE[identity] = _CachedTools(tuple(_detached(definitions)), monotonic())
+    return definitions
+
+
+async def _load_remote_tools() -> list[MCPToolDefinition]:
     """Load the real read-only tool collection from the configured endpoint."""
     try:
         async with _session("list_tools") as (client, _identity):

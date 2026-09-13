@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
@@ -14,11 +17,14 @@ from fluidbank_orchestrator.mcp_client import (
     MODEL_TOOL_NAMES,
     MCPConfig,
     MCPConfigurationError,
+    MCPToolDefinition,
     TrustedUserScopeError,
     UserContextError,
     call_mcp_tool,
+    clear_tools_cache,
     create_mcp_client,
     fetch_user_context,
+    list_remote_tools,
     load_mcp_config,
 )
 
@@ -321,3 +327,99 @@ async def test_scoped_mcp_call_without_identity_fails_closed_before_calling_clie
         )
 
     assert client.calls == []
+
+
+@pytest.fixture(autouse=True)
+def _empty_tools_cache() -> Iterator[None]:
+    clear_tools_cache()
+    yield
+    clear_tools_cache()
+
+
+def _tool_loader(calls: list[int]) -> Any:
+    async def load() -> list[MCPToolDefinition]:
+        calls.append(1)
+        return [MCPToolDefinition("select_rows", "Select scoped rows.", {"type": "object"})]
+
+    return load
+
+
+@pytest.mark.asyncio
+async def test_tool_schemas_are_loaded_once_and_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loading them cost up to 4.3s of every production turn."""
+    calls: list[int] = []
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader(calls))
+
+    first = await list_remote_tools()
+    second = await list_remote_tools()
+
+    assert calls == [1]
+    assert [tool.name for tool in first] == [tool.name for tool in second] == ["select_rows"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_misses_load_the_collection_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    async def slow() -> list[MCPToolDefinition]:
+        calls.append(1)
+        await asyncio.sleep(0.01)
+        return [MCPToolDefinition("select_rows", "Select scoped rows.", {"type": "object"})]
+
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_client, "_load_remote_tools", slow)
+
+    await asyncio.gather(*(list_remote_tools() for _ in range(4)))
+
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_cached_schema_cannot_be_mutated_through_a_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader([]))
+
+    first = await list_remote_tools()
+    first[0].input_schema["injected"] = True
+
+    assert "injected" not in (await list_remote_tools())[0].input_schema
+
+
+@pytest.mark.asyncio
+async def test_an_expired_collection_is_loaded_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader(calls))
+    monkeypatch.setenv("MCP_TOOLS_CACHE_SECONDS", "60")
+
+    await list_remote_tools()
+    clock = [mcp_client.monotonic() + 3_600]
+    monkeypatch.setattr(mcp_client, "monotonic", lambda: clock[0])
+    await list_remote_tools()
+
+    assert calls == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_zero_seconds_turns_the_cache_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A redeploy mid-demo can be picked up immediately without a restart."""
+    calls: list[int] = []
+    monkeypatch.setattr(mcp_client, "load_mcp_config", lambda: MCPConfig(_URL, "none"))
+    monkeypatch.setattr(mcp_client, "_load_remote_tools", _tool_loader(calls))
+    monkeypatch.setenv("MCP_TOOLS_CACHE_SECONDS", "0")
+
+    await list_remote_tools()
+    await list_remote_tools()
+
+    assert calls == [1, 1]
