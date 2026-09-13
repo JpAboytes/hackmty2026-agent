@@ -364,6 +364,64 @@ class _MappingCatalogProvider(A2uiCatalogProvider):  # type: ignore[misc]
         return deepcopy(self._catalog)
 
 
+def _add_form_components(schema: dict[str, Any]) -> None:
+    """Add the renderer's bounded Basic inputs to the Finance v2 catalog."""
+    components = schema["components"]
+    common = {
+        "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"
+    }
+    catalog_common = {"$ref": "#/$defs/CatalogComponentCommon"}
+
+    def component(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "allOf": [
+                common,
+                catalog_common,
+                {"type": "object", "properties": properties, "required": required},
+            ],
+            "unevaluatedProperties": False,
+        }
+
+    components["TextField"] = component(
+        {
+            "component": {"const": "TextField"},
+            "label": {"$ref": "#/$defs/SafeDynamicString"},
+            "value": {"$ref": "#/$defs/DataBinding"},
+            "variant": {
+                "type": "string",
+                "enum": ["shortText", "longText", "number", "obscured"],
+            },
+        },
+        ["component", "label", "value"],
+    )
+    components["DateTimeInput"] = component(
+        {
+            "component": {"const": "DateTimeInput"},
+            "label": {"$ref": "#/$defs/SafeDynamicString"},
+            "value": {"$ref": "#/$defs/DataBinding"},
+            "enableDate": {"const": True},
+            "enableTime": {"const": False},
+        },
+        ["component", "value", "enableDate"],
+    )
+    components["Slider"] = component(
+        {
+            "component": {"const": "Slider"},
+            "label": {"$ref": "#/$defs/SafeDynamicString"},
+            "value": {"$ref": "#/$defs/DataBinding"},
+            "min": {"type": "number"},
+            "max": {"type": "number"},
+        },
+        ["component", "value", "max"],
+    )
+    refs = schema["$defs"]["anyComponent"]["oneOf"]
+    refs.extend(
+        {"$ref": f"#/components/{name}"}
+        for name in ("TextField", "DateTimeInput", "Slider")
+    )
+
+
 def _finance_catalog_config(*, version: Literal["v1", "v2"] = "v1") -> CatalogConfig:
     resource = files("fluidbank_orchestrator.a2ui_catalogs").joinpath("finance_v1.json")
     try:
@@ -385,6 +443,7 @@ def _finance_catalog_config(*, version: Literal["v1", "v2"] = "v1") -> CatalogCo
         definitions = loaded.get("$defs")
         if not isinstance(components, dict) or not isinstance(definitions, dict):
             raise RuntimeError("The finance A2UI catalog is malformed")
+        _add_form_components(loaded)
         components["BankingView"] = {
             "type": "object",
             "allOf": [
@@ -470,7 +529,17 @@ _COMPONENTS_BY_CATALOG = {
     ),
     A2UI_FINANCE_CATALOG: frozenset({"Text", "Button", "Card", "Column", "Chart"}),
     A2UI_FINANCE_V2_CATALOG: frozenset(
-        {"Text", "Button", "Card", "Column", "Chart", "BankingView"}
+        {
+            "Text",
+            "Button",
+            "Card",
+            "Column",
+            "Chart",
+            "TextField",
+            "DateTimeInput",
+            "Slider",
+            "BankingView",
+        }
     ),
 }
 _OPERATIONS = ("createSurface", "updateComponents", "updateDataModel", "deleteSurface")
@@ -687,11 +756,33 @@ def validate_complete_sequence(messages: Sequence[Mapping[str, Any]], surface_id
                 validate_banking_view(candidate)
             except Exception as exc:
                 raise A2UIValidationError("Finance BankingView data model is invalid") from exc
+        action_contract = json.loads(
+            files("fluidbank_orchestrator.a2ui_actions")
+            .joinpath("actions.json")
+            .read_text(encoding="utf-8")
+        )
+        form_spec = next(
+            (
+                item
+                for item in action_contract["actions"]
+                if item["surfaceId"] == surface_id
+            ),
+            None,
+        )
         for component in finance_components:
             if component.get("component") != "Button":
                 continue
             event = component.get("action", {}).get("event", {})
             context = event.get("context") if isinstance(event, Mapping) else None
+            if form_spec is not None:
+                if (
+                    not isinstance(event, Mapping)
+                    or event.get("name") != form_spec["name"]
+                    or not isinstance(context, Mapping)
+                    or set(context) != set(form_spec["contextFields"])
+                ):
+                    raise A2UIValidationError("Finance v2 contains an unsupported form action")
+                continue
             intent_value = context.get("intent") if isinstance(context, Mapping) else None
             resolved_intent = (
                 _resolve_data_path(banking_data_model, intent_value["path"])

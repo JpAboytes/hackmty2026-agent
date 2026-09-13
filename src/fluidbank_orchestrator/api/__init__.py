@@ -42,7 +42,7 @@ from ..mcp_client import (
 from ..observability import configure_logging, end_turn, event, stage, start_turn
 from ..schemas.chat import ChatRequest, ChatResponse
 from .actions import FINANCIAL_VIEW_ACTION, action_payload, trusted_financial_intent
-from .query_routing import requested_form, requests_database_overview
+from .query_routing import requested_form, requested_form_arguments, requests_database_overview
 from .responses import (
     invalid_action_response,
     log_client_response,
@@ -174,7 +174,9 @@ async def _route_request(
     if form_name is not None:
         try:
             execution = await execute_remote_tool(
-                "a2ui_form", {"name": form_name}, current_user_id=current_user_id
+                "a2ui_form",
+                {"name": form_name, **requested_form_arguments(query, form_name)},
+                current_user_id=current_user_id,
             )
             return log_client_response("action_form", response_from_tool(execution))
         except (MCPConfigurationError, UserContextError):

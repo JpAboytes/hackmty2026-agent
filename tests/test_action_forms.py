@@ -9,7 +9,7 @@ import pytest
 from mcp.types import TextContent
 
 from fluidbank_orchestrator import api
-from fluidbank_orchestrator.a2ui_actions.routing import requested_form
+from fluidbank_orchestrator.a2ui_actions.routing import requested_form, requested_form_arguments
 from fluidbank_orchestrator.mcp_client import SCOPED_TOOL_NAMES, enforce_trusted_user_scope
 from fluidbank_orchestrator.schemas.a2ui import validate_complete_sequence
 
@@ -21,6 +21,10 @@ from fluidbank_orchestrator.schemas.a2ui import validate_complete_sequence
         ("Quiero editar mi presupuesto", "budget.load"),
         ("Crear una meta de ahorro", "savings_goal.create"),
         ("Actualiza mi meta de ahorro", "savings_goal.load"),
+        ("Transfiere $500 a Ana", "transfer.execute"),
+        ("Mueve dinero a mi cuenta de ahorro", "transfer.execute"),
+        ("Quiero pagar mi tarjeta de crédito", "credit_card.pay"),
+        ("¿Cuándo debo pagar mi tarjeta?", None),
         ("¿Cómo crear un presupuesto?", None),
         ("No quiero crear una meta de ahorro", None),
     ],
@@ -32,6 +36,17 @@ def test_form_routing_only_prepares_forms(query, expected):
     # search nor the `call_tool` proxy can reach it; here the invariant that
     # remains client-side is that it is always scoped to the authenticated user.
     assert "a2ui_action" in SCOPED_TOOL_NAMES
+
+
+def test_transfer_form_prefills_explicit_amount_and_recipient():
+    assert requested_form_arguments("Transfiere $1,250.50 a Ana", "transfer.execute") == {
+        "initial_amount": 1250.5,
+        "initial_recipient": "Ana",
+    }
+    assert requested_form_arguments("Transfiere $1250 a Ana", "transfer.execute") == {
+        "initial_amount": 1250.0,
+        "initial_recipient": "Ana",
+    }
 
 
 def test_all_forms_pass_official_sdk_and_agent_validation():
@@ -48,12 +63,26 @@ def test_all_forms_pass_official_sdk_and_agent_validation():
             ).read_text()
         )
         model = {field["key"]: field["default"] for field in action["inputs"]}
+        data_model = {"form": model, "help": "Revisa y confirma"}
+        if action.get("preview"):
+            data_model["preview"] = {
+                "intent": "credit-card",
+                "title": "Tu tarjeta",
+                "currency": "MXN",
+                "cardName": "Tarjeta oro",
+                "lastFour": "1234",
+                "debt": 5000,
+                "availableCredit": 5000,
+                "minimumPayment": 300,
+                "interestFreePayment": 2000,
+                "dueDate": "2026-10-01",
+            }
         messages.append(
             {
                 "version": "v0.9.1",
                 "updateDataModel": {
                     "surfaceId": action["surfaceId"],
-                    "value": {"form": model, "help": "Revisa y confirma"},
+                    "value": data_model,
                 },
             }
         )
@@ -76,6 +105,29 @@ async def test_form_request_routes_to_mcp_with_verified_user(monkeypatch):
     result = await api._route_request(None, "Crea un presupuesto", uid)
     assert result.message == "Formulario"
     assert called == [("a2ui_form", {"name": "budget.create"}, uid)]
+
+
+@pytest.mark.asyncio
+async def test_transfer_request_passes_only_bounded_prefill(monkeypatch):
+    uid = UUID("f52827d7-0213-4df4-9621-14775d6228d4")
+    called = []
+
+    async def execute(name, arguments, *, current_user_id):
+        called.append((name, arguments, current_user_id))
+        return SimpleNamespace(
+            result=SimpleNamespace(content=[TextContent(text="Formulario")], structured_content={}),
+            a2ui=None,
+        )
+
+    monkeypatch.setattr(api, "execute_remote_tool", execute)
+    await api._route_request(None, "Transfiere $500 a Ana", uid)
+    assert called == [
+        (
+            "a2ui_form",
+            {"name": "transfer.execute", "initial_amount": 500.0, "initial_recipient": "Ana"},
+            uid,
+        )
+    ]
 
 
 def test_form_tool_scope_is_replaced_by_authenticated_subject():

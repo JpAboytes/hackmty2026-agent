@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import unicodedata
 
-from ..a2ui_actions.routing import requested_form
+from ..a2ui_actions.routing import requested_form, requested_form_arguments
 
-__all__ = ["requested_form", "requests_database_overview"]
+__all__ = ["requested_form", "requested_form_arguments", "requests_database_overview"]
 
 _DATABASE_TERMS_EN = ("overview", "objects", "tables", "views")
 _DATABASE_TERMS_ES = ("resumen", "vista general", "objetos", "tablas", "vistas", "disponibles")

@@ -259,6 +259,99 @@
       ],
       "requiresConfirmation": false,
       "writes": false
+    },
+    {
+      "name": "transfer.execute",
+      "surfaceId": "transfer-execute",
+      "sourceComponentId": "submit",
+      "title": "Transferir dinero",
+      "submitLabel": "Confirmar transferencia",
+      "inputCount": 4,
+      "inputs": [
+        {
+          "key": "source_account",
+          "input": "text",
+          "label": "Cuenta de origen",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "recipient",
+          "input": "text",
+          "label": "Destinatario",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "amount",
+          "input": "slider",
+          "label": "Cantidad en MXN",
+          "required": true,
+          "default": 500,
+          "min": 1,
+          "max": 100000
+        },
+        {
+          "key": "concept",
+          "input": "text",
+          "label": "Concepto",
+          "required": true,
+          "default": "Transferencia"
+        }
+      ],
+      "contextFields": [
+        "source_account",
+        "recipient",
+        "amount",
+        "concept"
+      ],
+      "requiresConfirmation": true,
+      "writes": true
+    },
+    {
+      "name": "credit_card.pay",
+      "surfaceId": "credit-card-pay",
+      "sourceComponentId": "submit",
+      "catalogId": "https://fluidbank.app/a2ui/catalogs/finance/v2",
+      "preview": {
+        "component": "BankingView",
+        "path": "/preview"
+      },
+      "title": "Pagar tarjeta de crédito",
+      "submitLabel": "Confirmar pago",
+      "inputCount": 3,
+      "inputs": [
+        {
+          "key": "source_account",
+          "input": "text",
+          "label": "Cuenta para pagar",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "card",
+          "input": "text",
+          "label": "Tarjeta de crédito",
+          "required": true,
+          "default": ""
+        },
+        {
+          "key": "amount",
+          "input": "slider",
+          "label": "Cantidad a pagar en MXN",
+          "required": true,
+          "default": 1000,
+          "min": 1,
+          "max": 100000
+        }
+      ],
+      "contextFields": [
+        "source_account",
+        "card",
+        "amount"
+      ],
+      "requiresConfirmation": true,
+      "writes": true
     }
   ],
   "existingActions": [
