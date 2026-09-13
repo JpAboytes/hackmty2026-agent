@@ -11,7 +11,7 @@ import pytest
 from fastmcp.client.client import CallToolResult
 from mcp.types import EmbeddedResource, TextContent, TextResourceContents
 
-from fluidbank_orchestrator.api import _response_from_tool
+from fluidbank_orchestrator.api.responses import response_from_tool
 from fluidbank_orchestrator.mcp_client import MCPToolExecution, call_mcp_tool
 from fluidbank_orchestrator.schemas.a2ui import A2UI_BASIC_CATALOG, A2UI_MIME_TYPE
 from fluidbank_orchestrator.services.a2ui_bridge import A2UIBridge, A2UIBridgeError
@@ -136,7 +136,7 @@ async def test_valid_result_becomes_exact_expo_contract_with_object_messages() -
     bundle = await bridge.build_bundle(client, client.result, server_identity=SERVER_ID)  # type: ignore[arg-type]
 
     assert bundle is not None
-    response = _response_from_tool(MCPToolExecution(result=client.result, a2ui=bundle))
+    response = response_from_tool(MCPToolExecution(result=client.result, a2ui=bundle))
     assert response.model_dump() == {
         "message": "Database overview loaded.",
         "data": {"ok": True, "object_count": 1},
@@ -316,7 +316,7 @@ async def test_text_and_structured_data_survive_presentation_failure() -> None:
     execution = await call_mcp_tool(  # type: ignore[arg-type]
         client, SERVER_ID, "database_overview", {"limit": 50}, bridge=bridge
     )
-    response = _response_from_tool(execution)
+    response = response_from_tool(execution)
     assert client.call_count == 1
     assert execution.presentation_error is True
     assert response.message == "Database overview loaded."

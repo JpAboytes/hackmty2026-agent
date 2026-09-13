@@ -10,16 +10,11 @@ import pytest
 from fastmcp.client.client import CallToolResult
 from mcp.types import TextContent
 
-import fluidbank_orchestrator.graph as graph_module
-from fluidbank_orchestrator.graph import (
-    GeminiToolAwareModel,
-    ModelTurn,
-    ToolAwareModel,
-    _api_failure_reason,
-    _Intent,
-    _model_tool_schema,
-    build_graph,
-)
+import fluidbank_orchestrator.agent.gemini as gemini_module
+import fluidbank_orchestrator.agent.nodes as nodes_module
+from fluidbank_orchestrator.agent.gemini import GeminiToolAwareModel, _api_failure_reason, _Intent
+from fluidbank_orchestrator.agent.tool_visibility import model_tool_schema
+from fluidbank_orchestrator.graph import ModelTurn, ToolAwareModel, build_graph
 from fluidbank_orchestrator.mcp_client import (
     MCPToolDefinition,
     MCPToolExecution,
@@ -112,7 +107,7 @@ async def _run_graph(
         calls.append((name, resolved))
         return _execution(rows)
 
-    monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
     result = await build_graph(
         model=FakeModel(), tool_loader=_discovery_tools, tool_executor=execute
     ).ainvoke({"user_query": query, "current_user_id": USER_A})
@@ -186,8 +181,7 @@ async def test_context_rows_answer_a_balance_without_a_second_read(
 
     # Known gap, unchanged by discovery: the deterministic financial router
     # does not consult the prefetched context rows, so the overview read runs
-    # even though `accounts` was already loaded. `_has_table_observation` is the
-    # unused remnant of the suppression this docstring describes.
+    # even though `accounts` was already loaded.
     assert [name for name, _ in calls] == ["get_financial_overview"]
     presentation = result["financial_presentation"]
     assert presentation.intent == "financial-summary"
@@ -351,7 +345,7 @@ def test_model_facing_schemas_hide_trusted_scope_fields() -> None:
         },
     )
 
-    model_schema = _model_tool_schema(tool)
+    model_schema = model_tool_schema(tool)
     request_schema = model_schema["properties"]["request"]
 
     assert "scope" not in request_schema["properties"]
@@ -396,7 +390,7 @@ async def test_plain_conversation_can_finish_without_chat_message(
     async def fake_profile(_current_user_id: UUID) -> UserContext:
         return UserContext(profile=PROFILE.copy(), rows={})
 
-    monkeypatch.setattr(graph_module, "fetch_user_context", fake_profile)
+    monkeypatch.setattr(nodes_module, "fetch_user_context", fake_profile)
     result = await build_graph(model=FakeModel(), tool_loader=_discovery_tools).ainvoke(
         {"user_query": "Hola", "current_user_id": USER_A}
     )
@@ -409,9 +403,9 @@ async def test_unresolvable_user_never_receives_placeholder_money(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def unavailable(_current_user_id: UUID) -> UserContext:
-        raise graph_module.UserContextError("missing")
+        raise nodes_module.UserContextError("missing")
 
-    monkeypatch.setattr(graph_module, "fetch_user_context", unavailable)
+    monkeypatch.setattr(nodes_module, "fetch_user_context", unavailable)
     result = await build_graph(model=FakeModel(), tool_loader=_discovery_tools).ainvoke(
         {"user_query": "¿Cuánto dinero tengo?", "current_user_id": USER_A}
     )
@@ -451,7 +445,7 @@ class _RecordingModels:
 def _fake_genai(monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]) -> _RecordingModels:
     models = _RecordingModels(outcomes)
     client = type("_Client", (), {"aio": type("_Aio", (), {"models": models})()})
-    monkeypatch.setattr(graph_module, "genai", type("_Genai", (), {"Client": lambda: client}))
+    monkeypatch.setattr(gemini_module, "genai", type("_Genai", (), {"Client": lambda: client}))
     return models
 
 
